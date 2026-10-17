@@ -1,0 +1,1234 @@
+diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
+index 2658d6b6..59e38ded 100644
+--- a/ModernGekko/CMakeLists.txt
++++ b/ModernGekko/CMakeLists.txt
+@@ -309,6 +309,7 @@ target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
+ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     target_sources(moderngekko PRIVATE
+         src/runtime/dolphin_runtime.cpp
++        tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+     )
+@@ -329,7 +330,13 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         target_compile_definitions(moderngekko PRIVATE MODERNGEKKO_HAVE_COCOA=1)
+     endif()
+     target_include_directories(moderngekko PRIVATE
+-        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include")
++        "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/GXRuntime/include"
++        "${CMAKE_CURRENT_SOURCE_DIR}/tools")
++    if(NOT ANDROID)
++        # Automation drives the pads through Dolphin's input overrider.
++        target_sources(moderngekko PRIVATE
++            vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp)
++    endif()
+     # The Windows Vulkan probe (dolphin_runtime.cpp, VulkanHasGpu) needs the
+     # Vulkan types; vulkan_core.h includes its vk_video/ headers from this root,
+     # so it has to be an include directory, not a relative #include.
+diff --git a/ModernGekko/include/moderngekko/runtime.hpp b/ModernGekko/include/moderngekko/runtime.hpp
+index 74ea9b1b..85304cbf 100644
+--- a/ModernGekko/include/moderngekko/runtime.hpp
++++ b/ModernGekko/include/moderngekko/runtime.hpp
+@@ -48,6 +48,13 @@ struct InputSettings
+   bool background_input = false;
+ };
+ 
++// File-based remote control (pad input, savestates, screenshots, status.txt),
++// ported from upstream ModernGekko for unattended testing. Empty = off.
++struct AutomationSettings
++{
++  std::filesystem::path directory;
++};
++
+ enum class WindowSystem
+ {
+   Default,
+@@ -74,6 +81,9 @@ struct RuntimeConfig
+   // power-on -- there is no savestate anchor here.
+   std::filesystem::path record_movie;
+   std::filesystem::path replay_movie;
++  // Boot straight into a savestate instead of from the title screen.
++  std::optional<std::filesystem::path> load_state_path;
++  AutomationSettings automation;
+ };
+ 
+ enum class RuntimeErrorCode
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 0a318d74..22f9df36 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -10,6 +10,12 @@
+ #include "Core/Boot/BootManager.h"
+ #include "Core/HW/SI/SI_Device.h"
+ #include "Core/Movie.h"
++#include "Core/HW/Memmap.h"
++#include "Core/State.h"
++#include "InputCommon/ControllerInterface/Touch/InputOverrider.h"
++#include "VideoCommon/FrameDumper.h"
++#include "VideoCommon/VideoEvents.h"
++#include "automation_protocol.hpp"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/StaticRecompSettings.h"
+@@ -49,6 +55,7 @@
+ #include <fstream>
+ #include <fmt/format.h>
+ #include <mutex>
++#include <stop_token>
+ #include <ranges>
+ #include <thread>
+ #include <functional>
+@@ -158,6 +165,366 @@ Host_CreateGBAHost(std::weak_ptr<HW::GBA::Core>) {
+ }
+ 
+ namespace moderngekko {
++// --- automation ----------------------------------------------------------------
++// File-based remote control ported from upstream ModernGekko: command files in
++// <dir>/commands drive the pads, savestates, screenshots and memory reads, and
++// <dir>/status.txt reports fps/speed/frame count. Off unless --automation-dir.
++namespace {
++struct RuntimeAutomationState
++{
++  mutable std::mutex mutex;
++  std::atomic<std::uint64_t> frame_count{0};
++  std::atomic<std::uint64_t> present_count{0};
++  std::uint64_t processed_commands = 0;
++  std::string last_command;
++  std::string last_error;
++};
++
++void EnsureAutomationDirectories(const std::filesystem::path& root)
++{
++  if (root.empty())
++    return;
++  std::error_code ec;
++  std::filesystem::create_directories(root / "commands", ec);
++  std::filesystem::create_directories(root / "processed", ec);
++  std::filesystem::create_directories(root / "failed", ec);
++}
++
++void SetAutomationError(RuntimeAutomationState& state, std::string message)
++{
++  std::lock_guard lock(state.mutex);
++  state.last_error = std::move(message);
++}
++
++void MarkAutomationCommand(RuntimeAutomationState& state, std::string command_name)
++{
++  std::lock_guard lock(state.mutex);
++  ++state.processed_commands;
++  state.last_command = std::move(command_name);
++  state.last_error.clear();
++}
++
++void ClearAutomationPad(int port)
++{
++  for (int control = static_cast<int>(ciface::Touch::FIRST_GC_CONTROL);
++       control <= static_cast<int>(ciface::Touch::LAST_WII_CONTROL); ++control)
++  {
++    ciface::Touch::SetControlState(
++        port, static_cast<ciface::Touch::ControlID>(control), 0.0);
++  }
++}
++
++void ApplyAutomationPad(const automation::PadState& pad)
++{
++  ClearAutomationPad(pad.port);
++  for (std::size_t index = 0; index < pad.controls.size(); ++index)
++  {
++    ciface::Touch::SetControlState(
++        pad.port,
++        static_cast<ciface::Touch::ControlID>(
++            static_cast<int>(ciface::Touch::FIRST_GC_CONTROL) +
++            static_cast<int>(index)),
++        pad.controls[index]);
++  }
++}
++
++std::filesystem::path NormalizeScreenshotPath(const std::filesystem::path& path)
++{
++  if (!path.has_extension())
++    return path.string() + ".png";
++  return path;
++}
++
++void SaveAutomationScreenshot(const std::filesystem::path& path)
++{
++  std::error_code ec;
++  std::filesystem::create_directories(path.parent_path(), ec);
++  const Core::CPUThreadGuard guard(Core::System::GetInstance());
++  if (g_frame_dumper)
++    g_frame_dumper->SaveScreenshot(path.string());
++}
++
++std::optional<RuntimeError> ReadAutomationMemory(const std::filesystem::path& path, u32 address,
++                                                 u32 size)
++{
++  auto& system = Core::System::GetInstance();
++  const Core::CPUThreadGuard guard(system);
++  const u8* source = system.GetMemory().GetPointerForRange(address, size);
++  if (!source)
++  {
++    return RuntimeError{RuntimeErrorCode::InvalidState,
++                        fmt::format("guest range {:#010x}+{} is not readable", address, size)};
++  }
++
++  std::error_code ec;
++  std::filesystem::create_directories(path.parent_path(), ec);
++  if (ec)
++  {
++    return RuntimeError{RuntimeErrorCode::InitializationFailed,
++                        "could not create memory output directory: " + ec.message()};
++  }
++
++  std::ofstream output(path, std::ios::binary | std::ios::trunc);
++  if (!output)
++  {
++    return RuntimeError{RuntimeErrorCode::InitializationFailed,
++                        "could not open memory output file"};
++  }
++  output.write(reinterpret_cast<const char*>(source), size);
++  if (!output)
++  {
++    return RuntimeError{RuntimeErrorCode::InitializationFailed,
++                        "could not write memory output file"};
++  }
++  return {};
++}
++
++std::optional<RuntimeError> WriteAutomationMemory(u32 address,
++                                                  const std::vector<std::uint8_t>& data)
++{
++  auto& system = Core::System::GetInstance();
++  const Core::CPUThreadGuard guard(system);
++  if (!system.GetMemory().GetPointerForRange(address, data.size()))
++  {
++    return RuntimeError{
++        RuntimeErrorCode::InvalidState,
++        fmt::format("guest range {:#010x}+{} is not writable", address, data.size())};
++  }
++  system.GetMemory().CopyToEmu(address, data.data(), data.size());
++  return {};
++}
++
++std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
++                                                   RuntimeAutomationState& state,
++                                                   const automation::Command& command,
++                                                   std::stop_token stop_token)
++{
++  auto& system = Core::System::GetInstance();
++  switch (command.type)
++  {
++  case automation::CommandType::Pad:
++    ApplyAutomationPad(command.pad);
++    break;
++  case automation::CommandType::PadFrames:
++  {
++    if (Core::GetState(system) != Core::State::Running)
++    {
++      return RuntimeError{RuntimeErrorCode::InvalidState,
++                          "pad_frames requires a running emulated core"};
++    }
++    std::uint64_t first_frame = state.frame_count.load(std::memory_order_relaxed);
++    ApplyAutomationPad(command.pad);
++    while (!stop_token.stop_requested())
++    {
++      const std::uint64_t current_frame =
++          state.frame_count.load(std::memory_order_relaxed);
++      if (current_frame < first_frame)
++        first_frame = current_frame;
++      else if (current_frame - first_frame >= command.frames)
++        break;
++      std::this_thread::sleep_for(std::chrono::milliseconds(1));
++    }
++    ClearAutomationPad(command.pad.port);
++    break;
++  }
++  case automation::CommandType::ClearPad:
++    ClearAutomationPad(command.pad.port);
++    break;
++  case automation::CommandType::Pause:
++    if (auto error = runtime.Pause())
++      return error;
++    break;
++  case automation::CommandType::Resume:
++    if (auto error = runtime.Resume())
++      return error;
++    break;
++  case automation::CommandType::SaveState:
++    std::filesystem::create_directories(command.path.parent_path());
++    State::SaveAs(system, command.path.string());
++    break;
++  case automation::CommandType::LoadState:
++    State::LoadAs(system, command.path.string());
++    break;
++  case automation::CommandType::Screenshot:
++    SaveAutomationScreenshot(NormalizeScreenshotPath(command.path));
++    break;
++  case automation::CommandType::ReadMemory:
++    if (auto error = ReadAutomationMemory(command.path, command.address, command.size))
++      return error;
++    break;
++  case automation::CommandType::WriteMemory:
++    if (auto error = WriteAutomationMemory(command.address, command.data))
++      return error;
++    break;
++  case automation::CommandType::Stop:
++    runtime.RequestStop();
++    break;
++  }
++  MarkAutomationCommand(state, command.source_name);
++  return {};
++}
++
++bool AutomationCommandNeedsReadyCore(automation::CommandType type)
++{
++  switch (type)
++  {
++  case automation::CommandType::Pause:
++  case automation::CommandType::Resume:
++  case automation::CommandType::SaveState:
++  case automation::CommandType::LoadState:
++  case automation::CommandType::Screenshot:
++  case automation::CommandType::ReadMemory:
++  case automation::CommandType::WriteMemory:
++  case automation::CommandType::PadFrames:
++    return true;
++  case automation::CommandType::Pad:
++  case automation::CommandType::ClearPad:
++  case automation::CommandType::Stop:
++    return false;
++  }
++  return true;
++}
++
++bool AutomationCoreIsReady()
++{
++  const auto state = Core::GetState(Core::System::GetInstance());
++  return state == Core::State::Running || state == Core::State::Paused;
++}
++
++void MoveAutomationCommand(const std::filesystem::path& source, const std::filesystem::path& root,
++                           const char* destination_directory)
++{
++  std::error_code ec;
++  const std::filesystem::path destination =
++      root / destination_directory / source.filename();
++  std::filesystem::remove(destination, ec);
++  ec.clear();
++  std::filesystem::rename(source, destination, ec);
++  if (ec)
++  {
++    ec.clear();
++    std::filesystem::copy_file(source, destination,
++                               std::filesystem::copy_options::overwrite_existing, ec);
++    if (!ec)
++      std::filesystem::remove(source, ec);
++  }
++}
++
++template <typename ImplT>
++void WriteAutomationStatus(const std::filesystem::path& root, ImplT& impl)
++{
++  automation::Status status;
++  const auto core_state = impl.booted ? Core::GetState(Core::System::GetInstance())
++                                      : Core::State::Uninitialized;
++  status.state = core_state == Core::State::Paused
++                     ? "paused"
++                     : (core_state == Core::State::Running ? "running" : "stopped");
++  status.booted = impl.booted;
++  status.title = impl.title;
++  status.game_id = impl.metadata.disc_id;
++  status.game_name = impl.metadata.game_name;
++  if (impl.booted)
++  {
++    const auto& perf = Core::System::GetInstance().GetPerfMetrics();
++    status.fps = perf.GetFPS();
++    status.vps = perf.GetVPS();
++    status.speed = perf.GetSpeed();
++  }
++  status.frame_count =
++      impl.automation_state.frame_count.load(std::memory_order_relaxed);
++  status.present_count =
++      impl.automation_state.present_count.load(std::memory_order_relaxed);
++  {
++    std::lock_guard lock(impl.automation_state.mutex);
++    status.processed_commands = impl.automation_state.processed_commands;
++    status.last_command = impl.automation_state.last_command;
++    status.last_error = impl.automation_state.last_error;
++  }
++
++  const std::filesystem::path status_path = root / "status.txt";
++  const std::filesystem::path temp_path = root / "status.tmp";
++  std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
++  output << automation::FormatStatus(status);
++  if (impl.booted)
++  {
++    // Guest CPU position, for finding where a hung game waits. Read without
++    // synchronising with the CPU thread: a diagnostic snapshot, not exact state.
++    const auto& ppc = Core::System::GetInstance().GetPPCState();
++    output << fmt::format("pc={:#010x}\nlr={:#010x}\nmsr={:#010x}\nsrr0={:#010x}\n", ppc.pc,
++                          ppc.spr[SPR_LR], ppc.msr.Hex, ppc.spr[SPR_SRR0]);
++    output << "gpr=";
++    for (const u32 value : ppc.gpr)
++      output << fmt::format("{:08x} ", value);
++    output << '\n';
++  }
++  output.close();
++  std::error_code ec;
++  std::filesystem::rename(temp_path, status_path, ec);
++  if (ec)
++  {
++    ec.clear();
++    std::filesystem::copy_file(temp_path, status_path,
++                               std::filesystem::copy_options::overwrite_existing, ec);
++    std::filesystem::remove(temp_path, ec);
++  }
++}
++
++template <typename ImplT>
++void AutomationLoop(Runtime& runtime, ImplT& impl, std::stop_token stop_token)
++{
++  const std::filesystem::path root = impl.config.automation.directory;
++  if (root.empty())
++    return;
++
++  EnsureAutomationDirectories(root);
++  auto next_status_write = std::chrono::steady_clock::now();
++  while (!stop_token.stop_requested())
++  {
++
++    for (const auto& command_path : automation::ListCommandFiles(root / "commands"))
++    {
++      automation::Command command;
++      std::string error;
++      if (!automation::ParseCommandFile(command_path, &command, &error))
++      {
++        SetAutomationError(impl.automation_state,
++                           command_path.filename().string() + ": " + error);
++        MoveAutomationCommand(command_path, root, "failed");
++        continue;
++      }
++
++      if (AutomationCommandNeedsReadyCore(command.type) && !AutomationCoreIsReady())
++        break;
++
++      if (!command.path.empty())
++        command.path = automation::ResolveControlPath(root, command.path);
++
++      if (auto runtime_error =
++              ApplyAutomationCommand(runtime, impl.automation_state, command, stop_token))
++      {
++        SetAutomationError(impl.automation_state,
++                           command.source_name + ": " + runtime_error->message);
++        MoveAutomationCommand(command_path, root, "failed");
++        continue;
++      }
++
++      MoveAutomationCommand(command_path, root, "processed");
++    }
++
++    const auto now = std::chrono::steady_clock::now();
++    if (now >= next_status_write)
++    {
++      WriteAutomationStatus(root, impl);
++      next_status_write = now + std::chrono::milliseconds(200);
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(50));
++  }
++
++  WriteAutomationStatus(root, impl);
++}
++
++}  // namespace
++
+ struct Runtime::Impl {
+   RuntimeConfig config;
+   GameMetadata metadata;
+@@ -172,8 +539,22 @@ struct Runtime::Impl {
+   bool controllers_initialized = false;
+   bool booted = false;
+   std::atomic<bool> running{false};
++  RuntimeAutomationState automation_state;
++  Common::EventHook present_hook;
++  bool automation_registered = false;
++  std::jthread automation_thread;
+ };
+ 
++namespace {
++template <typename ImplT> void StopAutomation(ImplT &impl) {
++  if (impl.automation_thread.joinable()) {
++    impl.automation_thread.request_stop();
++    impl.automation_thread.join();
++  }
++  impl.present_hook = {};
++}
++} // namespace
++
+ namespace detail {
+ void SetExternalUICommon(bool external) {
+   std::lock_guard lock(s_runtime_mutex);
+@@ -704,12 +1085,17 @@ void ApplyModuleSourceToJit(const ModuleSource &module) {
+ 
+ // Takes whatever boot session data a host (netplay) staged for this run; the
+ // slot is one-shot, so it is cleared whether or not anything was there.
+-std::unique_ptr<BootParameters> TakeBootParameters(const std::string &main_dol) {
++std::unique_ptr<BootParameters>
++TakeBootParameters(const std::string &main_dol,
++                   const std::optional<std::filesystem::path> &load_state) {
+   std::lock_guard lock(s_runtime_mutex);
+   std::unique_ptr<BootParameters> boot;
+   if (s_boot_session_data)
+     boot = BootParameters::GenerateFromFile(main_dol,
+                                             std::move(*s_boot_session_data));
++  else if (load_state)
++    boot = BootParameters::GenerateFromFile(
++        main_dol, BootSessionData(load_state->string(), DeleteSavestateAfterBoot::No));
+   else
+     boot = BootParameters::GenerateFromFile(main_dol);
+   s_boot_session_data.reset();
+@@ -969,6 +1355,14 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   UICommon::InitControllers(impl->platform->GetWindowSystemInfo());
+   impl->controllers_initialized = true;
+   RebindPadsToPresentDevices();
++  EnsureAutomationDirectories(impl->config.automation.directory);
++  if (!impl->config.automation.directory.empty()) {
++    for (int port = 0; port < 4; ++port) {
++      ciface::Touch::RegisterGameCubeInputOverrider(port);
++      ClearAutomationPad(port);
++    }
++    impl->automation_registered = true;
++  }
+   impl->platform->SetTitle(impl->title);
+ 
+   ApplyCoreSettings(impl->metadata);
+@@ -987,10 +1381,16 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+ 
+ Runtime::~Runtime() {
+   RequestStop();
++  StopAutomation(*m_impl);
+   if (m_impl->booted) {
+     Core::Stop(Core::System::GetInstance());
+     Core::Shutdown(Core::System::GetInstance());
+   }
++  if (m_impl->automation_registered) {
++    for (int port = 0; port < 4; ++port)
++      ciface::Touch::UnregisterGameCubeInputOverrider(port);
++    m_impl->automation_registered = false;
++  }
+   m_impl->state_hook = {};
+   if (m_impl->controllers_initialized)
+     UICommon::ShutdownControllers();
+@@ -1010,7 +1410,7 @@ RuntimeRunResult Runtime::Run() {
+                          "runtime is already running"}};
+ 
+   std::unique_ptr<BootParameters> boot =
+-      TakeBootParameters(m_impl->metadata.main_dol.string());
++      TakeBootParameters(m_impl->metadata.main_dol.string(), m_impl->config.load_state_path);
+   if (!boot) {
+     m_impl->running = false;
+     return {RuntimeExitReason::BootFailed,
+@@ -1150,9 +1550,23 @@ RuntimeRunResult Runtime::Run() {
+   }
+   m_impl->booted = true;
+   // Continue-where-you-left-off (menu System > Auto-Resume). Headless runs are
+-  // benchmarks/verification; loading a state there would corrupt them.
+-  if (!m_impl->config.headless)
++  // benchmarks/verification; loading a state there would corrupt them, and so
++  // would it for an explicit --load-state or an automated run.
++  if (!m_impl->config.headless && !m_impl->config.load_state_path &&
++      m_impl->config.automation.directory.empty())
+     RecompMenu::ScheduleAutoResumeLoad();
++  m_impl->present_hook =
++      GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
++        m_impl->automation_state.frame_count.store(info.frame_count,
++                                                   std::memory_order_relaxed);
++        m_impl->automation_state.present_count.store(info.present_count,
++                                                     std::memory_order_relaxed);
++      });
++  if (!m_impl->config.automation.directory.empty()) {
++    m_impl->automation_thread = std::jthread([this](std::stop_token stop_token) {
++      AutomationLoop(*this, *m_impl, std::move(stop_token));
++    });
++  }
+   std::jthread title_thread;
+   if (!m_impl->config.headless && m_impl->config.show_fps_in_title)
+     title_thread = StartTitleThread();
+@@ -1161,6 +1575,7 @@ RuntimeRunResult Runtime::Run() {
+   if (title_thread.joinable())
+     title_thread.join();
+   m_impl->platform->SaveWindowGeometry();
++  StopAutomation(*m_impl);
+   Core::Stop(Core::System::GetInstance());
+   Core::Shutdown(Core::System::GetInstance());
+   m_impl->booted = false;
+diff --git a/ModernGekko/tools/automation_protocol.cpp b/ModernGekko/tools/automation_protocol.cpp
+new file mode 100644
+index 00000000..25f4167b
+--- /dev/null
++++ b/ModernGekko/tools/automation_protocol.cpp
+@@ -0,0 +1,545 @@
++#include "automation_protocol.hpp"
++
++#include <algorithm>
++#include <charconv>
++#include <cmath>
++#include <cstdlib>
++#include <fstream>
++#include <map>
++#include <sstream>
++#include <string_view>
++#include <system_error>
++#include <utility>
++
++namespace moderngekko::automation
++{
++namespace
++{
++using ciface::Touch::ControlID;
++
++struct PadField
++{
++  std::string_view name;
++  ControlID control;
++  double min_value;
++  double max_value;
++};
++
++constexpr std::array kPadFields = {
++    PadField{"a", ControlID::GCPAD_A_BUTTON, 0.0, 1.0},
++    PadField{"b", ControlID::GCPAD_B_BUTTON, 0.0, 1.0},
++    PadField{"x", ControlID::GCPAD_X_BUTTON, 0.0, 1.0},
++    PadField{"y", ControlID::GCPAD_Y_BUTTON, 0.0, 1.0},
++    PadField{"z", ControlID::GCPAD_Z_BUTTON, 0.0, 1.0},
++    PadField{"start", ControlID::GCPAD_START_BUTTON, 0.0, 1.0},
++    PadField{"dpad_up", ControlID::GCPAD_DPAD_UP, 0.0, 1.0},
++    PadField{"dpad_down", ControlID::GCPAD_DPAD_DOWN, 0.0, 1.0},
++    PadField{"dpad_left", ControlID::GCPAD_DPAD_LEFT, 0.0, 1.0},
++    PadField{"dpad_right", ControlID::GCPAD_DPAD_RIGHT, 0.0, 1.0},
++    PadField{"l", ControlID::GCPAD_L_DIGITAL, 0.0, 1.0},
++    PadField{"r", ControlID::GCPAD_R_DIGITAL, 0.0, 1.0},
++    PadField{"l_analog", ControlID::GCPAD_L_ANALOG, 0.0, 1.0},
++    PadField{"r_analog", ControlID::GCPAD_R_ANALOG, 0.0, 1.0},
++    PadField{"main_x", ControlID::GCPAD_MAIN_STICK_X, -1.0, 1.0},
++    PadField{"main_y", ControlID::GCPAD_MAIN_STICK_Y, -1.0, 1.0},
++    PadField{"c_x", ControlID::GCPAD_C_STICK_X, -1.0, 1.0},
++    PadField{"c_y", ControlID::GCPAD_C_STICK_Y, -1.0, 1.0},
++
++    PadField{"wii_a", ControlID::WIIMOTE_A_BUTTON, 0.0, 1.0},
++    PadField{"wii_b", ControlID::WIIMOTE_B_BUTTON, 0.0, 1.0},
++    PadField{"wii_1", ControlID::WIIMOTE_ONE_BUTTON, 0.0, 1.0},
++    PadField{"wii_2", ControlID::WIIMOTE_TWO_BUTTON, 0.0, 1.0},
++    PadField{"wii_plus", ControlID::WIIMOTE_PLUS_BUTTON, 0.0, 1.0},
++    PadField{"wii_minus", ControlID::WIIMOTE_MINUS_BUTTON, 0.0, 1.0},
++    PadField{"wii_home", ControlID::WIIMOTE_HOME_BUTTON, 0.0, 1.0},
++    PadField{"wii_dpad_up", ControlID::WIIMOTE_DPAD_UP, 0.0, 1.0},
++    PadField{"wii_dpad_down", ControlID::WIIMOTE_DPAD_DOWN, 0.0, 1.0},
++    PadField{"wii_dpad_left", ControlID::WIIMOTE_DPAD_LEFT, 0.0, 1.0},
++    PadField{"wii_dpad_right", ControlID::WIIMOTE_DPAD_RIGHT, 0.0, 1.0},
++    PadField{"wii_ir_x", ControlID::WIIMOTE_IR_X, -1.0, 1.0},
++    PadField{"wii_ir_y", ControlID::WIIMOTE_IR_Y, -1.0, 1.0},
++    PadField{"nunchuk_c", ControlID::NUNCHUK_C_BUTTON, 0.0, 1.0},
++    PadField{"nunchuk_z", ControlID::NUNCHUK_Z_BUTTON, 0.0, 1.0},
++    PadField{"nunchuk_x", ControlID::NUNCHUK_STICK_X, -1.0, 1.0},
++    PadField{"nunchuk_y", ControlID::NUNCHUK_STICK_Y, -1.0, 1.0},
++};
++
++std::string Trim(std::string_view value)
++{
++  const auto first = value.find_first_not_of(" \t\r\n");
++  if (first == std::string_view::npos)
++    return {};
++  const auto last = value.find_last_not_of(" \t\r\n");
++  return std::string(value.substr(first, last - first + 1));
++}
++
++std::optional<double> ParseDouble(std::string_view value)
++{
++  const std::string text = Trim(value);
++  if (text.empty())
++    return std::nullopt;
++  char* end = nullptr;
++  const double parsed = std::strtod(text.c_str(), &end);
++  if (end != text.c_str() + text.size() || !std::isfinite(parsed))
++    return std::nullopt;
++  return parsed;
++}
++
++std::optional<int> ParsePort(std::string_view value)
++{
++  const std::string text = Trim(value);
++  int parsed = 0;
++  const auto result =
++      std::from_chars(text.data(), text.data() + text.size(), parsed);
++  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() ||
++      parsed < 0 || parsed > 3)
++  {
++    return std::nullopt;
++  }
++  return parsed;
++}
++
++std::optional<std::uint32_t> ParseUnsigned(std::string_view value)
++{
++  std::string text = Trim(value);
++  if (text.empty())
++    return std::nullopt;
++
++  int base = 10;
++  if (text.starts_with("0x") || text.starts_with("0X"))
++  {
++    base = 16;
++    text.erase(0, 2);
++  }
++  if (text.empty())
++    return std::nullopt;
++
++  std::uint32_t parsed = 0;
++  const auto result =
++      std::from_chars(text.data(), text.data() + text.size(), parsed, base);
++  if (result.ec != std::errc{} || result.ptr != text.data() + text.size())
++    return std::nullopt;
++  return parsed;
++}
++
++std::optional<std::vector<std::uint8_t>> ParseHexBytes(std::string_view value)
++{
++  std::string text;
++  text.reserve(value.size());
++  for (const char character : value)
++  {
++    if (character != ' ' && character != '\t' && character != '_' && character != '-')
++      text.push_back(character);
++  }
++  if (text.starts_with("0x") || text.starts_with("0X"))
++    text.erase(0, 2);
++  if (text.empty() || text.size() % 2 != 0)
++    return std::nullopt;
++
++  std::vector<std::uint8_t> bytes;
++  bytes.reserve(text.size() / 2);
++  for (std::size_t offset = 0; offset < text.size(); offset += 2)
++  {
++    unsigned int byte = 0;
++    const auto result =
++        std::from_chars(text.data() + offset, text.data() + offset + 2, byte, 16);
++    if (result.ec != std::errc{} || result.ptr != text.data() + offset + 2)
++      return std::nullopt;
++    bytes.push_back(static_cast<std::uint8_t>(byte));
++  }
++  return bytes;
++}
++
++std::optional<CommandType> ParseCommandType(std::string_view value)
++{
++  const std::string text = Trim(value);
++  if (text == "pad")
++    return CommandType::Pad;
++  if (text == "pad_frames")
++    return CommandType::PadFrames;
++  if (text == "clear_pad")
++    return CommandType::ClearPad;
++  if (text == "pause")
++    return CommandType::Pause;
++  if (text == "resume")
++    return CommandType::Resume;
++  if (text == "save_state")
++    return CommandType::SaveState;
++  if (text == "load_state")
++    return CommandType::LoadState;
++  if (text == "screenshot")
++    return CommandType::Screenshot;
++  if (text == "read_memory")
++    return CommandType::ReadMemory;
++  if (text == "write_memory")
++    return CommandType::WriteMemory;
++  if (text == "stop")
++    return CommandType::Stop;
++  return std::nullopt;
++}
++
++const PadField* FindPadField(std::string_view name)
++{
++  const auto it = std::ranges::find(kPadFields, name, &PadField::name);
++  return it == kPadFields.end() ? nullptr : &*it;
++}
++
++std::map<std::string, std::string> ParseKeyValueLines(const std::filesystem::path& path,
++                                                      std::string* error)
++{
++  std::ifstream input(path);
++  if (!input) {
++    if (error)
++      *error = "could not open command file";
++    return {};
++  }
++
++  std::map<std::string, std::string> values;
++  std::string line;
++  std::size_t line_number = 0;
++  while (std::getline(input, line))
++  {
++    ++line_number;
++    const std::string trimmed = Trim(line);
++    if (trimmed.empty() || trimmed.starts_with('#'))
++      continue;
++    const auto equals = trimmed.find('=');
++    if (equals == std::string::npos)
++    {
++      if (error)
++        *error = "line " + std::to_string(line_number) + " must be key=value";
++      return {};
++    }
++    const std::string key = Trim(trimmed.substr(0, equals));
++    const std::string value = Trim(trimmed.substr(equals + 1));
++    if (key.empty())
++    {
++      if (error)
++        *error = "line " + std::to_string(line_number) + " has an empty key";
++      return {};
++    }
++    values[key] = value;
++  }
++  return values;
++}
++
++bool ParsePadCommand(const std::map<std::string, std::string>& values, Command* command,
++                     bool require_frames, std::string* error)
++{
++  const auto port_it = values.find("port");
++  if (port_it == values.end())
++  {
++    if (error)
++      *error = "pad commands require port=0..3";
++    return false;
++  }
++  const auto port = ParsePort(port_it->second);
++  if (!port)
++  {
++    if (error)
++      *error = "port must be between 0 and 3";
++    return false;
++  }
++
++  command->pad = {};
++  command->pad.port = *port;
++  if (require_frames)
++  {
++    const auto frames_it = values.find("frames");
++    const auto frames =
++        frames_it == values.end() ? std::nullopt : ParseUnsigned(frames_it->second);
++    if (!frames || *frames == 0 || *frames > 36000)
++    {
++      if (error)
++        *error = "pad_frames commands require frames=1..36000";
++      return false;
++    }
++    command->frames = *frames;
++  }
++
++  for (const auto& [key, value] : values)
++  {
++    if (key == "command" || key == "port" || (require_frames && key == "frames"))
++      continue;
++    const PadField* field = FindPadField(key);
++    if (!field)
++    {
++      if (error)
++        *error = "unknown pad field: " + key;
++      return false;
++    }
++    const auto parsed = ParseDouble(value);
++    if (!parsed || *parsed < field->min_value || *parsed > field->max_value)
++    {
++      if (error)
++      {
++        std::ostringstream message;
++        message << key << " must be between " << field->min_value << " and "
++                << field->max_value;
++        *error = message.str();
++      }
++      return false;
++    }
++    const std::size_t index =
++        static_cast<std::size_t>(field->control) -
++        static_cast<std::size_t>(ControlID::FIRST_GC_CONTROL);
++    command->pad.controls[index] = *parsed;
++  }
++  return true;
++}
++
++bool ParseReadMemoryCommand(const std::map<std::string, std::string>& values, Command* command,
++                            std::string* error)
++{
++  constexpr std::uint32_t max_read_size = 16 * 1024 * 1024;
++  for (const auto& [key, value] : values)
++  {
++    if (key != "command" && key != "address" && key != "size" && key != "path")
++    {
++      if (error)
++        *error = "unknown read_memory field: " + key;
++      return false;
++    }
++  }
++
++  const auto address_it = values.find("address");
++  const auto size_it = values.find("size");
++  const auto path_it = values.find("path");
++  if (address_it == values.end() || size_it == values.end() || path_it == values.end() ||
++      Trim(path_it->second).empty())
++  {
++    if (error)
++      *error = "read_memory requires address=<guest address>, size=<bytes>, and path=<file>";
++    return false;
++  }
++
++  const auto address = ParseUnsigned(address_it->second);
++  const auto size = ParseUnsigned(size_it->second);
++  if (!address)
++  {
++    if (error)
++      *error = "address must be an unsigned decimal or 0x-prefixed hexadecimal value";
++    return false;
++  }
++  if (!size || *size == 0 || *size > max_read_size)
++  {
++    if (error)
++      *error = "size must be between 1 and 16777216 bytes";
++    return false;
++  }
++  if (*address > UINT32_MAX - (*size - 1))
++  {
++    if (error)
++      *error = "address and size exceed the guest address space";
++    return false;
++  }
++
++  command->address = *address;
++  command->size = *size;
++  command->path = Trim(path_it->second);
++  return true;
++}
++
++bool ParseWriteMemoryCommand(const std::map<std::string, std::string>& values, Command* command,
++                             std::string* error)
++{
++  constexpr std::size_t max_write_size = 4096;
++  for (const auto& [key, value] : values)
++  {
++    if (key != "command" && key != "address" && key != "data")
++    {
++      if (error)
++        *error = "unknown write_memory field: " + key;
++      return false;
++    }
++  }
++
++  const auto address_it = values.find("address");
++  const auto data_it = values.find("data");
++  if (address_it == values.end() || data_it == values.end())
++  {
++    if (error)
++      *error = "write_memory requires address=<guest address> and data=<hex bytes>";
++    return false;
++  }
++
++  const auto address = ParseUnsigned(address_it->second);
++  const auto data = ParseHexBytes(data_it->second);
++  if (!address)
++  {
++    if (error)
++      *error = "address must be an unsigned decimal or 0x-prefixed hexadecimal value";
++    return false;
++  }
++  if (!data || data->empty() || data->size() > max_write_size)
++  {
++    if (error)
++      *error = "data must contain between 1 and 4096 hexadecimal bytes";
++    return false;
++  }
++  if (*address > UINT32_MAX - static_cast<std::uint32_t>(data->size() - 1))
++  {
++    if (error)
++      *error = "address and data exceed the guest address space";
++    return false;
++  }
++
++  command->address = *address;
++  command->data = *data;
++  command->size = static_cast<std::uint32_t>(data->size());
++  return true;
++}
++}  // namespace
++
++std::filesystem::path ResolveControlPath(const std::filesystem::path& automation_directory,
++                                         const std::filesystem::path& value)
++{
++  return value.is_absolute() ? value : automation_directory / value;
++}
++
++std::vector<std::filesystem::path>
++ListCommandFiles(const std::filesystem::path& commands_directory)
++{
++  std::vector<std::filesystem::path> result;
++  std::error_code ec;
++  if (!std::filesystem::is_directory(commands_directory, ec))
++    return result;
++
++  for (const auto& entry : std::filesystem::directory_iterator(commands_directory, ec))
++  {
++    if (ec)
++      break;
++    if (!entry.is_regular_file(ec))
++      continue;
++    result.push_back(entry.path());
++  }
++
++  std::ranges::sort(result);
++  return result;
++}
++
++bool ParseCommandFile(const std::filesystem::path& path, Command* command, std::string* error)
++{
++  const auto values = ParseKeyValueLines(path, error);
++  if (values.empty())
++  {
++    if (error && error->empty())
++      *error = "command file is empty";
++    return false;
++  }
++
++  const auto command_it = values.find("command");
++  if (command_it == values.end())
++  {
++    if (error)
++      *error = "command=<name> is required";
++    return false;
++  }
++
++  const auto type = ParseCommandType(command_it->second);
++  if (!type)
++  {
++    if (error)
++      *error = "unknown command: " + command_it->second;
++    return false;
++  }
++
++  Command parsed{};
++  parsed.type = *type;
++  parsed.source_name = path.filename().string();
++
++  switch (*type)
++  {
++  case CommandType::Pad:
++    if (!ParsePadCommand(values, &parsed, false, error))
++      return false;
++    break;
++  case CommandType::PadFrames:
++    if (!ParsePadCommand(values, &parsed, true, error))
++      return false;
++    break;
++  case CommandType::ClearPad:
++  {
++    const auto port_it = values.find("port");
++    if (port_it == values.end())
++    {
++      if (error)
++        *error = "clear_pad commands require port=0..3";
++      return false;
++    }
++    const auto port = ParsePort(port_it->second);
++    if (!port)
++    {
++      if (error)
++        *error = "port must be between 0 and 3";
++      return false;
++    }
++    parsed.pad.port = *port;
++    break;
++  }
++  case CommandType::SaveState:
++  case CommandType::LoadState:
++  case CommandType::Screenshot:
++  {
++    const auto path_it = values.find("path");
++    if (path_it == values.end() || Trim(path_it->second).empty())
++    {
++      if (error)
++        *error = "path=<file> is required";
++      return false;
++    }
++    parsed.path = Trim(path_it->second);
++    break;
++  }
++  case CommandType::ReadMemory:
++    if (!ParseReadMemoryCommand(values, &parsed, error))
++      return false;
++    break;
++  case CommandType::WriteMemory:
++    if (!ParseWriteMemoryCommand(values, &parsed, error))
++      return false;
++    break;
++  case CommandType::Pause:
++  case CommandType::Resume:
++  case CommandType::Stop:
++    break;
++  }
++
++  *command = std::move(parsed);
++  return true;
++}
++
++std::string FormatStatus(const Status& status)
++{
++  std::ostringstream output;
++  output << "state=" << status.state << '\n';
++  output << "booted=" << (status.booted ? "1" : "0") << '\n';
++  output << "fps=" << status.fps << '\n';
++  output << "vps=" << status.vps << '\n';
++  output << "speed=" << status.speed << '\n';
++  output << "frame_count=" << status.frame_count << '\n';
++  output << "present_count=" << status.present_count << '\n';
++  output << "title=" << status.title << '\n';
++  output << "game_id=" << status.game_id << '\n';
++  output << "game_name=" << status.game_name << '\n';
++  output << "navigation_mode=" << status.navigation_mode << '\n';
++  output << "navigation_valid=" << (status.navigation_valid ? "1" : "0")
++         << '\n';
++  output << "navigation_room_id=" << status.navigation_room_id << '\n';
++  output << "navigation_player_x=" << status.navigation_player_x << '\n';
++  output << "navigation_player_z=" << status.navigation_player_z << '\n';
++  output << "navigation_facing=" << status.navigation_facing << '\n';
++  output << "navigation_collision_valid="
++         << (status.navigation_collision_valid ? "1" : "0") << '\n';
++  output << "navigation_collision_base=" << status.navigation_collision_base << '\n';
++  output << "navigation_collision_segments="
++         << status.navigation_collision_segments << '\n';
++  output << "navigation_npc_count=" << status.navigation_npc_count << '\n';
++  output << "navigation_archive=" << status.navigation_archive << '\n';
++  output << "navigation_location=" << status.navigation_location << '\n';
++  output << "processed_commands=" << status.processed_commands << '\n';
++  output << "last_command=" << status.last_command << '\n';
++  output << "last_error=" << status.last_error << '\n';
++  return output.str();
++}
++}  // namespace moderngekko::automation
+diff --git a/ModernGekko/tools/automation_protocol.hpp b/ModernGekko/tools/automation_protocol.hpp
+new file mode 100644
+index 00000000..2396f01a
+--- /dev/null
++++ b/ModernGekko/tools/automation_protocol.hpp
+@@ -0,0 +1,83 @@
++#pragma once
++
++#include "InputCommon/ControllerInterface/Touch/InputOverrider.h"
++
++#include <array>
++#include <cstdint>
++#include <filesystem>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace moderngekko::automation
++{
++enum class CommandType
++{
++  Pad,
++  PadFrames,
++  ClearPad,
++  Pause,
++  Resume,
++  SaveState,
++  LoadState,
++  Screenshot,
++  ReadMemory,
++  WriteMemory,
++  Stop,
++};
++
++struct PadState
++{
++  int port = 0;
++  std::array<double, ciface::Touch::LAST_WII_CONTROL - ciface::Touch::FIRST_GC_CONTROL + 1>
++      controls{};
++};
++
++struct Command
++{
++  CommandType type = CommandType::Pause;
++  std::string source_name;
++  PadState pad;
++  std::filesystem::path path;
++  std::uint32_t address = 0;
++  std::uint32_t size = 0;
++  std::uint32_t frames = 0;
++  std::vector<std::uint8_t> data;
++};
++
++struct Status
++{
++  std::string state = "stopped";
++  bool booted = false;
++  double fps = 0.0;
++  double vps = 0.0;
++  double speed = 0.0;
++  std::uint64_t frame_count = 0;
++  std::uint64_t present_count = 0;
++  std::string title;
++  std::string game_id;
++  std::string game_name;
++  int navigation_mode = 0;
++  bool navigation_valid = false;
++  unsigned int navigation_room_id = 0;
++  float navigation_player_x = 0.0f;
++  float navigation_player_z = 0.0f;
++  float navigation_facing = 0.0f;
++  bool navigation_collision_valid = false;
++  std::uint32_t navigation_collision_base = 0;
++  std::uint32_t navigation_collision_segments = 0;
++  std::uint32_t navigation_npc_count = 0;
++  std::string navigation_archive;
++  std::string navigation_location;
++  std::uint64_t processed_commands = 0;
++  std::string last_command;
++  std::string last_error;
++};
++
++std::filesystem::path ResolveControlPath(const std::filesystem::path& automation_directory,
++                                         const std::filesystem::path& value);
++std::vector<std::filesystem::path>
++ListCommandFiles(const std::filesystem::path& commands_directory);
++bool ParseCommandFile(const std::filesystem::path& path, Command* command, std::string* error);
++std::string FormatStatus(const Status& status);
++}  // namespace moderngekko::automation
+diff --git a/ModernGekko/tools/moderngekko_run.cpp b/ModernGekko/tools/moderngekko_run.cpp
+index 3d1e4a2e..37b68b44 100644
+--- a/ModernGekko/tools/moderngekko_run.cpp
++++ b/ModernGekko/tools/moderngekko_run.cpp
+@@ -41,6 +41,8 @@ void Usage() {
+                "       [--widescreen]   (16:9; also Alt+W in-game)\n"
+                "       [--record <file.dtm>]  record this session as a replay\n"
+                "       [--replay <file.dtm>]  play a recorded session back\n"
++               "       [--load-state <file>]  boot straight into a savestate\n"
++               "       [--automation-dir <dir>]  file-based remote control\n"
+                "       [--netplay-host | --netplay-join <host>] "
+                "[--netplay-port <port>]\n"
+                "       [--nickname <name>] [--buffer <auto|1-20>] "
+@@ -281,6 +283,16 @@ int RunMain(int argc, char **argv) {
+       config.record_movie = value("--record");
+     else if (arg == "--replay")
+       config.replay_movie = value("--replay");
++    else if (arg == "--load-state") {
++      // Checked here: a missing state would otherwise boot to the title screen.
++      std::filesystem::path state = value("--load-state");
++      if (!std::filesystem::is_regular_file(state)) {
++        std::cerr << "savestate not found: " << state.string() << '\n';
++        return 2;
++      }
++      config.load_state_path = std::move(state);
++    } else if (arg == "--automation-dir")
++      config.automation.directory = value("--automation-dir");
+     else if (arg == "--headless")
+       config.headless = true;
+     else if (arg == "--allow-interpreter")

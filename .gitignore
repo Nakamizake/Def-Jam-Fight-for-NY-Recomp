@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Game data. Nothing derived from the disc may ever be committed:
+# disc images, extracted files, recompiled code and compiled game modules.
+# ---------------------------------------------------------------------------
+disc/
+*.iso
+*.gcm
+*.rvz
+*.gcz
+*.wia
+*.ciso
+*.nkit.*
+*.dol
+*.rel
+extracted/
+generated/
+
+# Build output
+build/
+build-*/
+cmake-build-*/
+CMakeUserPresets.json
+.cache/
+
+# Local tools and read-only reference checkouts (see docs/external-footprint.md)
+tools/
+references/
+
+# Runtime user data (saves, memory cards, logs, screenshots)
+userdata/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+.DS_Store
+Thumbs.db
+desktop.ini

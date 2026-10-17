@@ -1,0 +1,289 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/HW/GPFifo.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/HW/GPFifo.cpp
+index 0de434b9..ebba3f3f 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/HW/GPFifo.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/HW/GPFifo.cpp
+@@ -89,7 +89,11 @@ void GPFifoManager::UpdateGatherPipe()
+   auto& processor_interface = system.GetProcessorInterface();
+ 
+   size_t pipe_count = GetGatherPipeCount();
++  if (pipe_count >= GATHER_PIPE_SIZE)
++    system.GetCommandProcessor().RealignLinkedWritePointer();
++
+   size_t processed;
++  u32 chunks = 0;
+   for (processed = 0; pipe_count >= GATHER_PIPE_SIZE; processed += GATHER_PIPE_SIZE)
+   {
+     // copy the GatherPipe
+@@ -103,9 +107,15 @@ void GPFifoManager::UpdateGatherPipe()
+     else
+       processor_interface.m_fifo_cpu_write_pointer += GATHER_PIPE_SIZE;
+ 
+-    system.GetCommandProcessor().GatherPipeBursted();
++    ++chunks;
+   }
+ 
++  // One notification for every chunk copied above. Each one touches FIFO state the GPU
++  // thread reads (atomics, the GPU wake-up), so callers that let several chunks pile up
++  // (the static-recompilation core does) pay that once per batch instead of per chunk.
++  if (chunks != 0)
++    system.GetCommandProcessor().GatherPipeBursted(chunks);
++
+   // move back the spill bytes
+   memmove(m_gather_pipe, m_gather_pipe + processed, pipe_count);
+   SetGatherPipeCount(pipe_count);
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
+index 1dbf466f..9ef2431e 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
+@@ -336,7 +336,29 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
+   mmio->Register(base | FIFO_READ_POINTER_HI, fifo_read_hi_r, fifo_read_hi_w);
+ }
+ 
+-void CommandProcessorManager::GatherPipeBursted()
++void CommandProcessorManager::RealignLinkedWritePointer()
++{
++  if (!m_cp_ctrl_reg.GPLinkEnable)
++    return;
++
++  // A PI range different from the CP one is deliberate multi-buffering: nothing to realign.
++  auto& processor_interface = m_system.GetProcessorInterface();
++  if (processor_interface.m_fifo_cpu_base != m_fifo.CPBase.load(std::memory_order_relaxed) ||
++      processor_interface.m_fifo_cpu_end != m_fifo.CPEnd.load(std::memory_order_relaxed))
++  {
++    return;
++  }
++
++  const u32 write_pointer = m_fifo.CPWritePointer.load(std::memory_order_relaxed);
++  if (processor_interface.m_fifo_cpu_write_pointer == write_pointer)
++    return;
++
++  WARN_LOG_FMT(COMMANDPROCESSOR, "Linked FIFO write pointers diverged (PI {:08x}, CP {:08x})",
++               processor_interface.m_fifo_cpu_write_pointer, write_pointer);
++  processor_interface.m_fifo_cpu_write_pointer = write_pointer;
++}
++
++void CommandProcessorManager::GatherPipeBursted(u32 chunks)
+ {
+   SetCPStatusFromCPU();
+ 
+@@ -360,16 +382,13 @@ void CommandProcessorManager::GatherPipeBursted()
+     return;
+   }
+ 
+-  // update the fifo pointer
+-  if (m_fifo.CPWritePointer.load(std::memory_order_relaxed) ==
+-      m_fifo.CPEnd.load(std::memory_order_relaxed))
+-  {
+-    m_fifo.CPWritePointer.store(m_fifo.CPBase, std::memory_order_relaxed);
+-  }
+-  else
+-  {
+-    m_fifo.CPWritePointer.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_relaxed);
+-  }
++  // update the fifo pointer (the CPU thread is its only writer)
++  const u32 fifo_base = m_fifo.CPBase.load(std::memory_order_relaxed);
++  const u32 fifo_end = m_fifo.CPEnd.load(std::memory_order_relaxed);
++  u32 write_pointer = m_fifo.CPWritePointer.load(std::memory_order_relaxed);
++  for (u32 i = 0; i < chunks; ++i)
++    write_pointer = write_pointer == fifo_end ? fifo_base : write_pointer + GPFifo::GATHER_PIPE_SIZE;
++  m_fifo.CPWritePointer.store(write_pointer, std::memory_order_relaxed);
+ 
+   if (m_cp_ctrl_reg.GPReadEnable && m_cp_ctrl_reg.GPLinkEnable)
+   {
+@@ -383,7 +402,8 @@ void CommandProcessorManager::GatherPipeBursted()
+   if (m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) != 0)
+     m_system.GetCoreTiming().ForceExceptionCheck(0);
+ 
+-  m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
++  m_fifo.CPReadWriteDistance.fetch_add(chunks * GPFifo::GATHER_PIPE_SIZE,
++                                       std::memory_order_seq_cst);
+ 
+   m_system.GetFifo().RunGpu();
+ 
+@@ -439,6 +459,20 @@ bool CommandProcessorManager::IsInterruptWaiting() const
+   return m_interrupt_waiting.IsSet();
+ }
+ 
++void CommandProcessorManager::UpdateWatermarkFlags()
++{
++  // Both threads call this on every gather-pipe burst. The flags share a cache line with
++  // the FIFO pointers, so an unconditional store makes the line bounce between cores even
++  // though the flags almost never change; store only on a change.
++  const u32 distance = m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
++  const u32 hi = distance > m_fifo.CPHiWatermark ? 1 : 0;
++  const u32 lo = distance < m_fifo.CPLoWatermark ? 1 : 0;
++  if (m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) != hi)
++    m_fifo.bFF_HiWatermark.store(hi, std::memory_order_relaxed);
++  if (m_fifo.bFF_LoWatermark.load(std::memory_order_relaxed) != lo)
++    m_fifo.bFF_LoWatermark.store(lo, std::memory_order_relaxed);
++}
++
+ void CommandProcessorManager::SetCPStatusFromGPU()
+ {
+   // breakpoint
+@@ -476,12 +510,7 @@ void CommandProcessorManager::SetCPStatusFromGPU()
+   }
+ 
+   // overflow & underflow check
+-  m_fifo.bFF_HiWatermark.store(
+-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > m_fifo.CPHiWatermark),
+-      std::memory_order_relaxed);
+-  m_fifo.bFF_LoWatermark.store(
+-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) < m_fifo.CPLoWatermark),
+-      std::memory_order_relaxed);
++  UpdateWatermarkFlags();
+ 
+   bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
+                m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
+@@ -514,12 +543,7 @@ void CommandProcessorManager::SetCPStatusFromGPU()
+ void CommandProcessorManager::SetCPStatusFromCPU()
+ {
+   // overflow & underflow check
+-  m_fifo.bFF_HiWatermark.store(
+-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > m_fifo.CPHiWatermark),
+-      std::memory_order_relaxed);
+-  m_fifo.bFF_LoWatermark.store(
+-      (m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) < m_fifo.CPLoWatermark),
+-      std::memory_order_relaxed);
++  UpdateWatermarkFlags();
+ 
+   bool bpInt = m_fifo.bFF_Breakpoint.load(std::memory_order_relaxed) &&
+                m_fifo.bFF_BPInt.load(std::memory_order_relaxed);
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.h
+index 976592c8..39dbd7a8 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.h
+@@ -171,7 +171,12 @@ public:
+ 
+   void SetCPStatusFromGPU();
+   void SetCPStatusFromCPU();
+-  void GatherPipeBursted();
++  // Called once the CPU has written `chunks` gather-pipe bursts (32 bytes each) to the FIFO.
++  void GatherPipeBursted(u32 chunks = 1);
++  // In linked mode the CPU copies bursts to the PI write pointer while the GPU reads up to the CP
++  // write pointer, so the two must agree. Snaps the PI pointer back onto the CP one if the game
++  // left it somewhere else (e.g. a gather-pipe redirect restored with a stale saved pointer).
++  void RealignLinkedWritePointer();
+   void UpdateInterrupts(u64 userdata);
+   void UpdateInterruptsFromVideoBackend(u64 userdata);
+ 
+@@ -189,6 +194,8 @@ public:
+   SCPFifoStruct& GetFifo() { return m_fifo; }
+ 
+ private:
++  void UpdateWatermarkFlags();
++
+   SCPFifoStruct m_fifo;
+ 
+   CoreTiming::EventType* m_event_type_update_interrupts = nullptr;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp
+index c1ef15da..f5ef364a 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "VideoCommon/Fifo.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <cstdio>
+ #include <cstring>
+@@ -37,6 +38,10 @@ namespace Fifo
+ {
+ static constexpr int GPU_TIME_SLOT_SIZE = 1000;
+ 
++// Gather-pipe chunks the GPU thread decodes between updates of the FIFO state it
++// shares with the CPU thread (2 KiB). See RunGpuLoop().
++static constexpr u32 MAX_BATCH_CHUNKS = 64;
++
+ FifoManager::FifoManager(Core::System& system) : m_system{system}
+ {
+ }
+@@ -332,25 +337,48 @@ void FifoManager::RunGpuLoop()
+             // afterwards would then clobber the new configuration.
+             const u32 batch_base = fifo.CPBase.load(std::memory_order_relaxed);
+             const u32 batch_end = fifo.CPEnd.load(std::memory_order_relaxed);
+-            ReadDataFromFifo(readPtr);
+ 
+-            if (readPtr == fifo.CPEnd.load(std::memory_order_relaxed))
+-              readPtr = fifo.CPBase.load(std::memory_order_relaxed);
+-            else
+-              readPtr += GPFifo::GATHER_PIPE_SIZE;
++            // Decode up to MAX_BATCH_CHUNKS gather-pipe chunks before publishing the
++            // read pointer, the distance and the watermark flags. Those live on the
++            // cache lines the CPU thread writes on every 32-byte burst, so updating
++            // them per chunk made both threads trade cache lines thousands of times
++            // a frame (a third of this thread's time, measured in a Def Jam fight).
++            // Each chunk is still decoded as soon as it is copied. Only chunks
++            // already counted in the distance are taken, so a batch never reads
++            // past what the CPU wrote. CP breakpoints must stop at an exact read
++            // pointer and SyncGPU meters cycles per chunk, so both keep size 1.
++            const u32 available_chunks =
++                fifo.CPReadWriteDistance.load(std::memory_order_relaxed) /
++                GPFifo::GATHER_PIPE_SIZE;
++            const bool single_chunk =
++                m_config_sync_gpu || fifo.bFF_BPEnable.load(std::memory_order_relaxed) != 0;
++            const u32 batch_chunks =
++                single_chunk ? 1 : std::clamp<u32>(available_chunks, 1, MAX_BATCH_CHUNKS);
++
++            u8* write_ptr = m_video_buffer_write_ptr;
++            for (u32 chunk = 0; chunk < batch_chunks; ++chunk)
++            {
++              ReadDataFromFifo(readPtr);
++
++              if (readPtr == batch_end)
++                readPtr = batch_base;
++              else
++                readPtr += GPFifo::GATHER_PIPE_SIZE;
++
++              write_ptr = m_video_buffer_write_ptr;
++              m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
++                  DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
++            }
++            const u32 batch_bytes = batch_chunks * GPFifo::GATHER_PIPE_SIZE;
+ 
+             const s32 distance =
+                 static_cast<s32>(fifo.CPReadWriteDistance.load(std::memory_order_relaxed)) -
+-                GPFifo::GATHER_PIPE_SIZE;
++                static_cast<s32>(batch_bytes);
+             ASSERT_MSG(COMMANDPROCESSOR, distance >= 0,
+                        "Negative fifo.CPReadWriteDistance = {} in FIFO Loop !\nThat can produce "
+                        "instability in the game. Please report it.",
+                        distance);
+ 
+-            u8* write_ptr = m_video_buffer_write_ptr;
+-            m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
+-                DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
+-
+             // Only write back into the FIFO this batch actually came from.
+             //
+             // Measured on a Steam Deck 2026-09-02: entering a fight, the game
+@@ -368,8 +396,7 @@ void FifoManager::RunGpuLoop()
+             if (same_fifo)
+             {
+               fifo.CPReadPointer.store(readPtr, std::memory_order_relaxed);
+-              fifo.CPReadWriteDistance.fetch_sub(GPFifo::GATHER_PIPE_SIZE,
+-                                                 std::memory_order_seq_cst);
++              fifo.CPReadWriteDistance.fetch_sub(batch_bytes, std::memory_order_seq_cst);
+               if ((write_ptr - m_video_buffer_read_ptr) == 0)
+               {
+                 fifo.SafeCPReadPointer.store(fifo.CPReadPointer.load(std::memory_order_relaxed),
+diff --git a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.c b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.c
+index bddd77be..210d9d4f 100644
+--- a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.c
++++ b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.c
+@@ -105,7 +105,13 @@ PPC_MODULE_EXPORT void ppc_set_gather_pipe(u8** cursor, u8* const* base,
+ }
+ 
+ #define GATHER_PIPE_PAGE 0xCC008000u
+-#define GATHER_PIPE_FILL 32u
++// Fill mark for calling back into the runtime: eight whole 32-byte chunks. Every callback
++// hands the chunks to the GPU thread through shared atomics, so calling back per chunk
++// (the hardware's burst size) cost a Def Jam fight a tenth of the CPU thread. The runtime
++// flushes whatever whole chunks are left below the mark before CoreTiming events, idle
++// skipping and MMIO, so nothing observes the difference. 256 plus one 8-byte store stays
++// well inside the runtime's GATHER_PIPE_EXTRA_SIZE (512) buffer.
++#define GATHER_PIPE_FILL 256u
+ 
+ // Returns 1 when the store was serviced here. Keyed on the effective page,
+ // exactly as the chassis hook is, so which addresses take this path does not

@@ -1,0 +1,35 @@
+# dolrecomp flags for Def Jam: Fight for NY (GNWE69), read by scripts/build-module.ps1.
+# One flag (with its value) per line; '#' starts a comment.
+#
+# These are RingOut's (lib/RingOut) generic speed-ups, as its setup.ps1 applies them to
+# SoulCalibur II. SoulCalibur-specific ones are left out: --native-skin/--skin-simd
+# (its skinning loops), --native-regions and --twin-hot (need a per-game training list)
+# and --dispatch-pc (RingOut's FMV hooks; the runtime hooks nothing for this disc).
+
+# The OS idle spin loop stays a dispatcher return so idle-skip keeps working
+# (found automatically; 0x80276D20 on this disc).
+--idle-pc auto
+
+# Entry switch cases only where control can arrive (identical game state).
+--leader-cases
+
+# Calls between and within chunks go native instead of through the dispatcher.
+# Changes guest timing slightly (not game behaviour).
+--direct-calls
+--self-calls
+--indirect-calls
+
+# Fewer returns to the dispatcher.
+--jump-tables
+--function-overhang 4096
+--loop-budget 4000
+--dynamic-loop-budget
+
+# Small leaf functions inlined at native call sites.
+--inline-leaves 32
+
+# Stores off r1/r2/r13 (stack and small-data bases) skip the RAM/MMIO range test.
+--ram-bases 1,2,13
+
+# One MSR.FP test per straight-line run of FP instructions.
+--fp-check-once

@@ -1,0 +1,25 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
+index 9ef2431e..6c852d88 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
+@@ -571,6 +571,20 @@ void CommandProcessorManager::SetCPStatusFromCPU()
+       UpdateInterrupts(userdata);
+     }
+   }
++  else if (ovfInt && !m_interrupt_set.IsSet() && IsOnThread(m_system))
++  {
++    // The FIFO is past its high watermark while an interrupt update from the GPU thread is
++    // still pending. The GPU thread marks the update pending before it queues the event, and
++    // when it is descheduled in between, nothing reaches this thread: a trace caught the event
++    // still missing 330 us later. Waiting for it let the CPU thread fill the remaining 16 KiB
++    // and overwrite commands the GPU had not read yet (Def Jam: Fight for NY, while the GPU is
++    // parked on its end-of-frame breakpoint), which left the GPU hung on garbage. On hardware
++    // the CP raises this interrupt as the CPU's writes arrive, so raise it here; the pending
++    // update, when it runs, only sets the same line again or clears it for the GPU thread to
++    // re-evaluate.
++    m_interrupt_set.Set();
++    m_system.GetProcessorInterface().SetInterrupt(INT_CAUSE_CP, true);
++  }
+ }
+ 
+ void CommandProcessorManager::SetCpStatusRegister()

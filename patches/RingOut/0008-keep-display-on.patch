@@ -1,0 +1,39 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index ffb857af..0e210455 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -1308,6 +1308,26 @@ std::jthread StartTitleThread() {
+     }
+   });
+ }
++
++// Gamepad input does not reset the OS idle timer, so without this the display could go to sleep
++// in the middle of a fight played on a controller. Held for the whole session, as Dolphin does
++// while a game runs.
++class ScreenSaverInhibitor {
++public:
++  explicit ScreenSaverInhibitor(bool active) : m_active(active) {
++    if (m_active)
++      UICommon::InhibitScreenSaver(true);
++  }
++  ~ScreenSaverInhibitor() {
++    if (m_active)
++      UICommon::InhibitScreenSaver(false);
++  }
++  ScreenSaverInhibitor(const ScreenSaverInhibitor &) = delete;
++  ScreenSaverInhibitor &operator=(const ScreenSaverInhibitor &) = delete;
++
++private:
++  bool m_active;
++};
+ } // namespace
+ 
+ Runtime::Runtime(std::unique_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+@@ -1411,6 +1431,7 @@ RuntimeRunResult Runtime::Run() {
+             RuntimeError{RuntimeErrorCode::InvalidState,
+                          "runtime is already running"}};
+ 
++  const ScreenSaverInhibitor screen_saver_inhibitor(!m_impl->config.headless);
+   std::unique_ptr<BootParameters> boot =
+       TakeBootParameters(m_impl->metadata.main_dol.string(), m_impl->config.load_state_path);
+   if (!boot) {

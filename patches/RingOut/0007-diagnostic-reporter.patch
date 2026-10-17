@@ -1,0 +1,841 @@
+diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
+index 59e38ded..daaa4b12 100644
+--- a/ModernGekko/CMakeLists.txt
++++ b/ModernGekko/CMakeLists.txt
+@@ -309,6 +309,7 @@ target_link_libraries(moderngekko PUBLIC ModernGekko::ABI PRIVATE fmt::fmt)
+ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     target_sources(moderngekko PRIVATE
+         src/runtime/dolphin_runtime.cpp
++        src/runtime/diagnostic_reporter.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/ModernGekko/src/runtime/diagnostic_reporter.cpp b/ModernGekko/src/runtime/diagnostic_reporter.cpp
+new file mode 100644
+index 00000000..caf4b8ed
+--- /dev/null
++++ b/ModernGekko/src/runtime/diagnostic_reporter.cpp
+@@ -0,0 +1,677 @@
++#include "diagnostic_reporter.hpp"
++
++#include <algorithm>
++#include <cstring>
++#include <ctime>
++#include <fstream>
++#include <iterator>
++#include <map>
++#include <optional>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/Swap.h"
++#include "Core/Core.h"
++#include "Core/CoreTiming.h"
++#include "Core/HW/ProcessorInterface.h"
++#include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
++#include "Core/System.h"
++#include "VideoCommon/CommandProcessor.h"
++#include "VideoCommon/Fifo.h"
++#include "VideoCommon/VideoEvents.h"
++
++#if defined(_WIN32) && defined(_M_X64) && defined(_MSC_VER)
++#define MODERNGEKKO_NATIVE_STACKS 1
++#include <windows.h>
++#include <tlhelp32.h>
++#endif
++
++namespace moderngekko {
++namespace {
++using Clock = std::chrono::steady_clock;
++
++std::int64_t NowNs() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             Clock::now().time_since_epoch())
++      .count();
++}
++
++std::string LocalTimestamp(const char *format) {
++  const std::time_t now = std::time(nullptr);
++  std::tm local{};
++#if defined(_WIN32)
++  localtime_s(&local, &now);
++#else
++  localtime_r(&now, &local);
++#endif
++  char text[32];
++  std::strftime(text, sizeof(text), format, &local);
++  return text;
++}
++
++const char *CoreStateName(Core::State state) {
++  switch (state) {
++  case Core::State::Uninitialized: return "uninitialized";
++  case Core::State::Paused: return "paused";
++  case Core::State::Running: return "running";
++  case Core::State::Stopping: return "stopping";
++  case Core::State::Starting: return "starting";
++  }
++  return "unknown";
++}
++
++// --- guest -------------------------------------------------------------------
++
++// Reads a big-endian guest word from RAM, or nothing if the address is not RAM.
++std::optional<u32> ReadGuestWord(const CPUState &cpu, u32 address) {
++  if (address < 0x80000000u || !cpu.ram)
++    return std::nullopt;
++  const u32 offset = address & 0x3FFFFFFFu;  // 0x8 cached and 0xC uncached mirrors
++  if ((address & 3) != 0 || offset + 4 > cpu.ram_size)
++    return std::nullopt;
++  u32 value;
++  std::memcpy(&value, cpu.ram + offset, sizeof(value));
++  return Common::swap32(value);
++}
++
++// PowerPC EABI: each frame starts with the caller's stack pointer (the back
++// chain), and a non-leaf function saves its return address one word above its
++// caller's frame. The innermost entry may be stale while the current function
++// is a leaf or has not saved lr yet.
++void DescribeGuestCallStack(const CPUState &cpu, u32 stack_pointer, int max_depth,
++                            const char *indent, std::string &out) {
++  u32 frame = stack_pointer;
++  for (int depth = 0; depth < max_depth; ++depth) {
++    const std::optional<u32> caller_frame = ReadGuestWord(cpu, frame);
++    if (!caller_frame || *caller_frame <= frame)
++      break;
++    const std::optional<u32> return_address = ReadGuestWord(cpu, *caller_frame + 4);
++    if (!return_address)
++      break;
++    fmt::format_to(std::back_inserter(out), "{}#{:02} {:08x}  (frame {:08x})\n", indent, depth,
++                   *return_address, *caller_frame);
++    frame = *caller_frame;
++  }
++}
++
++void DescribeGuest(std::string &out) {
++  if (!g_static_recomp_core) {
++    out += "  static recompiler core not active\n";
++    return;
++  }
++  const CPUState &cpu = g_static_recomp_core->GuestStateForDiagnostics();
++  fmt::format_to(std::back_inserter(out),
++                 "  pc {:08x}  lr {:08x}  ctr {:08x}  msr {:08x}  cr {:08x}  xer {:08x}\n",
++                 cpu.pc, cpu.lr, cpu.ctr, cpu.msr, cpu_cr_get(&cpu), cpu.xer);
++  for (int i = 0; i < 32; i += 4) {
++    fmt::format_to(std::back_inserter(out), "  r{:<2} {:08x}  r{:<2} {:08x}  r{:<2} {:08x}  r{:<2} {:08x}\n",
++                   i, cpu.gpr[i], i + 1, cpu.gpr[i + 1], i + 2, cpu.gpr[i + 2], i + 3,
++                   cpu.gpr[i + 3]);
++  }
++  out += "  call stack (saved return addresses, innermost first):\n";
++  DescribeGuestCallStack(cpu, cpu.gpr[1], 48, "    ", out);
++}
++
++// The Dolphin OS thread list (Core/Debugger/OSThread.h has the layout): every
++// game thread with its state, what it is blocked on and where it stopped. In a
++// freeze this is usually the whole answer -- who waits on which queue.
++void DescribeGuestThreads(std::string &out) {
++  if (!g_static_recomp_core) {
++    out += "  static recompiler core not active\n";
++    return;
++  }
++  const CPUState &cpu = g_static_recomp_core->GuestStateForDiagnostics();
++  constexpr u32 kActiveQueueHead = 0x800000DC;
++  constexpr u32 kCurrentThread = 0x800000E4;
++  constexpr u32 kState = 0x2C8, kSuspend = 0x2CC, kPriority = 0x2D0, kQueue = 0x2DC,
++                kMutex = 0x2F0, kNextActive = 0x2FC, kLr = 0x84, kSrr0 = 0x198, kGpr1 = 0x4;
++  const auto read16 = [&](u32 address) -> std::optional<u32> {
++    const std::optional<u32> word = ReadGuestWord(cpu, address & ~3u);
++    if (!word)
++      return std::nullopt;
++    return (address & 2) ? (*word & 0xFFFF) : (*word >> 16);
++  };
++  const std::optional<u32> current = ReadGuestWord(cpu, kCurrentThread);
++  std::optional<u32> thread = ReadGuestWord(cpu, kActiveQueueHead);
++  for (int count = 0; thread && *thread != 0 && count < 64; ++count) {
++    const u32 t = *thread;
++    const std::optional<u32> state = read16(t + kState);
++    if (!state)
++      break;
++    const char *state_name = *state == 1 ? "ready" : *state == 2 ? "running" :
++                             *state == 4 ? "waiting" : *state == 8 ? "moribund" : "?";
++    fmt::format_to(std::back_inserter(out),
++                   "  thread {:08x}{}  {}  priority {}  suspend {}  waits on queue {:08x}  "
++                   "mutex {:08x}\n    saved pc {:08x}  lr {:08x}  sp {:08x}\n",
++                   t, current && *current == t ? " (current)" : "", state_name,
++                   ReadGuestWord(cpu, t + kPriority).value_or(0),
++                   static_cast<s32>(ReadGuestWord(cpu, t + kSuspend).value_or(0)),
++                   ReadGuestWord(cpu, t + kQueue).value_or(0),
++                   ReadGuestWord(cpu, t + kMutex).value_or(0),
++                   ReadGuestWord(cpu, t + kSrr0).value_or(0), ReadGuestWord(cpu, t + kLr).value_or(0),
++                   ReadGuestWord(cpu, t + kGpr1).value_or(0));
++    DescribeGuestCallStack(cpu, ReadGuestWord(cpu, t + kGpr1).value_or(0), 12, "      ", out);
++    thread = ReadGuestWord(cpu, t + kNextActive);
++  }
++}
++
++// --- GPU FIFO ----------------------------------------------------------------
++
++void DescribeBytes(const char *label, const u8 *data, std::size_t size, std::string &out) {
++  fmt::format_to(std::back_inserter(out), "  {}:\n", label);
++  for (std::size_t row = 0; row < size; row += 32) {
++    out += "    ";
++    for (std::size_t i = row; i < std::min(size, row + 32); ++i)
++      fmt::format_to(std::back_inserter(out), "{:02x}{}", data[i], (i % 4 == 3) ? " " : "");
++    out += '\n';
++  }
++}
++
++void DescribeFifo(Core::System &system, std::string &out) {
++  auto &command_processor = system.GetCommandProcessor();
++  const auto &fifo = command_processor.GetFifo();
++  const auto &processor_interface = system.GetProcessorInterface();
++  const auto load = [](const std::atomic<u32> &value) {
++    return value.load(std::memory_order_relaxed);
++  };
++  fmt::format_to(std::back_inserter(out),
++                 "  CP base {:08x}  end {:08x}  read {:08x}  write {:08x}  distance {:08x}\n"
++                 "  CP breakpoint {:08x}  hi watermark {:08x}  lo watermark {:08x}\n"
++                 "  flags: link {} read-enable {} bp-enable {} bp-int {} at-bp {} "
++                 "hi-wm {} (int {}) lo-wm {} (int {})  interrupt waiting {}\n"
++                 "  PI base {:08x}  end {:08x}  write {:08x}{}\n"
++                 "  video buffer: {} bytes copied but not decoded yet\n",
++                 load(fifo.CPBase), load(fifo.CPEnd), load(fifo.CPReadPointer),
++                 load(fifo.CPWritePointer), load(fifo.CPReadWriteDistance),
++                 load(fifo.CPBreakpoint), fifo.CPHiWatermark, fifo.CPLoWatermark,
++                 load(fifo.bFF_GPLinkEnable), load(fifo.bFF_GPReadEnable),
++                 load(fifo.bFF_BPEnable), load(fifo.bFF_BPInt), load(fifo.bFF_Breakpoint),
++                 load(fifo.bFF_HiWatermark), load(fifo.bFF_HiWatermarkInt),
++                 load(fifo.bFF_LoWatermark), load(fifo.bFF_LoWatermarkInt),
++                 command_processor.IsInterruptWaiting(), processor_interface.m_fifo_cpu_base,
++                 processor_interface.m_fifo_cpu_end, processor_interface.m_fifo_cpu_write_pointer,
++                 processor_interface.m_fifo_cpu_write_pointer == load(fifo.CPWritePointer) ?
++                     "" :
++                     "  (differs from CP write)",
++                 system.GetFifo().PendingVideoBufferBytesForDiagnostics());
++
++  // The bytes around the stall point: the command the decoder is stuck on, and
++  // the FIFO memory just before the read pointer (what it consumed last).
++  const std::size_t pending = system.GetFifo().PendingVideoBufferBytesForDiagnostics();
++  if (pending > 0 && pending < (64u << 20))
++    DescribeBytes("pending video data", system.GetFifo().PendingVideoBufferForDiagnostics(),
++                  std::min<std::size_t>(pending, 96), out);
++  if (g_static_recomp_core) {
++    const CPUState &cpu = g_static_recomp_core->GuestStateForDiagnostics();
++    const u32 read = load(fifo.CPReadPointer);
++    const u32 start = read >= 96 ? read - 96 : 0;
++    if (cpu.ram && read <= cpu.ram_size)
++      DescribeBytes(fmt::format("FIFO memory {:08x}..{:08x}", start, read).c_str(), cpu.ram + start,
++                    read - start, out);
++  }
++}
++
++// --- native threads ----------------------------------------------------------
++
++#ifdef MODERNGEKKO_NATIVE_STACKS
++constexpr int kMaxNativeFrames = 64;
++constexpr std::size_t kMaxStackCopy = 4 * 1024 * 1024;
++
++struct NativeStack {
++  DWORD thread_id = 0;
++  std::string name;
++  std::vector<std::uintptr_t> frames;
++  std::string note;
++};
++
++// The SEH helpers below hold no C++ objects, which __try requires.
++bool CopyMemorySafely(void *destination, const void *source, std::size_t size) {
++  __try {
++    std::memcpy(destination, source, size);
++    return true;
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++    return false;
++  }
++}
++
++// Unwinds `context` with the x64 unwind tables, keeping rsp inside
++// [stack_low, stack_high). Code without unwind data (JIT output) is treated as
++// a leaf, which is right for leaves and ends the walk early otherwise.
++int UnwindFrames(CONTEXT *context, std::uintptr_t stack_low, std::uintptr_t stack_high,
++                 std::uintptr_t *frames, int max_frames) {
++  int count = 0;
++  __try {
++    while (count < max_frames && context->Rip != 0) {
++      frames[count++] = context->Rip;
++      if (context->Rsp < stack_low || context->Rsp + 8 > stack_high)
++        break;
++      DWORD64 image_base = 0;
++      PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context->Rip, &image_base, nullptr);
++      if (!function) {
++        context->Rip = *reinterpret_cast<const DWORD64 *>(context->Rsp);
++        context->Rsp += 8;
++        continue;
++      }
++      void *handler_data = nullptr;
++      DWORD64 establisher_frame = 0;
++      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
++                       &handler_data, &establisher_frame, nullptr);
++    }
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++  }
++  return count;
++}
++
++std::string ThreadName(HANDLE thread) {
++  using GetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
++  static const auto get_description = reinterpret_cast<GetThreadDescriptionFn>(
++      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
++  if (!get_description)
++    return {};
++  PWSTR wide = nullptr;
++  if (FAILED(get_description(thread, &wide)) || !wide)
++    return {};
++  std::string name;
++  for (const wchar_t *c = wide; *c; ++c)
++    name += *c < 0x80 ? static_cast<char>(*c) : '?';
++  LocalFree(wide);
++  return name;
++}
++
++// Stack range of another thread, from its TEB (NT_TIB.StackLimit/StackBase).
++bool ThreadStackRange(HANDLE thread, std::uintptr_t *low, std::uintptr_t *high) {
++  struct ThreadBasicInformation {
++    LONG exit_status;
++    PVOID teb;
++    HANDLE process_id;
++    HANDLE thread_id;
++    ULONG_PTR affinity;
++    LONG priority;
++    LONG base_priority;
++  };
++  using NtQueryInformationThreadFn = LONG(NTAPI *)(HANDLE, int, PVOID, ULONG, PULONG);
++  static const auto query = reinterpret_cast<NtQueryInformationThreadFn>(
++      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
++  ThreadBasicInformation info{};
++  if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof(info), nullptr) < 0 ||
++      !info.teb)
++    return false;
++  const NT_TIB *tib = static_cast<const NT_TIB *>(info.teb);
++  *low = reinterpret_cast<std::uintptr_t>(tib->StackLimit);
++  *high = reinterpret_cast<std::uintptr_t>(tib->StackBase);
++  return *low < *high;
++}
++
++// Captures another thread's stack without unwinding it in place: the thread is
++// suspended only long enough to read its registers and copy its used stack,
++// because the unwinder takes loader locks a suspended thread might hold. The
++// copy is then unwound with stack pointers rebased onto it.
++void CaptureOtherThread(DWORD thread_id, std::vector<std::uint8_t> &buffer, NativeStack &stack) {
++  HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
++                             FALSE, thread_id);
++  if (!thread) {
++    stack.note = "could not open thread";
++    return;
++  }
++  stack.name = ThreadName(thread);
++  std::uintptr_t stack_low = 0, stack_high = 0;
++  if (!ThreadStackRange(thread, &stack_low, &stack_high)) {
++    stack.note = "could not read stack range";
++    CloseHandle(thread);
++    return;
++  }
++
++  CONTEXT context{};
++  context.ContextFlags = CONTEXT_FULL;
++  std::size_t copied = 0;
++  bool captured = false;
++  if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
++    if (GetThreadContext(thread, &context) && context.Rsp >= stack_low && context.Rsp < stack_high) {
++      copied = std::min<std::size_t>(stack_high - context.Rsp, buffer.size());
++      captured = CopyMemorySafely(buffer.data(), reinterpret_cast<const void *>(context.Rsp), copied);
++    }
++    ResumeThread(thread);
++  }
++  CloseHandle(thread);
++  if (!captured) {
++    stack.note = "could not capture registers or stack";
++    return;
++  }
++
++  // Rebase every pointer into the original stack (saved frame pointers,
++  // registers) onto the copy, so the unwinder never reads the live stack.
++  const std::uintptr_t original = context.Rsp;
++  const std::uintptr_t copy = reinterpret_cast<std::uintptr_t>(buffer.data());
++  const auto rebase = [&](DWORD64 &value) {
++    if (value >= original && value < original + copied)
++      value = value - original + copy;
++  };
++  for (std::size_t offset = 0; offset + 8 <= copied; offset += 8)
++    rebase(*reinterpret_cast<DWORD64 *>(buffer.data() + offset));
++  for (DWORD64 *reg : {&context.Rax, &context.Rbx, &context.Rcx, &context.Rdx, &context.Rsi,
++                       &context.Rdi, &context.Rbp, &context.Rsp, &context.R8, &context.R9,
++                       &context.R10, &context.R11, &context.R12, &context.R13, &context.R14,
++                       &context.R15})
++    rebase(*reg);
++
++  std::uintptr_t frames[kMaxNativeFrames];
++  const int count = UnwindFrames(&context, copy, copy + copied, frames, kMaxNativeFrames);
++  stack.frames.assign(frames, frames + count);
++  if (copied == buffer.size())
++    stack.note = "stack copy truncated";
++}
++
++void CaptureCurrentThread(const CONTEXT &crash_context, NativeStack &stack) {
++  stack.thread_id = GetCurrentThreadId();
++  stack.name = ThreadName(GetCurrentThread());
++  ULONG_PTR low = 0, high = 0;
++  GetCurrentThreadStackLimits(&low, &high);
++  CONTEXT context = crash_context;
++  std::uintptr_t frames[kMaxNativeFrames];
++  const int count = UnwindFrames(&context, low, high, frames, kMaxNativeFrames);
++  stack.frames.assign(frames, frames + count);
++}
++
++std::vector<NativeStack> CaptureAllThreads(const CONTEXT *current_thread_context) {
++  std::vector<DWORD> thread_ids;
++  const DWORD process_id = GetCurrentProcessId();
++  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++  if (snapshot != INVALID_HANDLE_VALUE) {
++    THREADENTRY32 entry{};
++    entry.dwSize = sizeof(entry);
++    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
++      if (entry.th32OwnerProcessID == process_id)
++        thread_ids.push_back(entry.th32ThreadID);
++    }
++    CloseHandle(snapshot);
++  }
++
++  std::vector<NativeStack> stacks;
++  stacks.reserve(thread_ids.size());
++  std::vector<std::uint8_t> buffer(kMaxStackCopy);
++  const DWORD self = GetCurrentThreadId();
++  for (const DWORD thread_id : thread_ids) {
++    NativeStack &stack = stacks.emplace_back();
++    stack.thread_id = thread_id;
++    if (thread_id != self)
++      CaptureOtherThread(thread_id, buffer, stack);
++    else if (current_thread_context)
++      CaptureCurrentThread(*current_thread_context, stack);
++    else
++      stack.note = "diagnostics thread";
++  }
++  return stacks;
++}
++
++struct ModuleInfo {
++  std::string name;
++  std::string path;
++  std::uintptr_t base = 0;
++};
++
++std::optional<ModuleInfo> ModuleAt(std::uintptr_t address) {
++  HMODULE module = nullptr;
++  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                          reinterpret_cast<LPCWSTR>(address), &module))
++    return std::nullopt;
++  wchar_t wide[MAX_PATH];
++  const DWORD length = GetModuleFileNameW(module, wide, MAX_PATH);
++  ModuleInfo info;
++  info.base = reinterpret_cast<std::uintptr_t>(module);
++  for (DWORD i = 0; i < length; ++i)
++    info.path += wide[i] < 0x80 ? static_cast<char>(wide[i]) : '?';
++  const std::size_t slash = info.path.find_last_of("\\/");
++  info.name = slash == std::string::npos ? info.path : info.path.substr(slash + 1);
++  return info;
++}
++
++std::string DescribeAddress(std::uintptr_t address, std::map<std::string, std::string> &modules) {
++  if (const std::optional<ModuleInfo> module = ModuleAt(address)) {
++    modules.emplace(module->name, module->path);
++    return fmt::format("{}+0x{:x}", module->name, address - module->base);
++  }
++  return fmt::format("0x{:016x} (no module: JIT code or bad frame)", address);
++}
++
++void DescribeNativeStacks(const CONTEXT *current_thread_context, std::string &out,
++                          std::map<std::string, std::string> &modules) {
++  for (const NativeStack &stack : CaptureAllThreads(current_thread_context)) {
++    fmt::format_to(std::back_inserter(out), "  thread {} \"{}\"{}{}\n", stack.thread_id,
++                   stack.name, stack.note.empty() ? "" : "  -- ", stack.note);
++    for (std::size_t i = 0; i < stack.frames.size(); ++i)
++      fmt::format_to(std::back_inserter(out), "    #{:02} {}\n", i,
++                     DescribeAddress(stack.frames[i], modules));
++  }
++}
++#endif
++
++// One sample of everything that moves: guest, FIFO and native stacks.
++void DescribeSample(Core::System &system, const void *current_thread_context, std::string &out,
++                    std::map<std::string, std::string> &modules) {
++  fmt::format_to(std::back_inserter(out), "core state: {}  core timing ticks: {}\n",
++                 CoreStateName(Core::GetState(system)), system.GetCoreTiming().GetTicks());
++  out += "\n[guest cpu]\n";
++  DescribeGuest(out);
++  out += "\n[guest threads]\n";
++  DescribeGuestThreads(out);
++  out += "\n[gpu fifo]\n";
++  DescribeFifo(system, out);
++  out += "\n[native threads]\n";
++#ifdef MODERNGEKKO_NATIVE_STACKS
++  DescribeNativeStacks(static_cast<const CONTEXT *>(current_thread_context), out, modules);
++#else
++  (void)current_thread_context;
++  (void)modules;
++  out += "  not supported on this platform\n";
++#endif
++}
++
++void DescribeModules(const std::map<std::string, std::string> &modules, std::string &out) {
++  out += "\n[modules]\n";
++  for (const auto &[name, path] : modules)
++    fmt::format_to(std::back_inserter(out), "  {} = {}\n", name, path);
++}
++
++bool WriteText(const std::filesystem::path &path, const std::string &text) {
++  std::error_code ec;
++  std::filesystem::create_directories(path.parent_path(), ec);
++  std::ofstream file(path, std::ios::binary);
++  file << text;
++  return static_cast<bool>(file);
++}
++} // namespace
++
++// --- crash handler -----------------------------------------------------------
++
++#ifdef MODERNGEKKO_NATIVE_STACKS
++struct DiagnosticReporterCrashHandler {
++  static inline DiagnosticReporter *s_reporter = nullptr;
++  static inline LPTOP_LEVEL_EXCEPTION_FILTER s_previous = nullptr;
++  static inline std::atomic<bool> s_handling{false};
++
++  static void Install(DiagnosticReporter *reporter) {
++    s_reporter = reporter;
++    s_previous = SetUnhandledExceptionFilter(&Filter);
++  }
++
++  static void Uninstall() {
++    SetUnhandledExceptionFilter(s_previous);
++    s_reporter = nullptr;
++  }
++
++  static LONG WINAPI Filter(EXCEPTION_POINTERS *exception) {
++    // Only the first crashing thread reports; a crash inside the report is
++    // left to the default handler.
++    if (s_reporter && !s_handling.exchange(true))
++      WriteCrashReport(*s_reporter, *exception);
++    return s_previous ? s_previous(exception) : EXCEPTION_CONTINUE_SEARCH;
++  }
++
++  static void WriteCrashReport(DiagnosticReporter &reporter, const EXCEPTION_POINTERS &exception) {
++    const EXCEPTION_RECORD &record = *exception.ExceptionRecord;
++    std::map<std::string, std::string> modules;
++    std::string out = fmt::format("Crash report, {}\n\n[exception]\n  code {:08x} at {}\n",
++                                  LocalTimestamp("%Y-%m-%d %H:%M:%S"),
++                                  static_cast<std::uint32_t>(record.ExceptionCode),
++                                  DescribeAddress(reinterpret_cast<std::uintptr_t>(record.ExceptionAddress), modules));
++    if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2) {
++      static constexpr const char *kAccess[] = {"reading", "writing", "?", "?", "?", "?", "?", "?",
++                                                "executing"};
++      fmt::format_to(std::back_inserter(out), "  access violation {} 0x{:016x}\n",
++                     kAccess[std::min<ULONG_PTR>(record.ExceptionInformation[0], 8)],
++                     record.ExceptionInformation[1]);
++    }
++    fmt::format_to(std::back_inserter(out), "  crashing thread {}\n\n",
++                   GetCurrentThreadId());
++    fmt::format_to(std::back_inserter(out), "last new frame {:.1f} s ago, frame {}, present {}\n",
++                   (NowNs() - reporter.m_last_new_frame_ns.load()) / 1e9,
++                   reporter.m_frame_count.load(), reporter.m_present_count.load());
++    DescribeSample(Core::System::GetInstance(), exception.ContextRecord, out, modules);
++    DescribeModules(modules, out);
++    const std::filesystem::path path = reporter.NextReportPath("crash");
++    if (WriteText(path, out))
++      std::fprintf(stderr, "[diagnostics] crash report written to %s\n", path.string().c_str());
++  }
++};
++#endif
++
++// --- reporter ----------------------------------------------------------------
++
++DiagnosticReporter::DiagnosticReporter(Options options) : m_options(std::move(options)) {
++  m_present_hook = GetVideoEvents().after_present_event.Register([this](const PresentInfo &info) {
++    m_present_count.store(info.present_count, std::memory_order_relaxed);
++    if (info.frame_count != m_frame_count.load(std::memory_order_relaxed)) {
++      m_frame_count.store(info.frame_count, std::memory_order_relaxed);
++      m_last_new_frame_ns.store(NowNs(), std::memory_order_relaxed);
++    }
++  });
++#ifdef MODERNGEKKO_NATIVE_STACKS
++  DiagnosticReporterCrashHandler::Install(this);
++#endif
++  m_watch_thread = std::jthread([this](std::stop_token stop_token) { WatchLoop(stop_token); });
++}
++
++DiagnosticReporter::~DiagnosticReporter() {
++  m_watch_thread.request_stop();
++  if (m_watch_thread.joinable())
++    m_watch_thread.join();
++#ifdef MODERNGEKKO_NATIVE_STACKS
++  DiagnosticReporterCrashHandler::Uninstall();
++#endif
++  m_present_hook = {};
++}
++
++void DiagnosticReporter::WatchLoop(std::stop_token stop_token) {
++  Core::System &system = Core::System::GetInstance();
++  const std::int64_t threshold_ns =
++      std::chrono::duration_cast<std::chrono::nanoseconds>(m_options.stall_threshold).count();
++  // Pauses (menus that stop the core, focus loss, savestate loads) are not
++  // stalls: time spent not running moves the baseline forward.
++  std::int64_t not_running_until_ns = 0;
++  std::filesystem::path open_stall_report;
++  std::int64_t stalled_frame_ns = 0;
++
++  while (!stop_token.stop_requested()) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    const std::int64_t now = NowNs();
++
++    if (ManualHotkeyPressed()) {
++      const std::int64_t last = m_last_new_frame_ns.load(std::memory_order_relaxed);
++      WriteReport(Trigger::Manual, last ? (now - last) / 1e9 : 0.0);
++    }
++
++    if (Core::GetState(system) != Core::State::Running) {
++      not_running_until_ns = now;
++      continue;
++    }
++    const std::int64_t last_frame = m_last_new_frame_ns.load(std::memory_order_relaxed);
++    if (last_frame == 0)
++      continue;  // still booting: no frame yet
++
++    if (!open_stall_report.empty()) {
++      if (last_frame != stalled_frame_ns) {
++        AppendLine(open_stall_report,
++                   fmt::format("\nframes resumed: the gap lasted {:.2f} s\n",
++                               (last_frame - stalled_frame_ns) / 1e9));
++        open_stall_report.clear();
++      }
++      continue;
++    }
++    const std::int64_t baseline = std::max(last_frame, not_running_until_ns);
++    if (now - baseline >= threshold_ns) {
++      stalled_frame_ns = last_frame;
++      open_stall_report = WriteReport(Trigger::Stall, (now - last_frame) / 1e9);
++      if (open_stall_report.empty())
++        not_running_until_ns = now;  // capped or failed: do not retry every tick
++    }
++  }
++}
++
++bool DiagnosticReporter::ManualHotkeyPressed() {
++#ifdef _WIN32
++  // Only while the game window has focus, so typing elsewhere never triggers it.
++  DWORD foreground_process = 0;
++  GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process);
++  const bool down = foreground_process == GetCurrentProcessId() &&
++                    (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
++                    (GetAsyncKeyState(VK_SHIFT) & 0x8000) && (GetAsyncKeyState('D') & 0x8000);
++  const bool pressed = down && !m_hotkey_was_down;
++  m_hotkey_was_down = down;
++  return pressed;
++#else
++  return false;
++#endif
++}
++
++std::filesystem::path DiagnosticReporter::NextReportPath(const char *kind) {
++  return m_options.directory /
++         fmt::format("{}-{}.txt", kind, LocalTimestamp("%Y%m%d-%H%M%S"));
++}
++
++std::filesystem::path DiagnosticReporter::WriteReport(Trigger trigger, double seconds_since_frame) {
++  std::lock_guard lock(m_write_mutex);
++  if (m_reports_written >= m_options.max_reports)
++    return {};
++  ++m_reports_written;
++
++  Core::System &system = Core::System::GetInstance();
++  const bool stall = trigger == Trigger::Stall;
++  std::map<std::string, std::string> modules;
++  std::string out = fmt::format(
++      "{} report, {}\n\nlast new frame {:.1f} s ago, frame {}, present {}\n",
++      stall ? "Stall" : "Manual", LocalTimestamp("%Y-%m-%d %H:%M:%S"), seconds_since_frame,
++      m_frame_count.load(), m_present_count.load());
++  // A stall is sampled a few times: what changes between samples tells a busy
++  // loop from a thread blocked on a wait.
++  const int samples = stall ? 3 : 1;
++  const std::uint64_t presents_before = m_present_count.load();
++  for (int sample = 0; sample < samples; ++sample) {
++    if (sample > 0)
++      std::this_thread::sleep_for(std::chrono::milliseconds(500));
++    fmt::format_to(std::back_inserter(out), "\n===== sample {} of {} =====\n", sample + 1, samples);
++    DescribeSample(system, nullptr, out, modules);
++  }
++  if (stall) {
++    fmt::format_to(std::back_inserter(out),
++                   "\npresents during sampling: {} (non-zero: video interface still ticking, "
++                   "so emulated time advances)\n",
++                   m_present_count.load() - presents_before);
++  }
++  DescribeModules(modules, out);
++
++  const std::filesystem::path path = NextReportPath(stall ? "stall" : "manual");
++  if (!WriteText(path, out))
++    return {};
++  std::fprintf(stderr, "[diagnostics] %s report written to %s\n", stall ? "stall" : "manual",
++               path.string().c_str());
++  return path;
++}
++
++void DiagnosticReporter::AppendLine(const std::filesystem::path &path, const std::string &line) {
++  std::lock_guard lock(m_write_mutex);
++  std::ofstream file(path, std::ios::binary | std::ios::app);
++  file << line;
++}
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/diagnostic_reporter.hpp b/ModernGekko/src/runtime/diagnostic_reporter.hpp
+new file mode 100644
+index 00000000..341d7f90
+--- /dev/null
++++ b/ModernGekko/src/runtime/diagnostic_reporter.hpp
+@@ -0,0 +1,66 @@
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <thread>
++
++#include "Common/HookableEvent.h"
++
++namespace moderngekko {
++// Writes a plain-text report to a log directory whenever the game stops
++// producing new frames for a while, crashes, or the player presses
++// Ctrl+Shift+D. Freezes met during normal play are rare and not reproducible
++// on demand, so the report captures everything needed to diagnose one after
++// the fact: the guest registers and call stack, the GPU FIFO pointers, and
++// the native call stack of every thread (as module+offset, resolved offline by
++// tools-src/profiling/resolve_report.py so the game never loads its PDBs).
++//
++// It only reads state. Taking a native stack suspends each thread for the
++// time of a stack copy, which happens only when a report is written.
++class DiagnosticReporter {
++public:
++  struct Options {
++    std::filesystem::path directory;
++    // A frame gap this long counts as a stall. Loading screens keep rendering,
++    // so anything past a couple of seconds is already abnormal.
++    std::chrono::milliseconds stall_threshold{4000};
++    // Caps the reports of one session, should something stall over and over.
++    int max_reports = 20;
++  };
++
++  explicit DiagnosticReporter(Options options);
++  ~DiagnosticReporter();
++
++  DiagnosticReporter(const DiagnosticReporter &) = delete;
++  DiagnosticReporter &operator=(const DiagnosticReporter &) = delete;
++
++private:
++  enum class Trigger { Stall, Manual };
++
++  void WatchLoop(std::stop_token stop_token);
++  bool ManualHotkeyPressed();
++  // Writes a stall or manual report; returns its path (empty if none written).
++  std::filesystem::path WriteReport(Trigger trigger, double seconds_since_frame);
++  void AppendLine(const std::filesystem::path &path, const std::string &line);
++  std::filesystem::path NextReportPath(const char *kind);
++
++  Options m_options;
++  std::mutex m_write_mutex;
++  int m_reports_written = 0;
++  bool m_hotkey_was_down = false;
++
++  // Updated by the present hook on the video thread.
++  std::atomic<std::uint64_t> m_frame_count{0};
++  std::atomic<std::uint64_t> m_present_count{0};
++  std::atomic<std::int64_t> m_last_new_frame_ns{0};
++  Common::EventHook m_present_hook;
++
++  std::jthread m_watch_thread;
++
++  friend struct DiagnosticReporterCrashHandler;
++};
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 22f9df36..ffb857af 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -16,6 +16,7 @@
+ #include "VideoCommon/FrameDumper.h"
+ #include "VideoCommon/VideoEvents.h"
+ #include "automation_protocol.hpp"
++#include "diagnostic_reporter.hpp"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/StaticRecompSettings.h"
+@@ -543,6 +544,7 @@ struct Runtime::Impl {
+   Common::EventHook present_hook;
+   bool automation_registered = false;
+   std::jthread automation_thread;
++  std::unique_ptr<DiagnosticReporter> diagnostics;
+ };
+ 
+ namespace {
+@@ -1549,6 +1551,8 @@ RuntimeRunResult Runtime::Run() {
+                          "Dolphin could not boot sys/main.dol"}};
+   }
+   m_impl->booted = true;
++  m_impl->diagnostics = std::make_unique<DiagnosticReporter>(
++      DiagnosticReporter::Options{m_impl->config.user_directory / "Diagnostics"});
+   // Continue-where-you-left-off (menu System > Auto-Resume). Headless runs are
+   // benchmarks/verification; loading a state there would corrupt them, and so
+   // would it for an explicit --load-state or an automated run.
+@@ -1576,6 +1580,7 @@ RuntimeRunResult Runtime::Run() {
+     title_thread.join();
+   m_impl->platform->SaveWindowGeometry();
+   StopAutomation(*m_impl);
++  m_impl->diagnostics.reset();
+   Core::Stop(Core::System::GetInstance());
+   Core::Shutdown(Core::System::GetInstance());
+   m_impl->booted = false;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index a3657116..66764b13 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -57,6 +57,10 @@ public:
+   bool DispatchableAt(u32 address);
+   bool FastDispatchableAt(u32 address) const;
+ 
++  // The live guest registers, for diagnostics only: read from another thread they are a
++  // racy snapshot, good enough to tell where a stuck guest is but never for emulation.
++  const CPUState& GuestStateForDiagnostics() const { return m_guest; }
++
+   // One bit per guest instruction slot: "this address is an entry point of a
+   // VERIFIED chunk", the exact question the dispatcher asks on every dispatch.
+   // It is the AND of the three arrays FastDispatchableAt used to walk, folded
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.h
+index 2afa1105..a08a136f 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.h
+@@ -76,6 +76,17 @@ public:
+   void EmulatorState(bool running);
+   void ResetVideoBuffer();
+ 
++  // Bytes copied out of the GX FIFO but not decoded yet, for diagnostics only: read from
++  // another thread it is a racy snapshot. Data stuck here with an empty FIFO means the
++  // decoder is waiting for the rest of a command that will never come.
++  std::size_t PendingVideoBufferBytesForDiagnostics() const
++  {
++    return static_cast<std::size_t>(m_video_buffer_write_ptr.load(std::memory_order_relaxed) -
++                                    m_video_buffer_read_ptr);
++  }
++  // Start of those bytes: the command the decoder is waiting to complete.
++  const u8* PendingVideoBufferForDiagnostics() const { return m_video_buffer_read_ptr; }
++
+ private:
+   void RefreshConfig();
+   void ReadDataFromFifo(u32 read_ptr);

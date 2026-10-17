@@ -1,0 +1,91 @@
+diff --git a/dist/RingOut-1.0-dist/module-src/CMakeLists.txt b/dist/RingOut-1.0-dist/module-src/CMakeLists.txt
+index f95f11a..add15c5 100644
+--- a/dist/RingOut-1.0-dist/module-src/CMakeLists.txt
++++ b/dist/RingOut-1.0-dist/module-src/CMakeLists.txt
+@@ -99,6 +99,13 @@ option(MODULE_FMA_LAZY "Lazy FPRF for the out-of-line fma helper" ON)
+ if(MODULE_FMA_LAZY)
+   target_compile_definitions(${MODULE_NAME} PRIVATE DOLRECOMP_FMA_LAZY)
+ endif()
++# Inline fast path for the finite common case of fmadd & co. in front of
++# ppc_fma (DOLRECOMP_FMA_INLINE in cpu.h; needs MODULE_FMA_LAZY). The helper
++# was 8.4% of the CPU thread in a Def Jam: Fight for NY 2v2 fight.
++option(MODULE_FMA_INLINE "Inline the finite fused multiply-add path" ON)
++if(MODULE_FMA_INLINE)
++  target_compile_definitions(${MODULE_NAME} PRIVATE DOLRECOMP_FMA_INLINE)
++endif()
+ # Keep the cycle charge in a chunk local (DOLRECOMP_DC_LOCAL in cpu.h). The
+ # generated code uses the macros unconditionally, so one tree builds both arms.
+ # ON by default: -0.98% cycles on the US disc alone (a latency win; the
+diff --git a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h
+index 15ccdae..46afb4b 100644
+--- a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h
++++ b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h
+@@ -805,4 +805,68 @@ DOLRECOMP_PSQ_AI bool dolrecomp_psq_store_inline_r(CPUState* cpu, u8* ram, u8 fr
+     dolrecomp_psq_store_inline_r((cpu), DOLRECOMP_RAM_ARG(cpu), (frS), (ea), (w), (gqr), (idx), (cia))
+ #endif
+ 
++/* fmadd/fmsub/fnmadd/fnmsub (and the single forms): an inline fast path per
++ * call site in front of the out-of-line ppc_fma.
++ *
++ * ppc_fma was 8.4% of the CPU thread in a Def Jam 2v2 fight, mostly the call
++ * itself and the general force_25_bit. The common case is narrow: finite
++ * result and, for singles, a normal (or zero) C operand and a product that is
++ * not an exact rounding tie. There the work is one FMA plus, for singles,
++ * Dolphin's 25-bit rounding of C and the store-rounding to single. Everything
++ * else -- NaN, infinity, denormal C, the tie the out-of-line helper corrects
++ * -- calls ppc_fma unchanged; nothing is written before that decision, so the
++ * fallback recomputes from the same inputs and the result is identical by
++ * construction.
++ *
++ * Mirrors ppc_fma's finite path under DOLRECOMP_FMA_LAZY: no FPSCR access
++ * other than leaving this result's FPRF pending (dropped entirely under
++ * RECOMP_NO_FPRF, like every other inline FP op).
++ *
++ * OPT-OUT (module CMake option MODULE_FMA_INLINE). */
++#if defined(DOLRECOMP_FMA_INLINE) && defined(DOLRECOMP_FMA_LAZY) && \
++    !defined(DOLRECOMP_PSQ_OUT_OF_LINE)
++static inline __attribute__((always_inline)) bool dolrecomp_fma_inline(
++    CPUState* cpu, f64 a, f64 c, f64 b, bool single, bool subtract, bool negative,
++    f64* output) {
++    const f64 addend = subtract ? -b : b;
++    f64 result;
++    u64 bits;
++    if (!single) {
++        result = __builtin_fma(a, c, addend);
++    } else {
++        u64 c_bits;
++        memcpy(&c_bits, &c, sizeof(c_bits));
++        /* force_25_bit for a C whose exponent is non-zero (normal, inf, NaN:
++         * the last two end non-finite and take the fallback) or that is zero. */
++        if (__builtin_expect((c_bits & 0x7FF0000000000000ull) == 0u &&
++                             (c_bits & 0x000FFFFFFFFFFFFFull) != 0u, 0))
++            return ppc_fma(cpu, a, c, b, single, subtract, negative, output);
++        c_bits = (c_bits & 0xFFFFFFFFF8000000ull) + (c_bits & 0x0000000008000000ull);
++        f64 rounded_c;
++        memcpy(&rounded_c, &c_bits, sizeof(rounded_c));
++        result = __builtin_fma(a, rounded_c, addend);
++        memcpy(&bits, &result, sizeof(bits));
++        if (__builtin_expect((bits & 0x000000001FFFFFFFull) == 0x0000000010000000ull, 0))
++            return ppc_fma(cpu, a, c, b, single, subtract, negative, output);
++        result = (f64)dolrecomp_cvt_single(result);
++    }
++    memcpy(&bits, &result, sizeof(bits));
++    if (__builtin_expect((bits & 0x7FF0000000000000ull) == 0x7FF0000000000000ull, 0))
++        return ppc_fma(cpu, a, c, b, single, subtract, negative, output);
++    if (negative)
++        result = -result;
++#if !defined(RECOMP_NO_FPRF)
++    PPC_FPRF_TAG(0xFFFFFFFEu);
++    g_fprf_value = result;
++    g_fprf_kind = single ? 1u : 2u;
++#else
++    (void)cpu;
++#endif
++    *output = result;
++    return true;
++}
++#define ppc_fma(cpu, a, c, b, single, subtract, negative, output) \
++    dolrecomp_fma_inline((cpu), (a), (c), (b), (single), (subtract), (negative), (output))
++#endif
++
+ #endif /* DOLRECOMP_CPU_H */

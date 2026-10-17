@@ -1,0 +1,16 @@
+diff --git a/module-template/CMakeLists.txt b/module-template/CMakeLists.txt
+index dac92e8..82b08d8 100644
+--- a/module-template/CMakeLists.txt
++++ b/module-template/CMakeLists.txt
+@@ -161,9 +161,9 @@ endif()
+ 
+ if(MSVC)
+   if(RECOMPCORE_MODULE_OPT_LEVEL STREQUAL "0")
+-    target_compile_options(${MODULE_NAME} PRIVATE /Od /fp:strict)
++    target_compile_options(${MODULE_NAME} PRIVATE /Od /fp:precise)
+   else()
+-    target_compile_options(${MODULE_NAME} PRIVATE /O2 /fp:strict)
++    target_compile_options(${MODULE_NAME} PRIVATE /O2 /fp:precise /arch:AVX2)
+   endif()
+ elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
+   target_compile_options(${MODULE_NAME} PRIVATE

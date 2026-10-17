@@ -1,0 +1,194 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index 723470c2..e6be013e 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -21,6 +21,7 @@
+ #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
+ #include "Core/RecompDeterminism.h"
+ #include "Core/System.h"
++#include "VideoCommon/CommandProcessor.h"
+ 
+ #ifdef _M_X86_64
+ #include "Core/PowerPC/Jit64/Jit.h"
+@@ -136,6 +137,23 @@ void StaticRecompCore::InstallGatherPipeFastPath()
+                   reinterpret_cast<const unsigned char*>(&m_lockstep_verifier->m_ls_journaling));
+ }
+ 
++// The module calls back only once several whole chunks have piled up (its fill mark),
++// so each burst notification -- atomics on FIFO state the GPU thread reads, plus a GPU
++// wake-up -- is paid per batch rather than per 32 bytes; in a Def Jam fight that was a
++// tenth of the CPU thread, and it left every other frame late. Chunks still below the
++// mark are handed over here after every dispatch, before CoreTiming events, before
++// idling and before MMIO accesses. Only whole 32-byte chunks ever move, as with a
++// 32-byte mark.
++//
++// The per-dispatch flush is not optional. The GX library pushes the pipe by padding it
++// with 32 bytes (GXFlush) and then waits on the GPU in ways that need not idle or touch
++// MMIO; with flushes only at events and idle, the tail of each batch sat in the pipe
++// until the next event and a Def Jam fight fell to 11 fps.
++void StaticRecompCore::FlushGatherPipe()
++{
++  m_system.GetGPFifo().FastCheckGatherPipe();
++}
++
+ // Called by the module only when the pipe has reached its fill mark.
+ // FastCheckGatherPipe re-checks the count and flushes; it is deliberately the
+ // Fast variant, for the reason spelled out in HookExternalWrite.
+@@ -143,6 +161,17 @@ void StaticRecompCore::GatherPipeFlushTrampoline(void* user)
+ {
+   auto* core = static_cast<StaticRecompCore*>(user);
+   core->m_system.GetGPFifo().FastCheckGatherPipe();
++  core->YieldNativeIfCheckForced();
++
++  const auto& fifo = core->m_system.GetCommandProcessor().GetFifo();
++  const u32 size = fifo.CPEnd.load(std::memory_order_relaxed) -
++                   fifo.CPBase.load(std::memory_order_relaxed);
++  if (size != 0)
++  {
++    const u32 permille = static_cast<u32>(
++        u64{fifo.CPReadWriteDistance.load(std::memory_order_relaxed)} * 1000 / size);
++    core->m_fifo_peak_permille = std::max(core->m_fifo_peak_permille, permille);
++  }
+ }
+ 
+ void StaticRecompCore::Init()
+@@ -315,11 +344,14 @@ void StaticRecompCore::Shutdown()
+   g_static_recomp_core = nullptr;
+   std::fprintf(stderr,
+                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
+-               "smc_failed=%u verifications=%llu reverify_events=%llu\n",
++               "smc_failed=%u verifications=%llu reverify_events=%llu forced_yields=%llu "
++               "fifo_peak=%u.%u%%\n",
+                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
+                (unsigned long long)m_native_exceptions,
+                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
+-               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events);
++               (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
++               (unsigned long long)m_forced_yields, m_fifo_peak_permille / 10,
++               m_fifo_peak_permille % 10);
+   NOTICE_LOG_FMT(POWERPC,
+                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "
+                  "native_exceptions={} hook_fallback_instructions={} smc_failed_chunks={} "
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index e8350de4..a3657116 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -198,6 +198,7 @@ private:
+   using SetGatherPipeFn = void (*)(u8**, u8* const*, void (*)(void*), void*, const unsigned char*);
+   void InstallGatherPipeFastPath();
+   static void GatherPipeFlushTrampoline(void* user);
++  void FlushGatherPipe();
+ 
+   Common::DynamicLibrary m_library;
+   StaticRecompModuleSource m_module_source;
+@@ -237,6 +238,31 @@ private:
+     m_dc_bias = (m_dyn_budget > 0 && ppc_downcount > m_dyn_budget) ? ppc_downcount - m_dyn_budget : 0;
+     m_guest.downcount = m_dc_bias;
+   }
++  // Native code only reaches CoreTiming (and so only takes external interrupts) when it
++  // returns to the dispatcher. When Dolphin asks for an exception check right now
++  // (ForceExceptionCheck, which leaves ppc.downcount at 0) from inside a native run, push
++  // the module's charge accumulator past any loop budget so the next loop back-edge
++  // exits. Bias moves by the same amount, so the cycles charged are unchanged.
++  //
++  // The case that needs it: a GX FIFO past its high watermark. The GPU thread stops
++  // reading until the CPU services the CP interrupt, and a vertex loop that kept
++  // writing for its whole budget overflowed the FIFO (Def Jam: Fight for NY froze on
++  // the first hit of a fight). Needs a module built without MODULE_DC_LOCAL, which
++  // would keep the accumulator in a register the loop never re-reads.
++  void YieldNativeIfCheckForced()
++  {
++    if (m_ppc_state.downcount > 0)
++      return;
++    constexpr s64 FORCED_EXIT = -(s64{1} << 40);
++    if (m_guest.downcount <= FORCED_EXIT)
++      return;
++    const s64 delta = FORCED_EXIT - m_guest.downcount;
++    m_guest.downcount += delta;
++    m_dc_bias += delta;
++    ++m_forced_yields;
++  }
++  u64 m_forced_yields = 0;      // YieldNativeIfCheckForced exits requested (diagnostic)
++  u32 m_fifo_peak_permille = 0;  // fullest the GX FIFO got at a native flush (diagnostic)
+ 
+   // D4 guard state: parallel to m_module->chunk_ranges.
+   std::vector<u8> m_chunk_state;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+index 35d1a8b1..e2992c0c 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Hooks.cpp
+@@ -19,6 +19,7 @@ constexpr u32 LOCKED_CACHE_BASE = 0xE0000000u;
+ u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
+ {
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
++  core->FlushGatherPipe();
+   core->PropagateGuestMSR();
+   auto& mmu = core->m_system.GetMMU();
+   u64 value;
+@@ -96,9 +97,11 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
+       break;
+     }
+     gpfifo.FastCheckGatherPipe();
++    core->YieldNativeIfCheckForced();
+     return;
+   }
+ 
++  core->FlushGatherPipe();
+   core->PropagateGuestMSR();
+   auto& mmu = core->m_system.GetMMU();
+   if (core->m_lockstep_verifier->m_ls_journaling &&
+@@ -132,6 +135,7 @@ u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
+   // generated helper; Dolphin's interpreter services the access as a plain
+   // MMU read (the rid is carried in EAR only).
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
++  core->FlushGatherPipe();
+   core->PropagateGuestMSR();
+   auto& mmu = core->m_system.GetMMU();
+   const u32 value = mmu.Read<u32>(ea);
+@@ -147,6 +151,7 @@ void StaticRecompCore::HookExternalWrite32(CPUState* cpu, u32 ea, u32 value, u8
+ {
+   // ecowx external-control write; see HookExternalRead32.
+   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
++  core->FlushGatherPipe();
+   core->PropagateGuestMSR();
+   auto& mmu = core->m_system.GetMMU();
+   if (core->m_lockstep_verifier->m_ls_journaling &&
+@@ -206,7 +211,12 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
+       const u32 ea = (ra ? cpu->gpr[ra] : 0u) + cpu->gpr[rb];
+       if (xo == 982u)
+       {
+-        system.GetJitInterface().InvalidateICacheLine(ea);
++        // Through the emulated instruction cache, exactly as Interpreter::icbi:
++        // it drops the line from iCache and then tells the JIT. Telling only
++        // the JIT left the stale line in iCache, which the interpreter and the
++        // JIT fetch from, so code a game regenerates at the same address (Def
++        // Jam: Fight for NY builds call stubs on the heap) ran its old bytes.
++        ppc.iCache.Invalidate(system.GetMemory(), system.GetJitInterface(), ea);
+       }
+       // These bypass SingleStepInner, so charge Dolphin's PPCTables cost
+       // here (icbi 4, dcbf/dcbst/dcbi 5); their emitted block cost is zero.
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+index c8d1b20c..95ef81b7 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore_Run.cpp
+@@ -728,6 +728,9 @@ void StaticRecompCore::Run()
+   u32 game_id_check = 0;
+   while (*state_ptr == CPU::State::Running)
+   {
++    // The module lets whole gather-pipe chunks pile up (see FlushGatherPipe); hand them
++    // to the GPU before any hardware event can observe the FIFO.
++    FlushGatherPipe();
+     core_timing.Advance();
+     if (m_gqr_log)
+       SampleGQRs();
+@@ -959,6 +962,10 @@ void StaticRecompCore::Run()
+           m_guest.timebase += m_tb_cycle_remainder / SystemTimers::TIMER_RATIO;
+           m_tb_cycle_remainder %= SystemTimers::TIMER_RATIO;
+ 
++          // Whole gather-pipe chunks the module held back go out at every dispatch
++          // (see FlushGatherPipe), so they never wait for more than one native run.
++          FlushGatherPipe();
++
+           // Idle loop skipping for configured target loops (e.g. Wii Menu OSIdleThread)
+           if (m_guest.pc == m_idle_pc && m_idle_pc != 0)
+           {

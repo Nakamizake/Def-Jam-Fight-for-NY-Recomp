@@ -1,0 +1,41 @@
+diff --git a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h
+index 9f587cd4..15ccdaec 100644
+--- a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h
++++ b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/cpu/cpu.h
+@@ -588,9 +588,35 @@ static inline f32 dolrecomp_cvt_single(f64 v) {
+     return (f32)v;
+ #endif
+ }
++/* Dolphin's ConvertToSingle (Interpreter_FPUtils.h): the truncating, bit-exact
++ * double -> single the hardware's stfs performs. Unlike cvtsd2ss under FTZ it
++ * keeps single denormals. */
++static inline u32 dolrecomp_convert_to_single_exact(u64 x) {
++    const u32 exp = (u32)((x >> 52) & 0x7FFu);
++    if (exp > 896u || (x & 0x7FFFFFFFFFFFFFFFull) == 0u || exp < 874u)
++        return (u32)(((x >> 32) & 0xC0000000u) | ((x >> 29) & 0x3FFFFFFFu));
++    u32 t = (u32)(0x80000000u | ((x & 0x000FFFFFFFFFFFFFull) >> 21));
++    t >>= 905u - exp;
++    t |= (u32)(x >> 32) & 0x80000000u;
++    return t;
++}
++
++/* stfs. The fast conversion is exact except where FTZ flushed a single
++ * denormal to zero, so a zero result from a non-zero input takes the exact
++ * path. That case matters beyond float math: compilers copy plain structs
++ * through FPRs with lfs/stfs, and a small integer in such a struct (0x00004658
++ * in Def Jam: Fight for NY) has a denormal bit pattern -- flushing it zeroed
++ * game data and crashed the first fight. Nearly free: the branch is a test on
++ * a value already in a register and is almost never taken. */
+ static inline u32 dolrecomp_store_single(f64 v) {
+     f32 r = dolrecomp_cvt_single(v);
+-    u32 b; memcpy(&b, &r, sizeof(b)); return b;
++    u32 b; memcpy(&b, &r, sizeof(b));
++    if (__builtin_expect((b & 0x7FFFFFFFu) == 0u, 0)) {
++        u64 x; memcpy(&x, &v, sizeof(x));
++        if ((x << 1) != 0u)
++            return dolrecomp_convert_to_single_exact(x);
++    }
++    return b;
+ }
+ 
+ /* Paired-single quantised load/store: a SLIM inline fast path per call site.

@@ -1,0 +1,3 @@
+# Patches mix CRLF and LF lines, matching the files they apply to; store them byte for byte
+# so they still apply after a checkout with core.autocrlf.
+*.patch -text
