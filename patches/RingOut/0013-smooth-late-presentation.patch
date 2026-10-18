@@ -1,0 +1,390 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -1051,6 +1051,9 @@ void ApplyGraphicsSettings(const GraphicsSettings &graphics, bool headless) {
+   Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
+                   ShaderCompilationMode::AsynchronousUberShaders);
+   Config::SetBase(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true);
++  // Frames reach presentation a varying 1-4 ms after their intended time; presented on arrival,
++  // that shows on a 120 Hz display as frames held for one or three refreshes instead of two.
++  Config::SetBase(Config::MAIN_SMOOTH_LATE_PRESENTATION, true);
+ }
+ 
+ // Resolves audio.backend to something this host actually offers, writing the
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+index 1fecff09..844cd9ef 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+@@ -56,6 +56,10 @@ const Info<bool> MAIN_RUSH_FRAME_PRESENTATION{{System::Main, "Core", "RushFrameP
+                                               false};
+ const Info<bool> MAIN_SMOOTH_EARLY_PRESENTATION{{System::Main, "Core", "SmoothEarlyPresentation"},
+                                                 false};
++// Holds frames that reach presentation late to a steady delay after their intended time, so that
++// lateness varying from frame to frame does not reach the display as uneven frame times.
++const Info<bool> MAIN_SMOOTH_LATE_PRESENTATION{{System::Main, "Core", "SmoothLatePresentation"},
++                                               false};
+ #if defined(ANDROID)
+ // Currently enabled by default on Android because the performance boost is really needed.
+ constexpr bool DEFAULT_CPU_THREAD = true;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+index 14689b49..916b8df8 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+@@ -68,6 +68,7 @@ extern const Info<int> MAIN_TIMING_VARIANCE;
+ extern const Info<bool> MAIN_CORRECT_TIME_DRIFT;
+ extern const Info<bool> MAIN_RUSH_FRAME_PRESENTATION;
+ extern const Info<bool> MAIN_SMOOTH_EARLY_PRESENTATION;
++extern const Info<bool> MAIN_SMOOTH_LATE_PRESENTATION;
+ extern const Info<bool> MAIN_CPU_THREAD;
+ extern const Info<bool> MAIN_LOAD_GAME_INTO_MEMORY;
+ extern const Info<bool> MAIN_SYNC_ON_SKIP_IDLE;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp
+index be7ba566..8f4f06b7 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Core.cpp
+@@ -789,7 +789,7 @@ void RunOnCPUThread(Core::System& system, Common::MoveOnlyFunction<void()> funct
+ void Callback_FramePresented(const PresentInfo& present_info)
+ {
+   auto& perf_metrics = Core::System::GetInstance().GetPerfMetrics();
+-  perf_metrics.CountFrame();
++  perf_metrics.CountFrame(present_info.actual_present_time);
+ 
+   const auto presentation_offset =
+       present_info.actual_present_time - present_info.intended_present_time;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
+index 68dbb4e8..74f68654 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <utility>
+ 
+ #include "Common/Assert.h"
+ #include "Common/HitchTrace.h"
+@@ -233,7 +234,7 @@ bool CommandBufferManager::CreateSubmitThread()
+ {
+   m_submit_thread.Reset("VK submission thread", [this](PendingCommandBufferSubmit submit) {
+     SubmitCommandBuffer(submit.command_buffer_index, submit.present_swap_chain,
+-                        submit.present_image_index);
++                        submit.present_image_index, submit.present_time);
+     CmdBufferResources& resources = m_command_buffers[submit.command_buffer_index];
+     resources.waiting_for_submit.store(false, std::memory_order_release);
+   });
+@@ -241,6 +242,15 @@ bool CommandBufferManager::CreateSubmitThread()
+   return true;
+ }
+ 
++bool CommandBufferManager::SchedulePresent(TimePoint present_time)
++{
++  if (!m_use_threaded_submission)
++    return false;
++
++  m_scheduled_present_time = present_time;
++  return true;
++}
++
+ void CommandBufferManager::WaitForWorkerThreadIdle()
+ {
+   if (!m_use_threaded_submission)
+@@ -330,12 +340,19 @@ void CommandBufferManager::SubmitCommandBuffer(bool submit_on_worker_thread,
+     }
+   }
+ 
++  // A scheduled present goes with the next swap chain image submitted (and is dropped if that one
++  // is presented right away, on this thread).
++  std::optional<TimePoint> present_time;
++  if (present_swap_chain != VK_NULL_HANDLE)
++    present_time = std::exchange(m_scheduled_present_time, std::nullopt);
++
+   // Submitting off-thread?
+   if (m_use_threaded_submission && submit_on_worker_thread && !wait_for_completion)
+   {
+     resources.waiting_for_submit.store(true, std::memory_order_relaxed);
+     // Push to the pending submit queue.
+-    m_submit_thread.Push({present_swap_chain, present_image_index, m_current_cmd_buffer});
++    m_submit_thread.Push(
++        {present_swap_chain, present_image_index, m_current_cmd_buffer, present_time});
+   }
+   else
+   {
+@@ -395,7 +412,8 @@ void CommandBufferManager::SubmitCommandBuffer(bool submit_on_worker_thread,
+ 
+ void CommandBufferManager::SubmitCommandBuffer(u32 command_buffer_index,
+                                                VkSwapchainKHR present_swap_chain,
+-                                               u32 present_image_index)
++                                               u32 present_image_index,
++                                               std::optional<TimePoint> present_time)
+ {
+   CmdBufferResources& resources = m_command_buffers[command_buffer_index];
+ 
+@@ -442,6 +460,10 @@ void CommandBufferManager::SubmitCommandBuffer(u32 command_buffer_index,
+   // Do we have a swap chain to present?
+   if (present_swap_chain != VK_NULL_HANDLE)
+   {
++    // The commands above are already on their way to the GPU; only the present waits.
++    if (present_time)
++      m_present_timer.SleepUntil(*present_time);
++
+     // Should have a signal semaphore.
+     VkPresentInfoKHR present_info = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                                      nullptr,
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.h b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.h
+index 45a322c2..f509deef 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.h
+@@ -6,10 +6,13 @@
+ #include <array>
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ #include <Common/WorkQueueThread.h>
++#include "Common/CommonTypes.h"
+ #include "Common/Flag.h"
++#include "Common/Timer.h"
+ 
+ #include "VideoBackends/Vulkan/Constants.h"
+ 
+@@ -81,6 +84,11 @@ public:
+                            VkSwapchainKHR present_swap_chain = VK_NULL_HANDLE,
+                            uint32_t present_image_index = 0xFFFFFFFF);
+ 
++  // Holds the present of the next command buffer submitted with a swap chain back until
++  // `present_time`, on the submission thread: its commands still go to the GPU at once. False
++  // when submission is not threaded (the caller would wait itself).
++  bool SchedulePresent(TimePoint present_time);
++
+   // Was the last present submitted to the queue a failure? If so, we must recreate our swapchain.
+   bool CheckLastPresentFail() { return m_last_present_failed.TestAndClear(); }
+   VkResult GetLastPresentResult() const { return m_last_present_result; }
+@@ -101,7 +109,8 @@ private:
+ 
+   void WaitForCommandBufferCompletion(u32 command_buffer_index);
+   void SubmitCommandBuffer(u32 command_buffer_index, VkSwapchainKHR present_swap_chain,
+-                           u32 present_image_index);
++                           u32 present_image_index,
++                           std::optional<TimePoint> present_time = std::nullopt);
+   void BeginCommandBuffer();
+ 
+   VkDescriptorPool CreateDescriptorPool(u32 descriptor_sizes);
+@@ -151,7 +160,12 @@ private:
+     VkSwapchainKHR present_swap_chain;
+     u32 present_image_index;
+     u32 command_buffer_index;
++    std::optional<TimePoint> present_time;
+   };
++  // Set by SchedulePresent() until the next present is submitted.
++  std::optional<TimePoint> m_scheduled_present_time;
++  // Waits out scheduled presents; used by the submission thread only.
++  Common::PrecisionTimer m_present_timer;
+   Common::WorkQueueThreadSP<PendingCommandBufferSubmit> m_submit_thread;
+   std::vector<VkSemaphore> m_present_semaphores = {};
+   Common::Flag m_last_present_failed;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.cpp
+index c88e422c..8d2da4ad 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.cpp
+@@ -306,6 +306,11 @@ bool VKGfx::BindBackbuffer(const ClearColor& clear_color)
+   return true;
+ }
+ 
++bool VKGfx::SchedulePresent(TimePoint present_time)
++{
++  return g_command_buffer_mgr->SchedulePresent(present_time);
++}
++
+ void VKGfx::PresentBackbuffer()
+ {
+   // End drawing to backbuffer
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.h b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.h
+index e044bf59..9ef1b34d 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKGfx.h
+@@ -78,6 +78,7 @@ public:
+                              u32 groupsize_z, u32 groups_x, u32 groups_y, u32 groups_z) override;
+   bool BindBackbuffer(const ClearColor& clear_color = {}) override;
+   void PresentBackbuffer() override;
++  bool SchedulePresent(TimePoint present_time) override;
+   void SetFullscreen(bool enable_fullscreen) override;
+   bool IsFullscreen() const override;
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.h
+index 3a3c72c6..070ba680 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AbstractGfx.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include "Common/CommonTypes.h"
+ #include "Common/HookableEvent.h"
+ #include "Common/MathUtil.h"
+ 
+@@ -110,6 +111,11 @@ public:
+   // Presents the backbuffer to the window system, or "swaps buffers".
+   virtual void PresentBackbuffer() {}
+ 
++  // Holds the next PresentBackbuffer() back until `present_time` without blocking the caller, for
++  // backends that hand presents to a thread of their own: the thread that renders frames can then
++  // go on with the next one. Returns false when the backend cannot, and the caller has to wait.
++  virtual bool SchedulePresent(TimePoint present_time) { return false; }
++
+   // Shader modules/objects.
+   virtual std::unique_ptr<AbstractShader>
+   CreateShaderFromSource(ShaderStage stage, std::string_view source,
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.cpp
+index fccc8ae3..f3dd5ba1 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.cpp
+@@ -37,9 +37,9 @@ void PerformanceMetrics::Reset()
+   m_frame_presentation_offset = DT{};
+ }
+ 
+-void PerformanceMetrics::CountFrame()
++void PerformanceMetrics::CountFrame(TimePoint presented_time)
+ {
+-  m_fps_counter.Count();
++  m_fps_counter.Count(presented_time);
+ }
+ 
+ void PerformanceMetrics::CountVBlank()
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.h
+index 538360a0..53ab43ac 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceMetrics.h
+@@ -28,7 +28,8 @@ public:
+ 
+   void Reset();
+ 
+-  void CountFrame();
++  // `presented_time`: when the frame went (or goes) to the window system.
++  void CountFrame(TimePoint presented_time);
+   void CountVBlank();
+ 
+   // Call from CPU thread.
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp
+index 2926606b..fc501e98 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp
+@@ -43,8 +43,11 @@ void PerformanceTracker::Reset()
+ 
+ void PerformanceTracker::Count()
+ {
+-  const TimePoint current_time{Clock::now()};
++  Count(Clock::now());
++}
+ 
++void PerformanceTracker::Count(TimePoint current_time)
++{
+   const DT diff{current_time - m_last_time};
+   m_last_time = current_time;
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h
+index e6998f85..f89065bf 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h
+@@ -34,6 +34,8 @@ public:
+ 
+   // May call from any thread, but not concurrently, not that you'd want to..
+   void Count();
++  // The same for an event at `time` rather than now (not before the last one counted).
++  void Count(TimePoint time);
+ 
+   // May call from any thread.
+   DT GetSampleWindow() const;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp
+index 08c0d677..a84facd2 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp
+@@ -29,6 +29,13 @@ std::unique_ptr<VideoCommon::Presenter> g_presenter;
+ 
+ namespace VideoCommon
+ {
++// SmoothLatePresentation: a frame later than this is a hitch, not jitter. It is shown at once and
++// leaves the delay alone, so one hitch does not hold every frame after it back.
++static constexpr DT MAX_LATE_PRESENTATION_DELAY = std::chrono::milliseconds{8};
++// How slowly the delay comes back down once frames arrive earlier again: by 1/N of the gap per
++// frame, so half of it in about 140 frames (2 s).
++static constexpr int LATE_PRESENTATION_DECAY = 200;
++
+ // Stretches the native/internal analog resolution aspect ratio from ~4:3 to ~16:9
+ static float SourceAspectRatioToWidescreen(float source_aspect)
+ {
+@@ -966,10 +973,13 @@ void Presenter::Present(PresentInfo* present_info)
+     {
+       const auto present_time = GetUpdatedPresentationTime(present_info->intended_present_time);
+ 
+-      Core::System::GetInstance().GetCoreTiming().SleepUntil(present_time);
++      // Where the backend can hold the present back on a thread of its own, this thread goes on
++      // with the next frame instead of sleeping: it would hold up the CPU thread waiting on it.
++      if (!g_gfx->SchedulePresent(present_time))
++        Core::System::GetInstance().GetCoreTiming().SleepUntil(present_time);
+ 
+       // Perhaps in the future a more accurate time can be acquired from the various backends.
+-      present_info->actual_present_time = Clock::now();
++      present_info->actual_present_time = std::max(Clock::now(), present_time);
+       present_info->present_time_accuracy = PresentInfo::PresentTimeAccuracy::PresentInProgress;
+     }
+ 
+@@ -1004,6 +1014,12 @@ TimePoint Presenter::GetUpdatedPresentationTime(TimePoint intended_presentation_
+     if (g_ActiveConfig.bImmediateXFB || Config::Get(Config::MAIN_RUSH_FRAME_PRESENTATION))
+       return now;
+ 
++    if (Config::Get(Config::MAIN_SMOOTH_LATE_PRESENTATION))
++    {
++      return intended_presentation_time +
++             UpdateLatePresentationDelay(now - intended_presentation_time);
++    }
++
+     return intended_presentation_time;
+   }
+ 
+@@ -1018,6 +1034,27 @@ TimePoint Presenter::GetUpdatedPresentationTime(TimePoint intended_presentation_
+   return intended_presentation_time + m_presentation_time_offset;
+ }
+ 
++// A frame normally reaches presentation a little after its intended time: the GPU thread takes the
++// swap up when it gets to it, and how long that takes changes from frame to frame (by 1-4 ms in
++// busy scenes). Presenting each frame on arrival hands that jitter to the display, where at a
++// refresh rate that is a multiple of the game's (120 Hz) a frame 1-2 ms off lands on the wrong
++// refresh and stays up for one or three refreshes instead of two. So every frame is held to one
++// common delay after its intended time instead: the delay rises at once to a frame that arrives
++// later than it, and decays slowly while frames arrive earlier.
++DT Presenter::UpdateLatePresentationDelay(DT lateness)
++{
++  if (lateness > MAX_LATE_PRESENTATION_DELAY)
++    return lateness;
++
++  lateness = std::max(lateness, DT{});
++  if (lateness > m_late_presentation_delay)
++    m_late_presentation_delay = lateness;
++  else
++    m_late_presentation_delay -= (m_late_presentation_delay - lateness) / LATE_PRESENTATION_DECAY;
++
++  return m_late_presentation_delay;
++}
++
+ void Presenter::SetKeyMap(const DolphinKeyMap& key_map)
+ {
+   if (m_onscreen_ui)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.h
+index a8264447..c32afb73 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.h
+@@ -195,6 +195,13 @@ private:
+   // Used by the SmoothEarlyPresentation setting.
+   DT m_presentation_time_offset{};
+ 
++  // For the SmoothLatePresentation setting: the delay after its intended time to present a frame
++  // at, given how late this one arrived. Updates the delay.
++  DT UpdateLatePresentationDelay(DT lateness);
++
++  // Used by the SmoothLatePresentation setting.
++  DT m_late_presentation_delay{};
++
+   // Calculated from the previous swap time and current refresh rate.
+   // Can be used for presentation of ImmediateXFB swaps which don't have timing information.
+   u64 m_next_swap_estimated_ticks = 0;

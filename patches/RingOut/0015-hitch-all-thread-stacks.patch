@@ -1,0 +1,136 @@
+diff --git a/ModernGekko/src/runtime/hitch_recorder.cpp b/ModernGekko/src/runtime/hitch_recorder.cpp
+index 85ec59f1..cd534d1c 100644
+--- a/ModernGekko/src/runtime/hitch_recorder.cpp
++++ b/ModernGekko/src/runtime/hitch_recorder.cpp
+@@ -144,17 +144,31 @@ void HitchRecorder::SamplerLoop(std::stop_token stop) {
+       if (now_ns < watch.next_sample_ns || watch.samples >= kMaxSamplesPerInterval)
+         continue;
+ 
+-      NativeStack stack = CaptureThreadStack(thread_id);
++      std::vector<NativeStack> stacks = CaptureStacks(thread_id);
+       watch.next_sample_ns = now_ns + sample_every_ns;
+       ++watch.samples;
+       std::lock_guard lock(m_mutex);
+-      m_samples.push_back(StackSample{watch.span, start_ns, now_ns, std::move(stack)});
++      m_samples.push_back(StackSample{watch.span, start_ns, now_ns, std::move(stacks)});
+       while (!m_samples.empty() && now_ns - m_samples.front().taken_ns > kSampleLifetimeNs)
+         m_samples.pop_front();
+     }
+   }
+ }
+ 
++std::vector<NativeStack> HitchRecorder::CaptureStacks(std::uint32_t interval_thread_id) {
++  std::vector<NativeStack> stacks = CaptureAllThreadStacks(nullptr);
++  // The calling thread (this sampler) has nothing to show.
++  const auto self = static_cast<std::uint32_t>(Common::CurrentThreadId());
++  std::erase_if(stacks, [self](const NativeStack &stack) { return stack.thread_id == self; });
++  const auto interval_thread =
++      std::find_if(stacks.begin(), stacks.end(), [interval_thread_id](const NativeStack &stack) {
++        return stack.thread_id == interval_thread_id;
++      });
++  if (interval_thread != stacks.end())
++    std::rotate(stacks.begin(), interval_thread, interval_thread + 1);
++  return stacks;
++}
++
+ void HitchRecorder::WriterLoop(std::stop_token stop) {
+   Common::SetCurrentThreadName("Hitch recorder");
+   const std::int64_t context_ns = ToNs(m_options.context);
+@@ -228,19 +242,49 @@ void HitchRecorder::WriteReport(const Hitch &hitch, const std::vector<StackSampl
+                    total.spans);
+   }
+ 
+-  // Where the thread was while the interval ran long (resolve_report.py names the frames).
++  // Where the threads were while the interval ran long (resolve_report.py names the frames): the
++  // interval's own thread at every sample, the others whenever their stack changed.
+   std::map<std::string, std::string> modules;
+-  if (!samples.empty()) {
+-    fmt::format_to(std::back_inserter(out), "\nnative stacks of {} while the interval ran long:\n",
+-                   ThreadLabel(samples.front().stack.thread_id));
+-  }
+-  for (const StackSample &sample : samples) {
+-    fmt::format_to(std::back_inserter(out), "  at {:.1f} ms{}{}\n",
+-                   ToMs(sample.taken_ns - hitch.start_ns), sample.stack.note.empty() ? "" : "  -- ",
+-                   sample.stack.note);
+-    for (std::size_t i = 0; i < sample.stack.frames.size(); ++i)
++  const auto describe_stack = [&](const NativeStack &stack, std::int64_t taken_ns) {
++    fmt::format_to(std::back_inserter(out), "  at {:.1f} ms{}{}\n", ToMs(taken_ns - hitch.start_ns),
++                   stack.note.empty() ? "" : "  -- ", stack.note);
++    for (std::size_t i = 0; i < stack.frames.size(); ++i)
+       fmt::format_to(std::back_inserter(out), "    #{:02} {}\n", i,
+-                     DescribeAddress(sample.stack.frames[i], modules));
++                     DescribeAddress(stack.frames[i], modules));
++  };
++  if (!samples.empty() && !samples.front().stacks.empty()) {
++    const std::uint32_t interval_thread_id = samples.front().stacks.front().thread_id;
++    fmt::format_to(std::back_inserter(out), "\nnative stacks of {} while the interval ran long:\n",
++                   ThreadLabel(interval_thread_id));
++    for (const StackSample &sample : samples) {
++      if (!sample.stacks.empty() && sample.stacks.front().thread_id == interval_thread_id)
++        describe_stack(sample.stacks.front(), sample.taken_ns);
++    }
++
++    // Thread ids in the order the first sample lists them, then any that started later.
++    std::vector<std::uint32_t> others;
++    for (const StackSample &sample : samples) {
++      for (const NativeStack &stack : sample.stacks) {
++        if (stack.thread_id != interval_thread_id &&
++            std::find(others.begin(), others.end(), stack.thread_id) == others.end()) {
++          others.push_back(stack.thread_id);
++        }
++      }
++    }
++    out += "\nthe other threads meanwhile (a stack is repeated only when it changed):\n";
++    for (const std::uint32_t thread_id : others) {
++      fmt::format_to(std::back_inserter(out), " {}\n", ThreadLabel(thread_id));
++      const std::vector<std::uintptr_t> *previous = nullptr;
++      for (const StackSample &sample : samples) {
++        const auto stack =
++            std::find_if(sample.stacks.begin(), sample.stacks.end(),
++                         [thread_id](const NativeStack &s) { return s.thread_id == thread_id; });
++        if (stack == sample.stacks.end() || (previous && *previous == stack->frames))
++          continue;
++        describe_stack(*stack, sample.taken_ns);
++        previous = &stack->frames;
++      }
++    }
+   }
+ 
+   fmt::format_to(std::back_inserter(out),
+diff --git a/ModernGekko/src/runtime/hitch_recorder.hpp b/ModernGekko/src/runtime/hitch_recorder.hpp
+index b1e3cc84..4cf969d3 100644
+--- a/ModernGekko/src/runtime/hitch_recorder.hpp
++++ b/ModernGekko/src/runtime/hitch_recorder.hpp
+@@ -24,7 +24,8 @@ namespace moderngekko {
+ // recorded around it (what the CPU and GPU threads were waiting on, and for how long), and how
+ // long the thread was actually on a core: a slow field with neither waits nor work in it means
+ // the thread was preempted or blocked somewhere the trace does not see. For those, the native
+-// stacks sampled from the thread while it was stuck show where.
++// stacks sampled from every thread while it was stuck show where (and what the thread it waits
++// on, say the DVD thread, was doing meanwhile).
+ //
+ // Off unless RINGOUT_HITCH_TRACE is set to the threshold in milliseconds.
+ class HitchRecorder {
+@@ -65,18 +66,20 @@ private:
+     std::int64_t busy_ns;
+   };
+ 
+-  // A native stack of a thread whose interval was already running long, taken while it ran.
++  // The native stacks of the process's threads, taken while an interval was already running
++  // long; the stack of the interval's own thread comes first.
+   struct StackSample {
+     Common::HitchTrace::Span span;
+     std::int64_t interval_start_ns;
+     std::int64_t taken_ns;
+-    NativeStack stack;
++    std::vector<NativeStack> stacks;
+   };
+ 
+   void OnIntervalEnd(Common::HitchTrace::Span span, IntervalClock &clock);
+   void SamplerLoop(std::stop_token stop);
+   void WriterLoop(std::stop_token stop);
+   void WriteReport(const Hitch &hitch, const std::vector<StackSample> &samples);
++  static std::vector<NativeStack> CaptureStacks(std::uint32_t interval_thread_id);
+   const std::string &ThreadLabel(std::uint32_t thread_id);
+ 
+   Options m_options;
