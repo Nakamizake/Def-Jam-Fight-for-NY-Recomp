@@ -1,32 +1,87 @@
 diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
-index 6722dcbb..f5504059 100644
+index 6722dcbb..def7c7f6 100644
 --- a/ModernGekko/CMakeLists.txt
 +++ b/ModernGekko/CMakeLists.txt
-@@ -311,6 +311,8 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+@@ -311,6 +311,9 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
          src/runtime/dolphin_runtime.cpp
          src/runtime/diagnostic_reporter.cpp
          src/runtime/game_data_prefetcher.cpp
 +        src/runtime/hitch_recorder.cpp
++        src/runtime/native_stacks.cpp
 +        src/runtime/thread_names.cpp
          tools/automation_protocol.cpp
          vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
          vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
 diff --git a/ModernGekko/src/runtime/diagnostic_reporter.cpp b/ModernGekko/src/runtime/diagnostic_reporter.cpp
-index caf4b8ed..bb5ebc64 100644
+index caf4b8ed..f173856e 100644
 --- a/ModernGekko/src/runtime/diagnostic_reporter.cpp
 +++ b/ModernGekko/src/runtime/diagnostic_reporter.cpp
-@@ -20,6 +20,7 @@
+@@ -20,11 +20,11 @@
  #include "VideoCommon/CommandProcessor.h"
  #include "VideoCommon/Fifo.h"
  #include "VideoCommon/VideoEvents.h"
-+#include "thread_names.hpp"
++#include "native_stacks.hpp"
  
  #if defined(_WIN32) && defined(_M_X64) && defined(_MSC_VER)
  #define MODERNGEKKO_NATIVE_STACKS 1
-@@ -263,22 +264,6 @@ int UnwindFrames(CONTEXT *context, std::uintptr_t stack_low, std::uintptr_t stac
-   return count;
- }
+ #include <windows.h>
+-#include <tlhelp32.h>
+ #endif
  
+ namespace moderngekko {
+@@ -214,230 +214,13 @@ void DescribeFifo(Core::System &system, std::string &out) {
+ 
+ // --- native threads ----------------------------------------------------------
+ 
+-#ifdef MODERNGEKKO_NATIVE_STACKS
+-constexpr int kMaxNativeFrames = 64;
+-constexpr std::size_t kMaxStackCopy = 4 * 1024 * 1024;
+-
+-struct NativeStack {
+-  DWORD thread_id = 0;
+-  std::string name;
+-  std::vector<std::uintptr_t> frames;
+-  std::string note;
+-};
+-
+-// The SEH helpers below hold no C++ objects, which __try requires.
+-bool CopyMemorySafely(void *destination, const void *source, std::size_t size) {
+-  __try {
+-    std::memcpy(destination, source, size);
+-    return true;
+-  } __except (EXCEPTION_EXECUTE_HANDLER) {
+-    return false;
+-  }
+-}
+-
+-// Unwinds `context` with the x64 unwind tables, keeping rsp inside
+-// [stack_low, stack_high). Code without unwind data (JIT output) is treated as
+-// a leaf, which is right for leaves and ends the walk early otherwise.
+-int UnwindFrames(CONTEXT *context, std::uintptr_t stack_low, std::uintptr_t stack_high,
+-                 std::uintptr_t *frames, int max_frames) {
+-  int count = 0;
+-  __try {
+-    while (count < max_frames && context->Rip != 0) {
+-      frames[count++] = context->Rip;
+-      if (context->Rsp < stack_low || context->Rsp + 8 > stack_high)
+-        break;
+-      DWORD64 image_base = 0;
+-      PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context->Rip, &image_base, nullptr);
+-      if (!function) {
+-        context->Rip = *reinterpret_cast<const DWORD64 *>(context->Rsp);
+-        context->Rsp += 8;
+-        continue;
+-      }
+-      void *handler_data = nullptr;
+-      DWORD64 establisher_frame = 0;
+-      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
+-                       &handler_data, &establisher_frame, nullptr);
+-    }
+-  } __except (EXCEPTION_EXECUTE_HANDLER) {
+-  }
+-  return count;
+-}
+-
 -std::string ThreadName(HANDLE thread) {
 -  using GetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
 -  static const auto get_description = reinterpret_cast<GetThreadDescriptionFn>(
@@ -43,9 +98,202 @@ index caf4b8ed..bb5ebc64 100644
 -  return name;
 -}
 -
- // Stack range of another thread, from its TEB (NT_TIB.StackLimit/StackBase).
- bool ThreadStackRange(HANDLE thread, std::uintptr_t *low, std::uintptr_t *high) {
-   struct ThreadBasicInformation {
+-// Stack range of another thread, from its TEB (NT_TIB.StackLimit/StackBase).
+-bool ThreadStackRange(HANDLE thread, std::uintptr_t *low, std::uintptr_t *high) {
+-  struct ThreadBasicInformation {
+-    LONG exit_status;
+-    PVOID teb;
+-    HANDLE process_id;
+-    HANDLE thread_id;
+-    ULONG_PTR affinity;
+-    LONG priority;
+-    LONG base_priority;
+-  };
+-  using NtQueryInformationThreadFn = LONG(NTAPI *)(HANDLE, int, PVOID, ULONG, PULONG);
+-  static const auto query = reinterpret_cast<NtQueryInformationThreadFn>(
+-      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+-  ThreadBasicInformation info{};
+-  if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof(info), nullptr) < 0 ||
+-      !info.teb)
+-    return false;
+-  const NT_TIB *tib = static_cast<const NT_TIB *>(info.teb);
+-  *low = reinterpret_cast<std::uintptr_t>(tib->StackLimit);
+-  *high = reinterpret_cast<std::uintptr_t>(tib->StackBase);
+-  return *low < *high;
+-}
+-
+-// Captures another thread's stack without unwinding it in place: the thread is
+-// suspended only long enough to read its registers and copy its used stack,
+-// because the unwinder takes loader locks a suspended thread might hold. The
+-// copy is then unwound with stack pointers rebased onto it.
+-void CaptureOtherThread(DWORD thread_id, std::vector<std::uint8_t> &buffer, NativeStack &stack) {
+-  HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+-                             FALSE, thread_id);
+-  if (!thread) {
+-    stack.note = "could not open thread";
+-    return;
+-  }
+-  stack.name = ThreadName(thread);
+-  std::uintptr_t stack_low = 0, stack_high = 0;
+-  if (!ThreadStackRange(thread, &stack_low, &stack_high)) {
+-    stack.note = "could not read stack range";
+-    CloseHandle(thread);
+-    return;
+-  }
+-
+-  CONTEXT context{};
+-  context.ContextFlags = CONTEXT_FULL;
+-  std::size_t copied = 0;
+-  bool captured = false;
+-  if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+-    if (GetThreadContext(thread, &context) && context.Rsp >= stack_low && context.Rsp < stack_high) {
+-      copied = std::min<std::size_t>(stack_high - context.Rsp, buffer.size());
+-      captured = CopyMemorySafely(buffer.data(), reinterpret_cast<const void *>(context.Rsp), copied);
+-    }
+-    ResumeThread(thread);
+-  }
+-  CloseHandle(thread);
+-  if (!captured) {
+-    stack.note = "could not capture registers or stack";
++void DescribeNativeStacks(const void *current_thread_context, std::string &out,
++                          std::map<std::string, std::string> &modules) {
++  if (!CanCaptureNativeStacks()) {
++    out += "  not supported on this platform\n";
+     return;
+   }
+-
+-  // Rebase every pointer into the original stack (saved frame pointers,
+-  // registers) onto the copy, so the unwinder never reads the live stack.
+-  const std::uintptr_t original = context.Rsp;
+-  const std::uintptr_t copy = reinterpret_cast<std::uintptr_t>(buffer.data());
+-  const auto rebase = [&](DWORD64 &value) {
+-    if (value >= original && value < original + copied)
+-      value = value - original + copy;
+-  };
+-  for (std::size_t offset = 0; offset + 8 <= copied; offset += 8)
+-    rebase(*reinterpret_cast<DWORD64 *>(buffer.data() + offset));
+-  for (DWORD64 *reg : {&context.Rax, &context.Rbx, &context.Rcx, &context.Rdx, &context.Rsi,
+-                       &context.Rdi, &context.Rbp, &context.Rsp, &context.R8, &context.R9,
+-                       &context.R10, &context.R11, &context.R12, &context.R13, &context.R14,
+-                       &context.R15})
+-    rebase(*reg);
+-
+-  std::uintptr_t frames[kMaxNativeFrames];
+-  const int count = UnwindFrames(&context, copy, copy + copied, frames, kMaxNativeFrames);
+-  stack.frames.assign(frames, frames + count);
+-  if (copied == buffer.size())
+-    stack.note = "stack copy truncated";
+-}
+-
+-void CaptureCurrentThread(const CONTEXT &crash_context, NativeStack &stack) {
+-  stack.thread_id = GetCurrentThreadId();
+-  stack.name = ThreadName(GetCurrentThread());
+-  ULONG_PTR low = 0, high = 0;
+-  GetCurrentThreadStackLimits(&low, &high);
+-  CONTEXT context = crash_context;
+-  std::uintptr_t frames[kMaxNativeFrames];
+-  const int count = UnwindFrames(&context, low, high, frames, kMaxNativeFrames);
+-  stack.frames.assign(frames, frames + count);
+-}
+-
+-std::vector<NativeStack> CaptureAllThreads(const CONTEXT *current_thread_context) {
+-  std::vector<DWORD> thread_ids;
+-  const DWORD process_id = GetCurrentProcessId();
+-  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+-  if (snapshot != INVALID_HANDLE_VALUE) {
+-    THREADENTRY32 entry{};
+-    entry.dwSize = sizeof(entry);
+-    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+-      if (entry.th32OwnerProcessID == process_id)
+-        thread_ids.push_back(entry.th32ThreadID);
+-    }
+-    CloseHandle(snapshot);
+-  }
+-
+-  std::vector<NativeStack> stacks;
+-  stacks.reserve(thread_ids.size());
+-  std::vector<std::uint8_t> buffer(kMaxStackCopy);
+-  const DWORD self = GetCurrentThreadId();
+-  for (const DWORD thread_id : thread_ids) {
+-    NativeStack &stack = stacks.emplace_back();
+-    stack.thread_id = thread_id;
+-    if (thread_id != self)
+-      CaptureOtherThread(thread_id, buffer, stack);
+-    else if (current_thread_context)
+-      CaptureCurrentThread(*current_thread_context, stack);
+-    else
+-      stack.note = "diagnostics thread";
+-  }
+-  return stacks;
+-}
+-
+-struct ModuleInfo {
+-  std::string name;
+-  std::string path;
+-  std::uintptr_t base = 0;
+-};
+-
+-std::optional<ModuleInfo> ModuleAt(std::uintptr_t address) {
+-  HMODULE module = nullptr;
+-  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+-                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+-                          reinterpret_cast<LPCWSTR>(address), &module))
+-    return std::nullopt;
+-  wchar_t wide[MAX_PATH];
+-  const DWORD length = GetModuleFileNameW(module, wide, MAX_PATH);
+-  ModuleInfo info;
+-  info.base = reinterpret_cast<std::uintptr_t>(module);
+-  for (DWORD i = 0; i < length; ++i)
+-    info.path += wide[i] < 0x80 ? static_cast<char>(wide[i]) : '?';
+-  const std::size_t slash = info.path.find_last_of("\\/");
+-  info.name = slash == std::string::npos ? info.path : info.path.substr(slash + 1);
+-  return info;
+-}
+-
+-std::string DescribeAddress(std::uintptr_t address, std::map<std::string, std::string> &modules) {
+-  if (const std::optional<ModuleInfo> module = ModuleAt(address)) {
+-    modules.emplace(module->name, module->path);
+-    return fmt::format("{}+0x{:x}", module->name, address - module->base);
+-  }
+-  return fmt::format("0x{:016x} (no module: JIT code or bad frame)", address);
+-}
+-
+-void DescribeNativeStacks(const CONTEXT *current_thread_context, std::string &out,
+-                          std::map<std::string, std::string> &modules) {
+-  for (const NativeStack &stack : CaptureAllThreads(current_thread_context)) {
++  for (const NativeStack &stack : CaptureAllThreadStacks(current_thread_context)) {
+     fmt::format_to(std::back_inserter(out), "  thread {} \"{}\"{}{}\n", stack.thread_id,
+                    stack.name, stack.note.empty() ? "" : "  -- ", stack.note);
+     for (std::size_t i = 0; i < stack.frames.size(); ++i)
+@@ -445,7 +228,6 @@ void DescribeNativeStacks(const CONTEXT *current_thread_context, std::string &ou
+                      DescribeAddress(stack.frames[i], modules));
+   }
+ }
+-#endif
+ 
+ // One sample of everything that moves: guest, FIFO and native stacks.
+ void DescribeSample(Core::System &system, const void *current_thread_context, std::string &out,
+@@ -459,19 +241,7 @@ void DescribeSample(Core::System &system, const void *current_thread_context, st
+   out += "\n[gpu fifo]\n";
+   DescribeFifo(system, out);
+   out += "\n[native threads]\n";
+-#ifdef MODERNGEKKO_NATIVE_STACKS
+-  DescribeNativeStacks(static_cast<const CONTEXT *>(current_thread_context), out, modules);
+-#else
+-  (void)current_thread_context;
+-  (void)modules;
+-  out += "  not supported on this platform\n";
+-#endif
+-}
+-
+-void DescribeModules(const std::map<std::string, std::string> &modules, std::string &out) {
+-  out += "\n[modules]\n";
+-  for (const auto &[name, path] : modules)
+-    fmt::format_to(std::back_inserter(out), "  {} = {}\n", name, path);
++  DescribeNativeStacks(current_thread_context, out, modules);
+ }
+ 
+ bool WriteText(const std::filesystem::path &path, const std::string &text) {
 diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
 index 880073ed..33f8b721 100644
 --- a/ModernGekko/src/runtime/dolphin_runtime.cpp
@@ -94,10 +342,10 @@ index 880073ed..33f8b721 100644
    Core::Shutdown(Core::System::GetInstance());
 diff --git a/ModernGekko/src/runtime/hitch_recorder.cpp b/ModernGekko/src/runtime/hitch_recorder.cpp
 new file mode 100644
-index 00000000..3870b0bc
+index 00000000..85ec59f1
 --- /dev/null
 +++ b/ModernGekko/src/runtime/hitch_recorder.cpp
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,286 @@
 +#include "hitch_recorder.hpp"
 +
 +#include <algorithm>
@@ -126,6 +374,11 @@ index 00000000..3870b0bc
 +// Longer intervals are pauses, savestate loads or real freezes (the diagnostic reporter covers
 +// those), not hitches.
 +constexpr std::int64_t kMaxIntervalNs = 2'000'000'000;
++// How often the stack sampler looks at the watched threads, how many stacks it takes from one
++// long interval (a pause makes it endless), and how long a stack waits for its report.
++constexpr std::chrono::milliseconds kSamplerPeriod{5};
++constexpr int kMaxSamplesPerInterval = 8;
++constexpr std::int64_t kSampleLifetimeNs = 5'000'000'000;
 +
 +std::int64_t ToNs(std::chrono::milliseconds duration) {
 +  return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
@@ -174,6 +427,8 @@ index 00000000..3870b0bc
 +      [this] { OnIntervalEnd(Span::ViField, m_field_clock); });
 +  m_present_hook = events.after_present_event.Register(
 +      [this](const PresentInfo &) { OnIntervalEnd(Span::FramePresented, m_present_clock); });
++  if (CanCaptureNativeStacks())
++    m_sampler = std::jthread([this](std::stop_token stop) { SamplerLoop(std::move(stop)); });
 +  m_writer = std::jthread([this](std::stop_token stop) { WriterLoop(std::move(stop)); });
 +}
 +
@@ -186,10 +441,13 @@ index 00000000..3870b0bc
 +void HitchRecorder::OnIntervalEnd(Span span, IntervalClock &clock) {
 +  const std::int64_t now_ns = HitchTrace::NowNs();
 +  const std::int64_t busy_ns = HitchTrace::CurrentThreadBusyNs();
-+  const std::int64_t start_ns = std::exchange(clock.last_ns, now_ns);
-+  const std::int64_t busy_in_interval_ns = busy_ns - std::exchange(clock.last_busy_ns, busy_ns);
-+  if (start_ns == 0)
++  const std::int64_t start_ns = clock.start_ns.exchange(now_ns, std::memory_order_relaxed);
++  const std::int64_t busy_in_interval_ns = busy_ns - std::exchange(clock.busy_start_ns, busy_ns);
++  if (start_ns == 0) {
++    clock.thread_id.store(static_cast<std::uint32_t>(Common::CurrentThreadId()),
++                          std::memory_order_relaxed);
 +    return;
++  }
 +
 +  const std::int64_t busy_us = std::max<std::int64_t>(busy_in_interval_ns / 1000, 0);
 +  HitchTrace::Record(span, start_ns, now_ns,
@@ -203,6 +461,46 @@ index 00000000..3870b0bc
 +    m_pending.push_back(Hitch{span, start_ns, now_ns, busy_in_interval_ns});
 +  }
 +  m_wake.notify_one();
++}
++
++void HitchRecorder::SamplerLoop(std::stop_token stop) {
++  Common::SetCurrentThreadName("Hitch stack sampler");
++  // Half the threshold in, and then every half threshold until the interval ends.
++  const std::int64_t sample_every_ns = ToNs(m_options.threshold) / 2;
++  struct Watch {
++    Span span;
++    IntervalClock *clock;
++    std::int64_t interval_start_ns = 0;
++    std::int64_t next_sample_ns = 0;
++    int samples = 0;
++  };
++  Watch watches[] = {{Span::ViField, &m_field_clock}, {Span::FramePresented, &m_present_clock}};
++
++  while (!stop.stop_requested()) {
++    std::this_thread::sleep_for(kSamplerPeriod);
++    for (Watch &watch : watches) {
++      const std::int64_t start_ns = watch.clock->start_ns.load(std::memory_order_relaxed);
++      const std::uint32_t thread_id = watch.clock->thread_id.load(std::memory_order_relaxed);
++      if (start_ns == 0 || thread_id == 0)
++        continue;
++      if (start_ns != watch.interval_start_ns) {
++        watch.interval_start_ns = start_ns;
++        watch.next_sample_ns = start_ns + sample_every_ns;
++        watch.samples = 0;
++      }
++      const std::int64_t now_ns = HitchTrace::NowNs();
++      if (now_ns < watch.next_sample_ns || watch.samples >= kMaxSamplesPerInterval)
++        continue;
++
++      NativeStack stack = CaptureThreadStack(thread_id);
++      watch.next_sample_ns = now_ns + sample_every_ns;
++      ++watch.samples;
++      std::lock_guard lock(m_mutex);
++      m_samples.push_back(StackSample{watch.span, start_ns, now_ns, std::move(stack)});
++      while (!m_samples.empty() && now_ns - m_samples.front().taken_ns > kSampleLifetimeNs)
++        m_samples.pop_front();
++    }
++  }
 +}
 +
 +void HitchRecorder::WriterLoop(std::stop_token stop) {
@@ -228,13 +526,18 @@ index 00000000..3870b0bc
 +    reported_until_ns = hitch.end_ns + context_ns;
 +    ++m_reports_written;
 +
++    std::vector<StackSample> samples;
++    for (const StackSample &sample : m_samples) {
++      if (sample.span == hitch.span && sample.interval_start_ns == hitch.start_ns)
++        samples.push_back(sample);
++    }
 +    lock.unlock();
-+    WriteReport(hitch);
++    WriteReport(hitch, samples);
 +    lock.lock();
 +  }
 +}
 +
-+void HitchRecorder::WriteReport(const Hitch &hitch) {
++void HitchRecorder::WriteReport(const Hitch &hitch, const std::vector<StackSample> &samples) {
 +  const std::int64_t context_ns = ToNs(m_options.context);
 +  const std::vector<HitchTrace::Event> events =
 +      HitchTrace::Collect(hitch.start_ns - context_ns, hitch.end_ns + context_ns);
@@ -273,6 +576,21 @@ index 00000000..3870b0bc
 +                   total.spans);
 +  }
 +
++  // Where the thread was while the interval ran long (resolve_report.py names the frames).
++  std::map<std::string, std::string> modules;
++  if (!samples.empty()) {
++    fmt::format_to(std::back_inserter(out), "\nnative stacks of {} while the interval ran long:\n",
++                   ThreadLabel(samples.front().stack.thread_id));
++  }
++  for (const StackSample &sample : samples) {
++    fmt::format_to(std::back_inserter(out), "  at {:.1f} ms{}{}\n",
++                   ToMs(sample.taken_ns - hitch.start_ns), sample.stack.note.empty() ? "" : "  -- ",
++                   sample.stack.note);
++    for (std::size_t i = 0; i < sample.stack.frames.size(); ++i)
++      fmt::format_to(std::back_inserter(out), "    #{:02} {}\n", i,
++                     DescribeAddress(sample.stack.frames[i], modules));
++  }
++
 +  fmt::format_to(std::back_inserter(out),
 +                 "\nevents from -{} ms to +{:.0f} ms (times in ms from the start of the slow "
 +                 "interval; spans shorter than 0.01 ms are not recorded):\n"
@@ -287,6 +605,8 @@ index 00000000..3870b0bc
 +      fmt::format_to(std::back_inserter(out), " {:.1f}", event.detail / 1000.0);
 +    out += '\n';
 +  }
++  if (!modules.empty())
++    DescribeModules(modules, out);
 +
 +  std::error_code error;
 +  std::filesystem::create_directories(m_options.directory, error);
@@ -314,12 +634,13 @@ index 00000000..3870b0bc
 +} // namespace moderngekko
 diff --git a/ModernGekko/src/runtime/hitch_recorder.hpp b/ModernGekko/src/runtime/hitch_recorder.hpp
 new file mode 100644
-index 00000000..21a3c03d
+index 00000000..b1e3cc84
 --- /dev/null
 +++ b/ModernGekko/src/runtime/hitch_recorder.hpp
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,103 @@
 +#pragma once
 +
++#include <atomic>
 +#include <chrono>
 +#include <condition_variable>
 +#include <cstdint>
@@ -331,16 +652,19 @@ index 00000000..21a3c03d
 +#include <stop_token>
 +#include <string>
 +#include <thread>
++#include <vector>
 +
 +#include "Common/HitchTrace.h"
 +#include "Common/HookableEvent.h"
++#include "native_stacks.hpp"
 +
 +namespace moderngekko {
 +// Writes a report to a log directory whenever an emulated video field or a presented frame
 +// takes much longer than a frame should. The report lays out the waits Common::HitchTrace
 +// recorded around it (what the CPU and GPU threads were waiting on, and for how long), and how
 +// long the thread was actually on a core: a slow field with neither waits nor work in it means
-+// the thread was preempted or blocked somewhere the trace does not see.
++// the thread was preempted or blocked somewhere the trace does not see. For those, the native
++// stacks sampled from the thread while it was stuck show where.
 +//
 +// Off unless RINGOUT_HITCH_TRACE is set to the threshold in milliseconds.
 +class HitchRecorder {
@@ -367,10 +691,11 @@ index 00000000..21a3c03d
 +
 +private:
 +  // One periodic interval of one thread: video fields on the CPU thread, presented frames on
-+  // the GPU thread. Each is touched only by its own thread.
++  // the GPU thread. Written by that thread only; the stack sampler reads the atomics.
 +  struct IntervalClock {
-+    std::int64_t last_ns = 0;
-+    std::int64_t last_busy_ns = 0;
++    std::atomic<std::int64_t> start_ns{0};
++    std::atomic<std::uint32_t> thread_id{0};
++    std::int64_t busy_start_ns = 0;
 +  };
 +
 +  struct Hitch {
@@ -380,9 +705,18 @@ index 00000000..21a3c03d
 +    std::int64_t busy_ns;
 +  };
 +
++  // A native stack of a thread whose interval was already running long, taken while it ran.
++  struct StackSample {
++    Common::HitchTrace::Span span;
++    std::int64_t interval_start_ns;
++    std::int64_t taken_ns;
++    NativeStack stack;
++  };
++
 +  void OnIntervalEnd(Common::HitchTrace::Span span, IntervalClock &clock);
++  void SamplerLoop(std::stop_token stop);
 +  void WriterLoop(std::stop_token stop);
-+  void WriteReport(const Hitch &hitch);
++  void WriteReport(const Hitch &hitch, const std::vector<StackSample> &samples);
 +  const std::string &ThreadLabel(std::uint32_t thread_id);
 +
 +  Options m_options;
@@ -395,6 +729,7 @@ index 00000000..21a3c03d
 +  std::mutex m_mutex;
 +  std::condition_variable_any m_wake;
 +  std::deque<Hitch> m_pending;
++  std::deque<StackSample> m_samples;
 +
 +  // Writer thread only.
 +  int m_reports_written = 0;
@@ -402,8 +737,320 @@ index 00000000..21a3c03d
 +
 +  Common::EventHook m_field_hook;
 +  Common::EventHook m_present_hook;
++  std::jthread m_sampler;
 +  std::jthread m_writer;
 +};
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/native_stacks.cpp b/ModernGekko/src/runtime/native_stacks.cpp
+new file mode 100644
+index 00000000..ae0f6bea
+--- /dev/null
++++ b/ModernGekko/src/runtime/native_stacks.cpp
+@@ -0,0 +1,262 @@
++#include "native_stacks.hpp"
++
++#include <algorithm>
++#include <cstring>
++#include <iterator>
++#include <optional>
++
++#include <fmt/format.h>
++
++#include "thread_names.hpp"
++
++#if defined(_WIN32) && defined(_M_X64) && defined(_MSC_VER)
++#define MODERNGEKKO_NATIVE_STACKS 1
++#include <windows.h>
++#include <tlhelp32.h>
++#endif
++
++namespace moderngekko {
++namespace {
++#ifdef MODERNGEKKO_NATIVE_STACKS
++constexpr int kMaxNativeFrames = 64;
++constexpr std::size_t kMaxStackCopy = 4 * 1024 * 1024;
++
++// The SEH helpers below hold no C++ objects, which __try requires.
++bool CopyMemorySafely(void *destination, const void *source, std::size_t size) {
++  __try {
++    std::memcpy(destination, source, size);
++    return true;
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++    return false;
++  }
++}
++
++// Unwinds `context` with the x64 unwind tables, keeping rsp inside
++// [stack_low, stack_high). Code without unwind data (JIT output) is treated as
++// a leaf, which is right for leaves and ends the walk early otherwise.
++int UnwindFrames(CONTEXT *context, std::uintptr_t stack_low, std::uintptr_t stack_high,
++                 std::uintptr_t *frames, int max_frames) {
++  int count = 0;
++  __try {
++    while (count < max_frames && context->Rip != 0) {
++      frames[count++] = context->Rip;
++      if (context->Rsp < stack_low || context->Rsp + 8 > stack_high)
++        break;
++      DWORD64 image_base = 0;
++      PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context->Rip, &image_base, nullptr);
++      if (!function) {
++        context->Rip = *reinterpret_cast<const DWORD64 *>(context->Rsp);
++        context->Rsp += 8;
++        continue;
++      }
++      void *handler_data = nullptr;
++      DWORD64 establisher_frame = 0;
++      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context->Rip, function, context,
++                       &handler_data, &establisher_frame, nullptr);
++    }
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++  }
++  return count;
++}
++
++// Stack range of another thread, from its TEB (NT_TIB.StackLimit/StackBase).
++bool ThreadStackRange(HANDLE thread, std::uintptr_t *low, std::uintptr_t *high) {
++  struct ThreadBasicInformation {
++    LONG exit_status;
++    PVOID teb;
++    HANDLE process_id;
++    HANDLE thread_id;
++    ULONG_PTR affinity;
++    LONG priority;
++    LONG base_priority;
++  };
++  using NtQueryInformationThreadFn = LONG(NTAPI *)(HANDLE, int, PVOID, ULONG, PULONG);
++  static const auto query = reinterpret_cast<NtQueryInformationThreadFn>(
++      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
++  ThreadBasicInformation info{};
++  if (!query || query(thread, 0 /* ThreadBasicInformation */, &info, sizeof(info), nullptr) < 0 ||
++      !info.teb)
++    return false;
++  const NT_TIB *tib = static_cast<const NT_TIB *>(info.teb);
++  *low = reinterpret_cast<std::uintptr_t>(tib->StackLimit);
++  *high = reinterpret_cast<std::uintptr_t>(tib->StackBase);
++  return *low < *high;
++}
++
++// Captures another thread's stack without unwinding it in place: the thread is
++// suspended only long enough to read its registers and copy its used stack,
++// because the unwinder takes loader locks a suspended thread might hold. The
++// copy is then unwound with stack pointers rebased onto it.
++void CaptureOtherThread(DWORD thread_id, std::vector<std::uint8_t> &buffer, NativeStack &stack) {
++  HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
++                             FALSE, thread_id);
++  if (!thread) {
++    stack.note = "could not open thread";
++    return;
++  }
++  stack.name = ThreadName(thread);
++  std::uintptr_t stack_low = 0, stack_high = 0;
++  if (!ThreadStackRange(thread, &stack_low, &stack_high)) {
++    stack.note = "could not read stack range";
++    CloseHandle(thread);
++    return;
++  }
++
++  CONTEXT context{};
++  context.ContextFlags = CONTEXT_FULL;
++  std::size_t copied = 0;
++  bool captured = false;
++  if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
++    if (GetThreadContext(thread, &context) && context.Rsp >= stack_low && context.Rsp < stack_high) {
++      copied = std::min<std::size_t>(stack_high - context.Rsp, buffer.size());
++      captured = CopyMemorySafely(buffer.data(), reinterpret_cast<const void *>(context.Rsp), copied);
++    }
++    ResumeThread(thread);
++  }
++  CloseHandle(thread);
++  if (!captured) {
++    stack.note = "could not capture registers or stack";
++    return;
++  }
++
++  // Rebase every pointer into the original stack (saved frame pointers,
++  // registers) onto the copy, so the unwinder never reads the live stack.
++  const std::uintptr_t original = context.Rsp;
++  const std::uintptr_t copy = reinterpret_cast<std::uintptr_t>(buffer.data());
++  const auto rebase = [&](DWORD64 &value) {
++    if (value >= original && value < original + copied)
++      value = value - original + copy;
++  };
++  for (std::size_t offset = 0; offset + 8 <= copied; offset += 8)
++    rebase(*reinterpret_cast<DWORD64 *>(buffer.data() + offset));
++  for (DWORD64 *reg : {&context.Rax, &context.Rbx, &context.Rcx, &context.Rdx, &context.Rsi,
++                       &context.Rdi, &context.Rbp, &context.Rsp, &context.R8, &context.R9,
++                       &context.R10, &context.R11, &context.R12, &context.R13, &context.R14,
++                       &context.R15})
++    rebase(*reg);
++
++  std::uintptr_t frames[kMaxNativeFrames];
++  const int count = UnwindFrames(&context, copy, copy + copied, frames, kMaxNativeFrames);
++  stack.frames.assign(frames, frames + count);
++  if (copied == buffer.size())
++    stack.note = "stack copy truncated";
++}
++
++void CaptureCurrentThread(const CONTEXT &crash_context, NativeStack &stack) {
++  stack.thread_id = GetCurrentThreadId();
++  stack.name = ThreadName(GetCurrentThread());
++  ULONG_PTR low = 0, high = 0;
++  GetCurrentThreadStackLimits(&low, &high);
++  CONTEXT context = crash_context;
++  std::uintptr_t frames[kMaxNativeFrames];
++  const int count = UnwindFrames(&context, low, high, frames, kMaxNativeFrames);
++  stack.frames.assign(frames, frames + count);
++}
++
++// The copy of another thread's stack, reused by every capture on the calling thread.
++std::vector<std::uint8_t> &StackCopyBuffer() {
++  thread_local std::vector<std::uint8_t> buffer(kMaxStackCopy);
++  return buffer;
++}
++
++struct ModuleInfo {
++  std::string name;
++  std::string path;
++  std::uintptr_t base = 0;
++};
++
++std::optional<ModuleInfo> ModuleAt(std::uintptr_t address) {
++  HMODULE module = nullptr;
++  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                          reinterpret_cast<LPCWSTR>(address), &module))
++    return std::nullopt;
++  wchar_t wide[MAX_PATH];
++  const DWORD length = GetModuleFileNameW(module, wide, MAX_PATH);
++  ModuleInfo info;
++  info.base = reinterpret_cast<std::uintptr_t>(module);
++  for (DWORD i = 0; i < length; ++i)
++    info.path += wide[i] < 0x80 ? static_cast<char>(wide[i]) : '?';
++  const std::size_t slash = info.path.find_last_of("\\/");
++  info.name = slash == std::string::npos ? info.path : info.path.substr(slash + 1);
++  return info;
++}
++#endif
++} // namespace
++
++bool CanCaptureNativeStacks() {
++#ifdef MODERNGEKKO_NATIVE_STACKS
++  return true;
++#else
++  return false;
++#endif
++}
++
++NativeStack CaptureThreadStack(std::uint32_t thread_id) {
++  NativeStack stack;
++  stack.thread_id = thread_id;
++#ifdef MODERNGEKKO_NATIVE_STACKS
++  if (thread_id == GetCurrentThreadId())
++    stack.note = "calling thread";
++  else
++    CaptureOtherThread(thread_id, StackCopyBuffer(), stack);
++#else
++  stack.note = "not supported on this platform";
++#endif
++  return stack;
++}
++
++std::vector<NativeStack> CaptureAllThreadStacks(const void *current_thread_context) {
++  std::vector<NativeStack> stacks;
++#ifdef MODERNGEKKO_NATIVE_STACKS
++  std::vector<DWORD> thread_ids;
++  const DWORD process_id = GetCurrentProcessId();
++  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++  if (snapshot != INVALID_HANDLE_VALUE) {
++    THREADENTRY32 entry{};
++    entry.dwSize = sizeof(entry);
++    for (BOOL ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
++      if (entry.th32OwnerProcessID == process_id)
++        thread_ids.push_back(entry.th32ThreadID);
++    }
++    CloseHandle(snapshot);
++  }
++
++  stacks.reserve(thread_ids.size());
++  const DWORD self = GetCurrentThreadId();
++  for (const DWORD thread_id : thread_ids) {
++    if (thread_id != self) {
++      stacks.push_back(CaptureThreadStack(thread_id));
++      continue;
++    }
++    NativeStack &stack = stacks.emplace_back();
++    stack.thread_id = thread_id;
++    if (current_thread_context)
++      CaptureCurrentThread(*static_cast<const CONTEXT *>(current_thread_context), stack);
++    else
++      stack.note = "diagnostics thread";
++  }
++#else
++  (void)current_thread_context;
++#endif
++  return stacks;
++}
++
++std::string DescribeAddress(std::uintptr_t address, std::map<std::string, std::string> &modules) {
++#ifdef MODERNGEKKO_NATIVE_STACKS
++  if (const std::optional<ModuleInfo> module = ModuleAt(address)) {
++    modules.emplace(module->name, module->path);
++    return fmt::format("{}+0x{:x}", module->name, address - module->base);
++  }
++#else
++  (void)modules;
++#endif
++  return fmt::format("0x{:016x} (no module: JIT code or bad frame)", address);
++}
++
++void DescribeModules(const std::map<std::string, std::string> &modules, std::string &out) {
++  out += "\n[modules]\n";
++  for (const auto &[name, path] : modules)
++    fmt::format_to(std::back_inserter(out), "  {} = {}\n", name, path);
++}
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/native_stacks.hpp b/ModernGekko/src/runtime/native_stacks.hpp
+new file mode 100644
+index 00000000..4114aeb5
+--- /dev/null
++++ b/ModernGekko/src/runtime/native_stacks.hpp
+@@ -0,0 +1,37 @@
++#pragma once
++
++#include <cstdint>
++#include <map>
++#include <string>
++#include <vector>
++
++namespace moderngekko {
++// Native call stacks of the runtime's own threads, for diagnostic reports. Frames are kept as
++// raw addresses and written as `module+0xoffset`, so the game never loads its PDBs:
++// tools-src/profiling/resolve_report.py turns them into function names offline.
++struct NativeStack {
++  std::uint32_t thread_id = 0;
++  std::string name;
++  std::vector<std::uintptr_t> frames;
++  // Why the stack is missing or incomplete, if it is.
++  std::string note;
++};
++
++// False where capturing is not implemented (anything but x64 Windows built with MSVC); the
++// functions below then return stacks with only a note.
++bool CanCaptureNativeStacks();
++
++// Another thread's stack. The thread is suspended only for the time of a register read and a
++// copy of its used stack, never while unwinding.
++NativeStack CaptureThreadStack(std::uint32_t thread_id);
++
++// Every thread of the process. `current_thread_context` (a Windows CONTEXT, e.g. from a crash)
++// is where to unwind the calling thread from; without it the calling thread gets only a note.
++std::vector<NativeStack> CaptureAllThreadStacks(const void *current_thread_context);
++
++// `module+0xoffset` for a code address, remembering the module's path in `modules`.
++std::string DescribeAddress(std::uintptr_t address, std::map<std::string, std::string> &modules);
++
++// The [modules] section resolve_report.py reads module paths from.
++void DescribeModules(const std::map<std::string, std::string> &modules, std::string &out);
 +} // namespace moderngekko
 diff --git a/ModernGekko/src/runtime/thread_names.cpp b/ModernGekko/src/runtime/thread_names.cpp
 new file mode 100644

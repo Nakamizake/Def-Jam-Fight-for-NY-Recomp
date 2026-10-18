@@ -73,8 +73,10 @@ to a threshold in milliseconds before starting the game, or pass `-HitchTraceMs`
 `hitch-*.txt` report in `userdata/Diagnostics/`. The report shows what the CPU and GPU
 threads were waiting on around the slow frame (the speed limiter, the GPU draining its
 FIFO, a DVD read, a Vulkan fence or present, a pipeline compile, ...) and how long each
-thread was actually running. With the variable unset the trace is off and costs next to
-nothing.
+thread was actually running. When a frame runs long, the report also holds native stacks
+sampled from the stuck thread, written as `module+0xoffset`; turn them into function names
+with `python -I tools-src\profiling\resolve_report.py <report>`. With the variable unset the
+trace is off and costs next to nothing.
 
 ## Licence
 

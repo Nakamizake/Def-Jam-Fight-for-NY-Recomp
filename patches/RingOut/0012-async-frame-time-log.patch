@@ -1,0 +1,77 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp
+index 3d519865..2926606b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.cpp
+@@ -5,9 +5,10 @@
+ 
+ #include <algorithm>
+ #include <cmath>
+-#include <iomanip>
++#include <string>
+ #include <utility>
+ 
++#include <fmt/format.h>
+ #include <implot.h>
+ 
+ #include "Common/CommonTypes.h"
+@@ -189,11 +190,24 @@ void PerformanceTracker::LogRenderTimeToFile(DT val)
+   if (!m_log_name || !g_ActiveConfig.bLogRenderTimeToFile)
+     return;
+ 
++  // A write can block for hundreds of milliseconds (a slow disk busy flushing the file), and this
++  // runs on the thread that presents frames: hand the line to a thread of its own instead.
++  if (!m_log_writer.IsRunning())
++  {
++    m_log_writer.Reset("Performance log: " + *m_log_name,
++                       [this](std::string line) { WriteLogLine(line); });
++  }
++  m_log_writer.Push(fmt::format("{:.8f}\n", DT_ms(val).count()));
++}
++
++void PerformanceTracker::WriteLogLine(const std::string& line)
++{
+   if (!m_bench_file.is_open())
+   {
+     File::OpenFStream(m_bench_file, File::GetUserPath(D_LOGS_IDX) + *m_log_name,
+                       std::ios_base::out);
+   }
+ 
+-  m_bench_file << std::fixed << std::setprecision(8) << DT_ms(val).count() << std::endl;
++  // Flushed line by line, so a game that is killed still leaves a complete log behind.
++  m_bench_file << line << std::flush;
+ }
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h
+index e210a849..e6998f85 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/PerformanceTracker.h
+@@ -7,9 +7,11 @@
+ #include <deque>
+ #include <fstream>
+ #include <optional>
++#include <string>
+ 
+ #include "Common/CommonTypes.h"
+ #include "Common/SPSCQueue.h"
++#include "Common/WorkQueueThread.h"
+ 
+ class PerformanceTracker
+ {
+@@ -43,14 +45,17 @@ public:
+ 
+ private:
+   void LogRenderTimeToFile(DT val);
++  void WriteLogLine(const std::string& line);
+ 
+   void HandleRawDt(DT value);
+   void PushFront(DT value);
+   void PopBack();
+ 
+-  // Name of log file and file stream
++  // Name of log file and file stream (the stream is used by the log writer thread only)
+   std::optional<std::string> m_log_name;
+   std::ofstream m_bench_file;
++  // Declared after the stream: on destruction it writes what is still queued, then stops.
++  Common::WorkQueueThreadSP<std::string> m_log_writer;
+ 
+   // Last time Count() was called
+   TimePoint m_last_time;
