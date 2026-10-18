@@ -18,6 +18,14 @@ function Get-VcVarsPath {
     throw 'Visual Studio 2022 with the C++ workload was not found.'
 }
 
+# MSVC on a localized install translates the line /showIncludes prints before each header
+# (in Portuguese, an accented "Observacao: incluindo arquivo:") and writes it in the console's
+# code page. CMake records that line once, at configure time, and Ninja then matches every
+# compile's output against it byte for byte to learn which headers an object depends on. A
+# build run under another code page than its configure records no dependencies, and later
+# header edits then leave stale objects behind. So every command runs under UTF-8.
+$script:CodePage = 65001
+
 function Invoke-InVsDevEnv {
     <#
     .SYNOPSIS
@@ -26,8 +34,18 @@ function Invoke-InVsDevEnv {
     param([Parameter(Mandatory)] [string] $CommandLine)
 
     $vcvars = Get-VcVarsPath
-    & cmd.exe /d /c "call `"$vcvars`" -vcvars_ver=$script:MsvcToolset >nul && $CommandLine"
-    if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $CommandLine" }
+    # chcp changes the code page of the whole console, so put the caller's back afterwards.
+    # (chcp prints e.g. "Active code page: 850", translated: keep the digits.)
+    $previousCodePage = (& cmd.exe /d /c chcp) -replace '\D', ''
+    try {
+        & cmd.exe /d /c "chcp $script:CodePage >nul && call `"$vcvars`" -vcvars_ver=$script:MsvcToolset >nul && $CommandLine"
+        if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $CommandLine" }
+    }
+    finally {
+        if ($previousCodePage -and [int]$previousCodePage -ne $script:CodePage) {
+            & cmd.exe /d /c "chcp $previousCodePage >nul"
+        }
+    }
 }
 
 Export-ModuleMember -Function Invoke-InVsDevEnv

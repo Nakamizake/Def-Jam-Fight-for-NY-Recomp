@@ -57,6 +57,16 @@ param(
     # Keeps the game's sound on. Runs are muted by default (volume 0, so audio is still
     # emulated and timed the same) to not disturb whoever is at the PC.
     [switch] $Sound,
+    # Reports every video field or presented frame slower than this many milliseconds, with
+    # the waits the emulator's threads were in around it (RINGOUT_HITCH_TRACE), to
+    # build/bench/<Label>/hitch-*.txt. 0 = off.
+    [int] $HitchTraceMs = 0,
+    # Extracted game directory override, passed to run.ps1.
+    [string] $GameRoot = '',
+    # Directory for the files the run writes while the game plays (automation commands and
+    # status, the user directory copy, frame logs); defaults to build/. Results still go to
+    # build/bench/.
+    [string] $WorkDir = '',
     # Renderer override, passed to run.ps1; empty keeps the player's configured backend.
     [ValidateSet('', 'Vulkan', 'D3D', 'D3D12', 'OGL')]
     [string] $Graphics = '',
@@ -76,7 +86,8 @@ function ConvertTo-UInt32([string] $Text) {
 $dumpAddressValue = ConvertTo-UInt32 $DumpAddress
 $dumpSizeValue = ConvertTo-UInt32 $DumpSize
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$automationDir = Join-Path $repoRoot 'build\automation'
+$workDir = if ($WorkDir) { $WorkDir } else { Join-Path $repoRoot 'build' }
+$automationDir = Join-Path $workDir 'automation'
 $commandsDir = Join-Path $automationDir 'commands'
 $statusFile = Join-Path $automationDir 'status.txt'
 $benchDir = Join-Path $repoRoot 'build\bench'
@@ -147,7 +158,7 @@ New-Item -ItemType Directory -Force $commandsDir, (Join-Path $benchDir $Label) |
 # a test fight that ends autosaves campaign progress to the memory card, and that must not
 # touch the player's real save. Savestates, logs and dumps are not copied.
 $playerUserDir = Join-Path $repoRoot 'userdata'
-$userDir = Join-Path $repoRoot 'build\bench-userdata'
+$userDir = Join-Path $workDir 'bench-userdata'
 Remove-Item -Recurse -Force $userDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $userDir | Out-Null
 foreach ($item in 'Config', 'GameSettings', 'GC', 'Wii', 'Load', 'Cache', 'config.ini') {
@@ -174,6 +185,7 @@ $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PS
 if ($Profiling) { $runArgs += '-Profiling' }
 if ($Headless) { $runArgs += @('-ExtraArgs', '--headless') }
 if ($Graphics) { $runArgs += @('-Graphics', $Graphics) }
+if ($GameRoot) { $runArgs += @('-GameRoot', (Resolve-Path $GameRoot).Path) }
 if ($Module) { $runArgs += @('-Module', (Resolve-Path $Module).Path) }
 if ($LoadState) {
     $runArgs += @('-LoadState', (Resolve-Path $LoadState).Path)
@@ -196,8 +208,10 @@ if (-not $NoFrameTimes) {
 $logFile = Join-Path $benchDir "$Label.log"
 # A game the player already has open is not ours to close at the end.
 $preexistingGames = @(Get-Process moderngekko-run -ErrorAction SilentlyContinue | ForEach-Object Id)
+if ($HitchTraceMs -gt 0) { $env:RINGOUT_HITCH_TRACE = $HitchTraceMs }  # inherited by the runtime
 $runner = Start-Process powershell -ArgumentList $runArgs -PassThru -WindowStyle Hidden `
     -RedirectStandardError $logFile -RedirectStandardOutput "$logFile.out"
+Remove-Item Env:RINGOUT_HITCH_TRACE -ErrorAction SilentlyContinue
 
 $script:commandCounter = 0
 $samples = [System.Collections.Generic.List[object]]::new()
@@ -304,6 +318,15 @@ if (-not $NoFrameTimes) {
             $Label, $what, $stats.P50, $stats.P95, $stats.P99, $stats.Max, $stats.OffPace, $stats.Frames,
             ($stats.OffPace / $stats.Frames))
     }
+}
+if ($HitchTraceMs -gt 0) {
+    $hitchReports = @(Get-ChildItem (Join-Path $userDir 'Diagnostics') -Filter 'hitch-*.txt' -ErrorAction SilentlyContinue)
+    if ($hitchReports) {
+        $hitchDir = Join-Path $benchDir $Label
+        $hitchReports | Copy-Item -Destination $hitchDir -Force
+    }
+    Write-Host ("[{0}] hitch reports (over {1} ms): {2}{3}" -f $Label, $HitchTraceMs, $hitchReports.Count,
+        $(if ($hitchReports) { " in $hitchDir" } else { '' }))
 }
 Get-Content $logFile | Select-String 'shutdown' | ForEach-Object { Write-Host $_ }
 Write-Host "CSV: $csv"

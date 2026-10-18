@@ -65,6 +65,17 @@ with the profiling build (`scripts\run.ps1 -Profiling`, which has PDBs) and then
 python -I tools-src\profiling\resolve_report.py userdata\Diagnostics\stall-<time>.txt
 ```
 
+## Hitches
+
+For short hitches (a frame that takes 100 ms instead of 16.7), set `RINGOUT_HITCH_TRACE`
+to a threshold in milliseconds before starting the game, or pass `-HitchTraceMs` to
+`scripts\bench.ps1`. Every video field or presented frame slower than that gets a
+`hitch-*.txt` report in `userdata/Diagnostics/`. The report shows what the CPU and GPU
+threads were waiting on around the slow frame (the speed limiter, the GPU draining its
+FIFO, a DVD read, a Vulkan fence or present, a pipeline compile, ...) and how long each
+thread was actually running. With the variable unset the trace is off and costs next to
+nothing.
+
 ## Licence
 
 Project code: GPL-3.0-or-later (to match DolRecomp and ModernGekko). See each submodule

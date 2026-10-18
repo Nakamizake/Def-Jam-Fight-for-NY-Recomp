@@ -1,0 +1,1002 @@
+diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
+index 6722dcbb..f5504059 100644
+--- a/ModernGekko/CMakeLists.txt
++++ b/ModernGekko/CMakeLists.txt
+@@ -311,6 +311,8 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         src/runtime/dolphin_runtime.cpp
+         src/runtime/diagnostic_reporter.cpp
+         src/runtime/game_data_prefetcher.cpp
++        src/runtime/hitch_recorder.cpp
++        src/runtime/thread_names.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/ModernGekko/src/runtime/diagnostic_reporter.cpp b/ModernGekko/src/runtime/diagnostic_reporter.cpp
+index caf4b8ed..bb5ebc64 100644
+--- a/ModernGekko/src/runtime/diagnostic_reporter.cpp
++++ b/ModernGekko/src/runtime/diagnostic_reporter.cpp
+@@ -20,6 +20,7 @@
+ #include "VideoCommon/CommandProcessor.h"
+ #include "VideoCommon/Fifo.h"
+ #include "VideoCommon/VideoEvents.h"
++#include "thread_names.hpp"
+ 
+ #if defined(_WIN32) && defined(_M_X64) && defined(_MSC_VER)
+ #define MODERNGEKKO_NATIVE_STACKS 1
+@@ -263,22 +264,6 @@ int UnwindFrames(CONTEXT *context, std::uintptr_t stack_low, std::uintptr_t stac
+   return count;
+ }
+ 
+-std::string ThreadName(HANDLE thread) {
+-  using GetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
+-  static const auto get_description = reinterpret_cast<GetThreadDescriptionFn>(
+-      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
+-  if (!get_description)
+-    return {};
+-  PWSTR wide = nullptr;
+-  if (FAILED(get_description(thread, &wide)) || !wide)
+-    return {};
+-  std::string name;
+-  for (const wchar_t *c = wide; *c; ++c)
+-    name += *c < 0x80 ? static_cast<char>(*c) : '?';
+-  LocalFree(wide);
+-  return name;
+-}
+-
+ // Stack range of another thread, from its TEB (NT_TIB.StackLimit/StackBase).
+ bool ThreadStackRange(HANDLE thread, std::uintptr_t *low, std::uintptr_t *high) {
+   struct ThreadBasicInformation {
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 880073ed..33f8b721 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -43,6 +43,7 @@
+ #include "VideoCommon/VideoConfig.h"
+ #include "dolphin_runtime_internal.hpp"
+ #include "game_data_prefetcher.hpp"
++#include "hitch_recorder.hpp"
+ #include "moderngekko/cpu_state.h"
+ #include "moderngekko/module_loader.hpp"
+ 
+@@ -546,6 +547,7 @@ struct Runtime::Impl {
+   bool automation_registered = false;
+   std::jthread automation_thread;
+   std::unique_ptr<DiagnosticReporter> diagnostics;
++  std::unique_ptr<HitchRecorder> hitch_recorder;
+ };
+ 
+ namespace {
+@@ -1434,6 +1436,8 @@ RuntimeRunResult Runtime::Run() {
+ 
+   const ScreenSaverInhibitor screen_saver_inhibitor(!m_impl->config.headless);
+   const GameDataPrefetcher game_data_prefetcher(m_impl->config.game_root);
++  const std::optional<HitchRecorder::Options> hitch_options =
++      HitchRecorder::EnableFromEnvironment(m_impl->config.user_directory / "Diagnostics");
+   std::unique_ptr<BootParameters> boot =
+       TakeBootParameters(m_impl->metadata.main_dol.string(), m_impl->config.load_state_path);
+   if (!boot) {
+@@ -1576,6 +1580,8 @@ RuntimeRunResult Runtime::Run() {
+   m_impl->booted = true;
+   m_impl->diagnostics = std::make_unique<DiagnosticReporter>(
+       DiagnosticReporter::Options{m_impl->config.user_directory / "Diagnostics"});
++  if (hitch_options)
++    m_impl->hitch_recorder = std::make_unique<HitchRecorder>(*hitch_options);
+   // Continue-where-you-left-off (menu System > Auto-Resume). Headless runs are
+   // benchmarks/verification; loading a state there would corrupt them, and so
+   // would it for an explicit --load-state or an automated run.
+@@ -1603,6 +1609,7 @@ RuntimeRunResult Runtime::Run() {
+     title_thread.join();
+   m_impl->platform->SaveWindowGeometry();
+   StopAutomation(*m_impl);
++  m_impl->hitch_recorder.reset();
+   m_impl->diagnostics.reset();
+   Core::Stop(Core::System::GetInstance());
+   Core::Shutdown(Core::System::GetInstance());
+diff --git a/ModernGekko/src/runtime/hitch_recorder.cpp b/ModernGekko/src/runtime/hitch_recorder.cpp
+new file mode 100644
+index 00000000..3870b0bc
+--- /dev/null
++++ b/ModernGekko/src/runtime/hitch_recorder.cpp
+@@ -0,0 +1,214 @@
++#include "hitch_recorder.hpp"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <ctime>
++#include <fstream>
++#include <iterator>
++#include <system_error>
++#include <utility>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/Thread.h"
++#include "VideoCommon/VideoEvents.h"
++#include "thread_names.hpp"
++
++namespace moderngekko {
++namespace {
++namespace HitchTrace = Common::HitchTrace;
++using HitchTrace::Span;
++
++// About half a minute of waits at the rate a fight records them.
++constexpr std::size_t kTraceCapacity = 1 << 16;
++// Longer intervals are pauses, savestate loads or real freezes (the diagnostic reporter covers
++// those), not hitches.
++constexpr std::int64_t kMaxIntervalNs = 2'000'000'000;
++
++std::int64_t ToNs(std::chrono::milliseconds duration) {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
++}
++
++double ToMs(std::int64_t ns) { return static_cast<double>(ns) / 1e6; }
++
++std::string LocalTimestamp() {
++  const std::time_t now = std::time(nullptr);
++  std::tm local{};
++#ifdef _WIN32
++  localtime_s(&local, &now);
++#else
++  localtime_r(&now, &local);
++#endif
++  char text[32];
++  std::strftime(text, sizeof(text), "%Y%m%d-%H%M%S", &local);
++  return text;
++}
++
++// The interval spans carry the time the thread spent on a core, in microseconds.
++bool HasBusyTime(Span span) { return span == Span::ViField || span == Span::FramePresented; }
++} // namespace
++
++std::optional<HitchRecorder::Options>
++HitchRecorder::EnableFromEnvironment(std::filesystem::path directory) {
++  const char *value = std::getenv("RINGOUT_HITCH_TRACE");
++  const long threshold_ms = value ? std::strtol(value, nullptr, 10) : 0;
++  if (threshold_ms <= 0)
++    return std::nullopt;
++
++  HitchTrace::Enable(kTraceCapacity);
++  Options options;
++  options.directory = std::move(directory);
++  options.threshold = std::chrono::milliseconds(threshold_ms);
++  std::fprintf(stderr, "[hitch-trace] on: fields and frames over %ld ms are reported to %s\n",
++               threshold_ms, options.directory.string().c_str());
++  return options;
++}
++
++HitchRecorder::HitchRecorder(Options options)
++    : m_options(std::move(options)), m_session_start_ns(HitchTrace::NowNs()),
++      m_session_timestamp(LocalTimestamp()) {
++  VideoEvents &events = GetVideoEvents();
++  m_field_hook = events.vi_end_field_event.Register(
++      [this] { OnIntervalEnd(Span::ViField, m_field_clock); });
++  m_present_hook = events.after_present_event.Register(
++      [this](const PresentInfo &) { OnIntervalEnd(Span::FramePresented, m_present_clock); });
++  m_writer = std::jthread([this](std::stop_token stop) { WriterLoop(std::move(stop)); });
++}
++
++HitchRecorder::~HitchRecorder() {
++  // Unhook first, so no interval ends while the writer shuts down.
++  m_field_hook = {};
++  m_present_hook = {};
++}
++
++void HitchRecorder::OnIntervalEnd(Span span, IntervalClock &clock) {
++  const std::int64_t now_ns = HitchTrace::NowNs();
++  const std::int64_t busy_ns = HitchTrace::CurrentThreadBusyNs();
++  const std::int64_t start_ns = std::exchange(clock.last_ns, now_ns);
++  const std::int64_t busy_in_interval_ns = busy_ns - std::exchange(clock.last_busy_ns, busy_ns);
++  if (start_ns == 0)
++    return;
++
++  const std::int64_t busy_us = std::max<std::int64_t>(busy_in_interval_ns / 1000, 0);
++  HitchTrace::Record(span, start_ns, now_ns,
++                     static_cast<std::uint32_t>(std::min<std::int64_t>(busy_us, UINT32_MAX)));
++
++  const std::int64_t length_ns = now_ns - start_ns;
++  if (length_ns < ToNs(m_options.threshold) || length_ns > kMaxIntervalNs)
++    return;
++  {
++    std::lock_guard lock(m_mutex);
++    m_pending.push_back(Hitch{span, start_ns, now_ns, busy_in_interval_ns});
++  }
++  m_wake.notify_one();
++}
++
++void HitchRecorder::WriterLoop(std::stop_token stop) {
++  Common::SetCurrentThreadName("Hitch recorder");
++  const std::int64_t context_ns = ToNs(m_options.context);
++  std::int64_t reported_until_ns = 0;
++  std::unique_lock lock(m_mutex);
++  while (m_wake.wait(lock, stop, [this] { return !m_pending.empty(); })) {
++    const Hitch hitch = m_pending.front();
++    m_pending.pop_front();
++
++    // A span is recorded when it ends: give the ones still open at the end of the slow
++    // interval the context time to close.
++    const std::int64_t wait_ns = hitch.end_ns + context_ns - HitchTrace::NowNs();
++    if (wait_ns > 0)
++      m_wake.wait_for(lock, stop, std::chrono::nanoseconds(wait_ns), [] { return false; });
++    if (stop.stop_requested())
++      return;
++
++    // A slow field usually comes with a slow frame (and the other way round): one report.
++    if (hitch.start_ns < reported_until_ns || m_reports_written >= m_options.max_reports)
++      continue;
++    reported_until_ns = hitch.end_ns + context_ns;
++    ++m_reports_written;
++
++    lock.unlock();
++    WriteReport(hitch);
++    lock.lock();
++  }
++}
++
++void HitchRecorder::WriteReport(const Hitch &hitch) {
++  const std::int64_t context_ns = ToNs(m_options.context);
++  const std::vector<HitchTrace::Event> events =
++      HitchTrace::Collect(hitch.start_ns - context_ns, hitch.end_ns + context_ns);
++
++  std::string out = fmt::format(
++      "Hitch report {}\n\n"
++      "slow {}: {:.1f} ms (threshold {} ms), {:.1f} ms of it on a core, {:.3f} s into the "
++      "session\n",
++      m_reports_written, HitchTrace::GetName(hitch.span), ToMs(hitch.end_ns - hitch.start_ns),
++      m_options.threshold.count(), ToMs(hitch.busy_ns),
++      ToMs(hitch.start_ns - m_session_start_ns) / 1000.0);
++
++  // Time each thread spent in each kind of wait inside the slow interval.
++  struct Total {
++    std::int64_t ns = 0;
++    int spans = 0;
++  };
++  std::map<std::pair<std::uint32_t, Span>, Total> totals;
++  for (const HitchTrace::Event &event : events) {
++    if (HasBusyTime(event.span))
++      continue;
++    const std::int64_t overlap_ns =
++        std::min(event.end_ns, hitch.end_ns) - std::max(event.start_ns, hitch.start_ns);
++    if (overlap_ns <= 0)
++      continue;
++    Total &total = totals[{event.thread_id, event.span}];
++    total.ns += overlap_ns;
++    ++total.spans;
++  }
++  out += "\nwaits inside the slow interval (clipped to it):\n";
++  if (totals.empty())
++    out += "  none\n";
++  for (const auto &[key, total] : totals) {
++    fmt::format_to(std::back_inserter(out), "  {:<28} {:<16} {:8.1f} ms in {} span(s)\n",
++                   ThreadLabel(key.first), HitchTrace::GetName(key.second), ToMs(total.ns),
++                   total.spans);
++  }
++
++  fmt::format_to(std::back_inserter(out),
++                 "\nevents from -{} ms to +{:.0f} ms (times in ms from the start of the slow "
++                 "interval; spans shorter than 0.01 ms are not recorded):\n"
++                 "    start    length  {:<28} {:<16} on a core\n",
++                 m_options.context.count(), ToMs(hitch.end_ns - hitch.start_ns + context_ns),
++                 "thread", "span");
++  for (const HitchTrace::Event &event : events) {
++    fmt::format_to(std::back_inserter(out), "{:9.3f} {:9.3f}  {:<28} {:<16}",
++                   ToMs(event.start_ns - hitch.start_ns), ToMs(event.end_ns - event.start_ns),
++                   ThreadLabel(event.thread_id), HitchTrace::GetName(event.span));
++    if (HasBusyTime(event.span))
++      fmt::format_to(std::back_inserter(out), " {:.1f}", event.detail / 1000.0);
++    out += '\n';
++  }
++
++  std::error_code error;
++  std::filesystem::create_directories(m_options.directory, error);
++  const std::filesystem::path path =
++      m_options.directory /
++      fmt::format("hitch-{}-{:02}.txt", m_session_timestamp, m_reports_written);
++  std::ofstream file(path, std::ios::binary);
++  file << out;
++  if (file)
++    std::fprintf(stderr, "[hitch-trace] slow %s (%.1f ms): %s\n",
++                 HitchTrace::GetName(hitch.span), ToMs(hitch.end_ns - hitch.start_ns),
++                 path.string().c_str());
++}
++
++const std::string &HitchRecorder::ThreadLabel(std::uint32_t thread_id) {
++  auto it = m_thread_labels.find(thread_id);
++  if (it == m_thread_labels.end()) {
++    const std::string name = ThreadNameById(thread_id);
++    it = m_thread_labels
++             .emplace(thread_id, fmt::format("{} [{}]", name.empty() ? "thread" : name, thread_id))
++             .first;
++  }
++  return it->second;
++}
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/hitch_recorder.hpp b/ModernGekko/src/runtime/hitch_recorder.hpp
+new file mode 100644
+index 00000000..21a3c03d
+--- /dev/null
++++ b/ModernGekko/src/runtime/hitch_recorder.hpp
+@@ -0,0 +1,87 @@
++#pragma once
++
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <filesystem>
++#include <map>
++#include <mutex>
++#include <optional>
++#include <stop_token>
++#include <string>
++#include <thread>
++
++#include "Common/HitchTrace.h"
++#include "Common/HookableEvent.h"
++
++namespace moderngekko {
++// Writes a report to a log directory whenever an emulated video field or a presented frame
++// takes much longer than a frame should. The report lays out the waits Common::HitchTrace
++// recorded around it (what the CPU and GPU threads were waiting on, and for how long), and how
++// long the thread was actually on a core: a slow field with neither waits nor work in it means
++// the thread was preempted or blocked somewhere the trace does not see.
++//
++// Off unless RINGOUT_HITCH_TRACE is set to the threshold in milliseconds.
++class HitchRecorder {
++public:
++  struct Options {
++    std::filesystem::path directory;
++    std::chrono::milliseconds threshold{50};
++    // How much of the trace before and after the slow interval goes into a report.
++    std::chrono::milliseconds context{250};
++    // Caps the reports of one session.
++    int max_reports = 30;
++  };
++
++  // Reads RINGOUT_HITCH_TRACE and, when it asks for reports, starts Common::HitchTrace and
++  // returns the options to build the recorder with. Call it before the emulator starts its
++  // threads, so the trace covers all of them.
++  static std::optional<Options> EnableFromEnvironment(std::filesystem::path directory);
++
++  explicit HitchRecorder(Options options);
++  ~HitchRecorder();
++
++  HitchRecorder(const HitchRecorder &) = delete;
++  HitchRecorder &operator=(const HitchRecorder &) = delete;
++
++private:
++  // One periodic interval of one thread: video fields on the CPU thread, presented frames on
++  // the GPU thread. Each is touched only by its own thread.
++  struct IntervalClock {
++    std::int64_t last_ns = 0;
++    std::int64_t last_busy_ns = 0;
++  };
++
++  struct Hitch {
++    Common::HitchTrace::Span span;
++    std::int64_t start_ns;
++    std::int64_t end_ns;
++    std::int64_t busy_ns;
++  };
++
++  void OnIntervalEnd(Common::HitchTrace::Span span, IntervalClock &clock);
++  void WriterLoop(std::stop_token stop);
++  void WriteReport(const Hitch &hitch);
++  const std::string &ThreadLabel(std::uint32_t thread_id);
++
++  Options m_options;
++  std::int64_t m_session_start_ns;
++  std::string m_session_timestamp;
++
++  IntervalClock m_field_clock;
++  IntervalClock m_present_clock;
++
++  std::mutex m_mutex;
++  std::condition_variable_any m_wake;
++  std::deque<Hitch> m_pending;
++
++  // Writer thread only.
++  int m_reports_written = 0;
++  std::map<std::uint32_t, std::string> m_thread_labels;
++
++  Common::EventHook m_field_hook;
++  Common::EventHook m_present_hook;
++  std::jthread m_writer;
++};
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/thread_names.cpp b/ModernGekko/src/runtime/thread_names.cpp
+new file mode 100644
+index 00000000..609fea3b
+--- /dev/null
++++ b/ModernGekko/src/runtime/thread_names.cpp
+@@ -0,0 +1,39 @@
++#include "thread_names.hpp"
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++namespace moderngekko {
++#ifdef _WIN32
++std::string ThreadName(void *thread_handle) {
++  // Looked up at run time: GetThreadDescription is missing before Windows 10 1607.
++  using GetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PWSTR *);
++  static const auto get_description = reinterpret_cast<GetThreadDescriptionFn>(
++      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription"));
++  if (!get_description)
++    return {};
++  PWSTR wide = nullptr;
++  if (FAILED(get_description(static_cast<HANDLE>(thread_handle), &wide)) || !wide)
++    return {};
++  std::string name;
++  for (const wchar_t *c = wide; *c; ++c)
++    name += *c < 0x80 ? static_cast<char>(*c) : '?';
++  LocalFree(wide);
++  return name;
++}
++
++std::string ThreadNameById(std::uint32_t thread_id) {
++  HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, thread_id);
++  if (!thread)
++    return {};
++  std::string name = ThreadName(thread);
++  CloseHandle(thread);
++  return name;
++}
++#else
++std::string ThreadName(void *) { return {}; }
++
++std::string ThreadNameById(std::uint32_t) { return {}; }
++#endif
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/thread_names.hpp b/ModernGekko/src/runtime/thread_names.hpp
+new file mode 100644
+index 00000000..94cae957
+--- /dev/null
++++ b/ModernGekko/src/runtime/thread_names.hpp
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++
++namespace moderngekko {
++// The name a thread was given with SetThreadDescription (Dolphin names its own threads), or an
++// empty string. `thread_handle` is a Windows HANDLE with query access; other platforms always
++// get an empty string.
++std::string ThreadName(void *thread_handle);
++
++// The same, for a thread of this process given by id.
++std::string ThreadNameById(std::uint32_t thread_id);
++} // namespace moderngekko
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Common/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/Common/CMakeLists.txt
+index f4aff5fb..c2de2fce 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Common/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/Common/CMakeLists.txt
+@@ -80,6 +80,8 @@ add_library(common
+   GekkoDisassembler.h
+   Hash.cpp
+   Hash.h
++  HitchTrace.cpp
++  HitchTrace.h
+   HookableEvent.h
+   HostDisassembler.cpp
+   HostDisassembler.h
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Common/HitchTrace.cpp b/ModernGekko/vendor/dolphin/Source/Core/Common/HitchTrace.cpp
+new file mode 100644
+index 00000000..b90f6956
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/Common/HitchTrace.cpp
+@@ -0,0 +1,183 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Common/HitchTrace.h"
++
++#include <algorithm>
++#include <bit>
++#include <chrono>
++#include <memory>
++#include <mutex>
++#include <thread>
++
++#include "Common/Thread.h"
++
++#ifdef _WIN32
++#include <Windows.h>
++#include <intrin.h>
++#else
++#include <time.h>
++#endif
++
++namespace Common::HitchTrace
++{
++namespace Detail
++{
++std::atomic<bool> g_enabled{false};
++}
++
++namespace
++{
++// Shorter spans are not worth a slot: they would only push older events out of the ring.
++constexpr s64 MIN_SPAN_NS = 10'000;
++constexpr u32 MAX_DETAIL = (1u << 24) - 1;
++
++// Written by any thread, read by Collect() on another one without locking: the sequence number
++// tells a reader whether the slot changed under it (odd while a write is in progress).
++struct Slot
++{
++  std::atomic<u64> sequence{0};  // 0 = never written, else 2 * write index + 1 or + 2
++  std::atomic<s64> start_ns{0};
++  std::atomic<s64> end_ns{0};
++  std::atomic<u64> info{0};  // thread id << 32 | span << 24 | detail
++};
++
++std::unique_ptr<Slot[]> s_slots;
++std::size_t s_mask = 0;
++std::atomic<u64> s_next_write{0};
++std::once_flag s_enable_once;
++
++#ifdef _WIN32
++// QueryThreadCycleTime counts time-stamp counter ticks; measured once against the steady clock.
++double s_ns_per_cycle = 0.0;
++
++void CalibrateCycleClock()
++{
++  const u64 cycles_before = __rdtsc();
++  const s64 ns_before = NowNs();
++  std::this_thread::sleep_for(std::chrono::milliseconds(20));
++  const u64 cycles = __rdtsc() - cycles_before;
++  const s64 ns = NowNs() - ns_before;
++  if (cycles > 0)
++    s_ns_per_cycle = static_cast<double>(ns) / static_cast<double>(cycles);
++}
++#endif
++}  // namespace
++
++const char* GetName(Span span)
++{
++  switch (span)
++  {
++  case Span::ThrottleSleep:
++    return "ThrottleSleep";
++  case Span::GpuFlush:
++    return "GpuFlush";
++  case Span::GpuSyncWait:
++    return "GpuSyncWait";
++  case Span::GpuRequestWait:
++    return "GpuRequestWait";
++  case Span::DvdReadWait:
++    return "DvdReadWait";
++  case Span::ViField:
++    return "ViField";
++  case Span::Present:
++    return "Present";
++  case Span::FramePresented:
++    return "FramePresented";
++  case Span::FenceWait:
++    return "FenceWait";
++  case Span::SubmitWait:
++    return "SubmitWait";
++  case Span::AcquireImage:
++    return "AcquireImage";
++  case Span::QueuePresent:
++    return "QueuePresent";
++  case Span::PipelineCompile:
++    return "PipelineCompile";
++  case Span::Count:
++    break;
++  }
++  return "?";
++}
++
++void Enable(std::size_t capacity)
++{
++  std::call_once(s_enable_once, [capacity] {
++    const std::size_t size = std::bit_ceil(std::max<std::size_t>(capacity, 2));
++    s_slots = std::make_unique<Slot[]>(size);
++    s_mask = size - 1;
++#ifdef _WIN32
++    CalibrateCycleClock();
++#endif
++    Detail::g_enabled.store(true, std::memory_order_release);
++  });
++}
++
++s64 NowNs()
++{
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++s64 CurrentThreadBusyNs()
++{
++#ifdef _WIN32
++  ULONG64 cycles = 0;
++  QueryThreadCycleTime(GetCurrentThread(), &cycles);
++  return static_cast<s64>(static_cast<double>(cycles) * s_ns_per_cycle);
++#else
++  timespec time{};
++  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
++  return static_cast<s64>(time.tv_sec) * 1'000'000'000 + time.tv_nsec;
++#endif
++}
++
++void Record(Span span, s64 start_ns, s64 end_ns, u32 detail)
++{
++  if (!Detail::g_enabled.load(std::memory_order_acquire) || end_ns - start_ns < MIN_SPAN_NS)
++    return;
++
++  const u64 index = s_next_write.fetch_add(1, std::memory_order_relaxed);
++  Slot& slot = s_slots[index & s_mask];
++  slot.sequence.store(2 * index + 1, std::memory_order_relaxed);
++  std::atomic_thread_fence(std::memory_order_release);
++  slot.start_ns.store(start_ns, std::memory_order_relaxed);
++  slot.end_ns.store(end_ns, std::memory_order_relaxed);
++  slot.info.store(static_cast<u64>(static_cast<u32>(CurrentThreadId())) << 32 |
++                      static_cast<u64>(span) << 24 | std::min(detail, MAX_DETAIL),
++                  std::memory_order_relaxed);
++  slot.sequence.store(2 * index + 2, std::memory_order_release);
++}
++
++std::vector<Event> Collect(s64 from_ns, s64 to_ns)
++{
++  std::vector<Event> events;
++  if (!Detail::g_enabled.load(std::memory_order_acquire))
++    return events;
++
++  for (std::size_t i = 0; i <= s_mask; ++i)
++  {
++    const Slot& slot = s_slots[i];
++    const u64 sequence = slot.sequence.load(std::memory_order_acquire);
++    if (sequence == 0 || sequence % 2 != 0)
++      continue;
++    const s64 start_ns = slot.start_ns.load(std::memory_order_relaxed);
++    const s64 end_ns = slot.end_ns.load(std::memory_order_relaxed);
++    const u64 info = slot.info.load(std::memory_order_relaxed);
++    std::atomic_thread_fence(std::memory_order_acquire);
++    if (slot.sequence.load(std::memory_order_relaxed) != sequence)
++      continue;
++    if (end_ns < from_ns || start_ns > to_ns)
++      continue;
++    events.push_back(Event{
++        .start_ns = start_ns,
++        .end_ns = end_ns,
++        .thread_id = static_cast<u32>(info >> 32),
++        .span = static_cast<Span>((info >> 24) & 0xFF),
++        .detail = static_cast<u32>(info & MAX_DETAIL),
++    });
++  }
++  std::ranges::sort(events, {}, &Event::start_ns);
++  return events;
++}
++}  // namespace Common::HitchTrace
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Common/HitchTrace.h b/ModernGekko/vendor/dolphin/Source/Core/Common/HitchTrace.h
+new file mode 100644
+index 00000000..3f44ce38
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/Common/HitchTrace.h
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <utility>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++// Records where the emulator's threads wait, so a frame that took too long can be explained
++// after the fact: the CPU thread sleeping in the speed limiter, waiting for the GPU thread to
++// drain the FIFO or for a DVD read, the GPU thread waiting on a fence or a present, and so on.
++//
++// Each span is written, once it ends, to a fixed-size ring in memory that a reader (the
++// runtime's hitch recorder) copies out when it sees a slow frame. Recording is off until
++// Enable() is called; while off, a traced span costs one relaxed atomic load.
++namespace Common::HitchTrace
++{
++enum class Span : u8
++{
++  // CPU thread
++  ThrottleSleep,   // speed limiter sleeping until the emulated time catches up with real time
++  GpuFlush,        // idle skip waiting for the GPU thread to drain the FIFO
++  GpuSyncWait,     // "Sync GPU thread" holding the CPU back until the GPU catches up
++  GpuRequestWait,  // a blocking request run on the GPU thread (EFB peek, bounding box, query)
++  DvdReadWait,     // waiting for the DVD thread to finish a read that is due
++  ViField,         // one emulated video field; detail = microseconds the thread was on a core
++
++  // GPU thread
++  Present,         // Presenter::Present, from the XFB copy to handing the frame to the backend
++  FramePresented,  // time since the previous presented frame; detail as for ViField
++
++  // Vulkan backend (GPU thread or its submit worker)
++  FenceWait,        // waiting for a command buffer to finish on the GPU
++  SubmitWait,       // waiting for the submit worker thread to go idle
++  AcquireImage,     // vkAcquireNextImageKHR
++  QueuePresent,     // vkQueuePresentKHR
++  PipelineCompile,  // vkCreateGraphicsPipelines
++
++  Count
++};
++
++const char* GetName(Span span);
++
++struct Event
++{
++  s64 start_ns;
++  s64 end_ns;
++  u32 thread_id;
++  Span span;
++  u32 detail;
++};
++
++namespace Detail
++{
++extern std::atomic<bool> g_enabled;
++}
++
++inline bool IsEnabled()
++{
++  return Detail::g_enabled.load(std::memory_order_relaxed);
++}
++
++// Allocates a ring of at least `capacity` events and starts recording. Call once, before the
++// traced threads start; later calls do nothing.
++void Enable(std::size_t capacity);
++
++// Steady clock, in nanoseconds. Event times use it.
++s64 NowNs();
++
++// Time the calling thread has spent running on a core, in nanoseconds (it does not advance
++// while the thread waits or is preempted). Only meaningful as a difference.
++s64 CurrentThreadBusyNs();
++
++void Record(Span span, s64 start_ns, s64 end_ns, u32 detail = 0);
++
++// Copies out the recorded events that overlap [from_ns, to_ns], oldest first. Events written
++// while the copy runs may be missed.
++std::vector<Event> Collect(s64 from_ns, s64 to_ns);
++
++// Records the lifetime of the object as one span of the calling thread.
++class ScopedSpan
++{
++public:
++  explicit ScopedSpan(Span span) : m_span(span), m_start_ns(IsEnabled() ? NowNs() : 0) {}
++  ~ScopedSpan()
++  {
++    if (m_start_ns != 0)
++      Record(m_span, m_start_ns, NowNs());
++  }
++
++  ScopedSpan(const ScopedSpan&) = delete;
++  ScopedSpan& operator=(const ScopedSpan&) = delete;
++
++private:
++  Span m_span;
++  s64 m_start_ns;
++};
++
++// Runs `function` as one span and returns what it returns.
++template <typename F>
++decltype(auto) Traced(Span span, F&& function)
++{
++  const ScopedSpan trace{span};
++  return std::forward<F>(function)();
++}
++}  // namespace Common::HitchTrace
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/CoreTiming.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/CoreTiming.cpp
+index 4c82646c..c355502c 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/CoreTiming.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/CoreTiming.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "Common/Assert.h"
+ #include "Common/ChunkFile.h"
++#include "Common/HitchTrace.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/SPSCQueue.h"
+ #include "Common/ScopeGuard.h"
+@@ -413,6 +414,7 @@ void CoreTimingManager::SleepUntil(TimePoint time_point)
+ 
+   if (Core::IsCPUThread())
+   {
++    const Common::HitchTrace::ScopedSpan trace{Common::HitchTrace::Span::ThrottleSleep};
+     const TimePoint time = Clock::now();
+ 
+     if (use_precision_timer)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/HW/DVD/DVDThread.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/HW/DVD/DVDThread.cpp
+index c11d0dae..95e40a5b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/HW/DVD/DVDThread.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/HW/DVD/DVDThread.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
++#include "Common/HitchTrace.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/SPSCQueue.h"
+@@ -244,6 +245,7 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
+   }
+   else
+   {
++    const Common::HitchTrace::ScopedSpan trace{Common::HitchTrace::Span::DvdReadWait};
+     while (true)
+     {
+       m_result_queue.WaitForData();
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
+index c82417eb..68dbb4e8 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/CommandBufferManager.cpp
+@@ -7,6 +7,7 @@
+ #include <cstdint>
+ 
+ #include "Common/Assert.h"
++#include "Common/HitchTrace.h"
+ #include "Common/MsgHandler.h"
+ 
+ #include "VideoBackends/Vulkan/VulkanContext.h"
+@@ -245,6 +246,7 @@ void CommandBufferManager::WaitForWorkerThreadIdle()
+   if (!m_use_threaded_submission)
+     return;
+ 
++  const Common::HitchTrace::ScopedSpan trace{Common::HitchTrace::Span::SubmitWait};
+   m_submit_thread.WaitForCompletion();
+ }
+ 
+@@ -280,8 +282,10 @@ void CommandBufferManager::WaitForCommandBufferCompletion(u32 index)
+   }
+ 
+   // Wait for this command buffer to be completed.
+-  VkResult res =
+-      vkWaitForFences(g_vulkan_context->GetDevice(), 1, &resources.fence, VK_TRUE, UINT64_MAX);
++  VkResult res = Common::HitchTrace::Traced(Common::HitchTrace::Span::FenceWait, [&] {
++    return vkWaitForFences(g_vulkan_context->GetDevice(), 1, &resources.fence, VK_TRUE,
++                           UINT64_MAX);
++  });
+   if (res != VK_SUCCESS)
+     LOG_VULKAN_ERROR(res, "vkWaitForFences failed: ");
+ 
+@@ -448,7 +452,9 @@ void CommandBufferManager::SubmitCommandBuffer(u32 command_buffer_index,
+                                      &present_image_index,
+                                      nullptr};
+ 
+-    m_last_present_result = vkQueuePresentKHR(g_vulkan_context->GetPresentQueue(), &present_info);
++    m_last_present_result = Common::HitchTrace::Traced(Common::HitchTrace::Span::QueuePresent, [&] {
++      return vkQueuePresentKHR(g_vulkan_context->GetPresentQueue(), &present_info);
++    });
+     if (m_last_present_result != VK_SUCCESS)
+     {
+       // VK_ERROR_OUT_OF_DATE_KHR is not fatal, just means we need to recreate our swap chain.
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKPipeline.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKPipeline.cpp
+index 6dbd9e5b..abede46b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKPipeline.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKPipeline.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "Common/Assert.h"
+ #include "Common/EnumMap.h"
++#include "Common/HitchTrace.h"
+ #include "Common/MsgHandler.h"
+ 
+ #include "VideoBackends/Vulkan/ObjectCache.h"
+@@ -422,9 +423,11 @@ std::unique_ptr<VKPipeline> VKPipeline::Create(const AbstractPipelineConfig& con
+   };
+ 
+   VkPipeline pipeline;
+-  VkResult res =
+-      vkCreateGraphicsPipelines(g_vulkan_context->GetDevice(), g_object_cache->GetPipelineCache(),
+-                                1, &pipeline_info, nullptr, &pipeline);
++  VkResult res = Common::HitchTrace::Traced(Common::HitchTrace::Span::PipelineCompile, [&] {
++    return vkCreateGraphicsPipelines(g_vulkan_context->GetDevice(),
++                                     g_object_cache->GetPipelineCache(), 1, &pipeline_info,
++                                     nullptr, &pipeline);
++  });
+   if (res != VK_SUCCESS)
+   {
+     LOG_VULKAN_ERROR(res, "vkCreateGraphicsPipelines failed: ");
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp
+index e4d21001..2426c902 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/Vulkan/VKSwapChain.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include "Common/Assert.h"
+ #include "Common/Contains.h"
++#include "Common/HitchTrace.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/Config/Config.h"
+@@ -517,9 +518,11 @@ void SwapChain::DestroySwapChain()
+ 
+ VkResult SwapChain::AcquireNextImage()
+ {
+-  VkResult res = vkAcquireNextImageKHR(g_vulkan_context->GetDevice(), m_swap_chain, UINT64_MAX,
+-                                       g_command_buffer_mgr->GetCurrentCommandBufferSemaphore(),
+-                                       VK_NULL_HANDLE, &m_current_swap_chain_image_index);
++  VkResult res = Common::HitchTrace::Traced(Common::HitchTrace::Span::AcquireImage, [&] {
++    return vkAcquireNextImageKHR(g_vulkan_context->GetDevice(), m_swap_chain, UINT64_MAX,
++                                 g_command_buffer_mgr->GetCurrentCommandBufferSemaphore(),
++                                 VK_NULL_HANDLE, &m_current_swap_chain_image_index);
++  });
+   m_current_swap_chain_image_is_valid = res >= 0;
+   if (IsCurrentImageValid())
+     g_command_buffer_mgr->MarkCurrentCommandBufferSemaphoreUsed();
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AsyncRequests.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AsyncRequests.h
+index 2c3e84fd..c3f59a98 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AsyncRequests.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/AsyncRequests.h
+@@ -8,6 +8,7 @@
+ #include <future>
+ 
+ #include "Common/Functional.h"
++#include "Common/HitchTrace.h"
+ #include "Common/SPSCQueue.h"
+ 
+ struct EfbPokeData;
+@@ -45,6 +46,7 @@ public:
+     std::packaged_task task{std::forward<F>(callback)};
+     QueueEvent(Event{[&] { task(); }});
+ 
++    const Common::HitchTrace::ScopedSpan trace{Common::HitchTrace::Span::GpuRequestWait};
+     return task.get_future().get();
+   }
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp
+index f5ef364a..5571a405 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Fifo.cpp
+@@ -13,6 +13,7 @@
+ #include "Common/ChunkFile.h"
+ #include "Common/Event.h"
+ #include "Common/FPURoundMode.h"
++#include "Common/HitchTrace.h"
+ #include "Common/MemoryUtil.h"
+ #include "Common/MsgHandler.h"
+ 
+@@ -463,6 +464,7 @@ void FifoManager::FlushGpu()
+   if (!m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread)
+     return;
+ 
++  const Common::HitchTrace::ScopedSpan trace{Common::HitchTrace::Span::GpuFlush};
+   m_gpu_mainloop.Wait();
+ }
+ 
+@@ -632,7 +634,10 @@ int FifoManager::WaitForGpuThread(int ticks)
+ 
+   // Wait for GPU
+   if (now >= m_config_sync_gpu_max_distance)
++  {
++    const Common::HitchTrace::ScopedSpan trace{Common::HitchTrace::Span::GpuSyncWait};
+     m_sync_wakeup_event.Wait();
++  }
+ 
+   return GPU_TIME_SLOT_SIZE;
+ }
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp
+index 1416e026..08c0d677 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/Present.cpp
+@@ -4,6 +4,7 @@
+ #include "VideoCommon/Present.h"
+ 
+ #include "Common/ChunkFile.h"
++#include "Common/HitchTrace.h"
+ #include "Core/Config/GraphicsSettings.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/CoreTiming.h"
+@@ -212,7 +213,10 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
+ 
+   if (!is_duplicate || !g_ActiveConfig.bSkipPresentingDuplicateXFBs)
+   {
+-    Present(&present_info);
++    {
++      const Common::HitchTrace::ScopedSpan trace{Common::HitchTrace::Span::Present};
++      Present(&present_info);
++    }
+     ProcessFrameDumping(ticks);
+ 
+     video_events.after_present_event.Trigger(present_info);

@@ -26,6 +26,9 @@ param(
     [string] $Module = '',
     # Runtime user directory (config, memory cards, caches); bench.ps1 points this at a copy.
     [string] $UserDir = '',
+    # Extracted game directory; defaults to extracted/<GameId> in the repository (e.g. a copy
+    # on a faster disk).
+    [string] $GameRoot = '',
     [string[]] $ExtraArgs = @()
 )
 
@@ -34,7 +37,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 $runtimeBuild = if ($Profiling) { 'runtime-prof' } else { 'runtime' }
 $runner = Join-Path $repoRoot "build\$runtimeBuild\moderngekko-run.exe"
-$gameRoot = Join-Path $repoRoot "extracted\$GameId"
+$gameRoot = if ($GameRoot) { $GameRoot } else { Join-Path $repoRoot "extracted\$GameId" }
 $moduleRoot = Join-Path $repoRoot "build\modules\$GameId"
 $userDir = if ($UserDir) { $UserDir } else { Join-Path $repoRoot 'userdata' }
 
