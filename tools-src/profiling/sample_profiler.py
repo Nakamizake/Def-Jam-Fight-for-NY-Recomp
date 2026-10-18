@@ -17,6 +17,9 @@ to it, using dbghelp.dll from Windows (offline, after sampling).
 --trace writes every sample of the busiest threads, in time order, to a CSV
 (seconds, thread, function) for finding what each thread did during a hitch
 (see trace_hitches.py).
+
+--slow-sample-ms lists samples that took long to take: a thread cannot be suspended while it
+is busy in the kernel, so these show threads blocked in a driver call or a disk read.
 """
 
 from __future__ import annotations
@@ -77,6 +80,8 @@ kernel32.ResumeThread.argtypes = [wt.HANDLE]
 kernel32.GetThreadContext.argtypes = [wt.HANDLE, ctypes.c_void_p]
 kernel32.CloseHandle.argtypes = [wt.HANDLE]
 kernel32.GetExitCodeProcess.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
+kernel32.GetThreadDescription.argtypes = [wt.HANDLE, ctypes.POINTER(wt.LPWSTR)]
+kernel32.LocalFree.argtypes = [ctypes.c_void_p]
 
 
 def find_pid(process_name: str, required: bool = True) -> int | None:
@@ -266,6 +271,16 @@ class ThreadSampler:
         finally:
             kernel32.ResumeThread(self.handle)
 
+    def description(self) -> str:
+        """The name the process gave this thread (SetThreadDescription), or ""."""
+        text = wt.LPWSTR()
+        if not self.handle or kernel32.GetThreadDescription(self.handle, ctypes.byref(text)) < 0:
+            return ""
+        try:
+            return text.value or ""
+        finally:
+            kernel32.LocalFree(text)
+
     def close(self) -> None:
         if self.handle:
             kernel32.CloseHandle(self.handle)
@@ -292,6 +307,9 @@ def main() -> int:
                         help="write every sample of the busiest threads, in time order, to this CSV")
     parser.add_argument("--trace-threads", type=int, default=4,
                         help="how many of the busiest threads --trace keeps (default 4)")
+    parser.add_argument("--slow-sample-ms", type=float, default=0.0,
+                        help="report samples that took longer than this: the thread could not be "
+                             "suspended because it was busy in the kernel (a driver call, a page fault)")
     args = parser.parse_args()
 
     pid = args.pid
@@ -319,6 +337,7 @@ def main() -> int:
     timeline: list[tuple[float, str, collections.Counter]] = []
     window: dict[int, collections.Counter] = collections.defaultdict(collections.Counter)
     next_window = started + args.window if args.window else float("inf")
+    slow_samples: list[tuple[float, int, float, str, int]] = []  # seconds, thread, ms, module, offset
     while time.perf_counter() < deadline:
         if (args.stop_file and os.path.exists(args.stop_file)) or not process_alive(process):
             break
@@ -337,10 +356,14 @@ def main() -> int:
             next_refresh = time.perf_counter() + 1.0
         now = time.perf_counter() - started
         for tid, sampler in samplers.items():
+            before = time.perf_counter()
             rip = sampler.sample()
+            took_ms = (time.perf_counter() - before) * 1000
             if rip is None:
                 continue
             name, offset = resolve(modules, rip)
+            if args.slow_sample_ms and took_ms > args.slow_sample_ms:
+                slow_samples.append((before - started, tid, took_ms, name, offset))
             if args.trace:
                 trace[tid].append((now, name, offset))
             per_thread[tid][name] += 1
@@ -351,6 +374,7 @@ def main() -> int:
         rounds += 1
         time.sleep(interval)
 
+    thread_names = {tid: sampler.description() for tid, sampler in samplers.items()}
     for sampler in samplers.values():
         sampler.close()
     kernel32.CloseHandle(process)
@@ -365,13 +389,15 @@ def main() -> int:
                             for name, n in counter.most_common(4) if name not in IDLE_MODULES)
             fps = title.rsplit("|", 1)[-1].strip() if "|" in title else "-"
             print(f"  {at:6.0f}s  {fps:>9}  busy {100 * busy_samples(counter) / total:3.0f}%  {top}")
-    busy = sorted(per_thread.items(), key=lambda item: -sum(item[1].values()))
+    # Every thread gets one sample per round, so rank by time spent outside the kernel.
+    busy = sorted(per_thread.items(), key=lambda item: -busy_samples(item[1]))
     for tid, counter in busy:
         total = sum(counter.values())
         idle = total - busy_samples(counter)
         if total == 0 or idle / total > 0.98:
             continue  # mostly waiting in the kernel
-        print(f"\nthread {tid}: {total} samples ({100 * (1 - idle / total):.0f}% not in ntdll/win32u)")
+        label = f" ({thread_names[tid]})" if thread_names.get(tid) else ""
+        print(f"\nthread {tid}{label}: {total} samples ({100 * (1 - idle / total):.0f}% not in ntdll/win32u)")
         for name, n in counter.most_common(8):
             print(f"  {100 * n / total:5.1f}%  {name}")
 
@@ -386,7 +412,27 @@ def main() -> int:
         print_functions(exact, module_info, busy, args.functions)
     if args.trace:
         write_trace(args.trace, trace, module_info, busy[: args.trace_threads])
+    if args.slow_sample_ms:
+        print_slow_samples(slow_samples, module_info, thread_names, args.slow_sample_ms)
     return 0
+
+
+def print_slow_samples(slow_samples: list[tuple[float, int, float, str, int]],
+                       module_info: dict[str, tuple[str, int]], thread_names: dict[int, str],
+                       threshold_ms: float) -> None:
+    print(f"\nsamples slower than {threshold_ms:g} ms (thread busy in the kernel), "
+          f"with where it was once it stopped:")
+    resolver = SymbolResolver()
+    try:
+        loaded = {name for name, (module_path, size) in module_info.items()
+                  if name not in IDLE_MODULES and resolver.load(module_path, size)}
+        for at, tid, took_ms, name, offset in slow_samples:
+            where = (f"{name.split('.')[0]}!{resolver.name(module_info[name][0], offset)}"
+                     if name in loaded else f"{name}+0x{offset:X}")
+            label = f" ({thread_names[tid]})" if thread_names.get(tid) else ""
+            print(f"  {at:7.2f}s  thread {tid}{label}  {took_ms:6.1f} ms  {where}")
+    finally:
+        resolver.close()
 
 
 def write_trace(path: str, trace: dict[int, list[tuple[float, str, int]]],

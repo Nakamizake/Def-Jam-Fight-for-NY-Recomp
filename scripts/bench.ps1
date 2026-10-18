@@ -54,6 +54,9 @@ param(
     [switch] $NoFrameTimes,
     # Runs without a window (no swap chain): for a locked screen or a monitor that is off.
     [switch] $Headless,
+    # Keeps the game's sound on. Runs are muted by default (volume 0, so audio is still
+    # emulated and timed the same) to not disturb whoever is at the PC.
+    [switch] $Sound,
     # Renderer override, passed to run.ps1; empty keeps the player's configured backend.
     [ValidateSet('', 'Vulkan', 'D3D', 'D3D12', 'OGL')]
     [string] $Graphics = '',
@@ -159,6 +162,11 @@ if ($Unthrottled) {
     if ($core -lt 0) { $lines += '[Core]'; $core = $lines.Count - 1 }
     $lines = @($lines[0..$core]) + 'EmulationSpeed = 0' + @($lines | Select-Object -Skip ($core + 1))
     [IO.File]::WriteAllLines($benchIni, [string[]]$lines, [Text.UTF8Encoding]::new($false))
+}
+if (-not $Sound) {
+    $benchIni = Join-Path $userDir 'Config\Dolphin.ini'
+    $text = if (Test-Path $benchIni) { [IO.File]::ReadAllText($benchIni) } else { $null }
+    [IO.File]::WriteAllText($benchIni, (Set-IniValue $text 'DSP' 'Volume' '0'), [Text.UTF8Encoding]::new($false))
 }
 
 $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'run.ps1'),

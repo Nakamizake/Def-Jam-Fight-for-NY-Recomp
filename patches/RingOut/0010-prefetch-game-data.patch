@@ -1,0 +1,143 @@
+diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
+index daaa4b12..6722dcbb 100644
+--- a/ModernGekko/CMakeLists.txt
++++ b/ModernGekko/CMakeLists.txt
+@@ -310,6 +310,7 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     target_sources(moderngekko PRIVATE
+         src/runtime/dolphin_runtime.cpp
+         src/runtime/diagnostic_reporter.cpp
++        src/runtime/game_data_prefetcher.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 0e210455..880073ed 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -42,6 +42,7 @@
+ #include "VideoCommon/RecompMenu.h"
+ #include "VideoCommon/VideoConfig.h"
+ #include "dolphin_runtime_internal.hpp"
++#include "game_data_prefetcher.hpp"
+ #include "moderngekko/cpu_state.h"
+ #include "moderngekko/module_loader.hpp"
+ 
+@@ -1432,6 +1433,7 @@ RuntimeRunResult Runtime::Run() {
+                          "runtime is already running"}};
+ 
+   const ScreenSaverInhibitor screen_saver_inhibitor(!m_impl->config.headless);
++  const GameDataPrefetcher game_data_prefetcher(m_impl->config.game_root);
+   std::unique_ptr<BootParameters> boot =
+       TakeBootParameters(m_impl->metadata.main_dol.string(), m_impl->config.load_state_path);
+   if (!boot) {
+diff --git a/ModernGekko/src/runtime/game_data_prefetcher.cpp b/ModernGekko/src/runtime/game_data_prefetcher.cpp
+new file mode 100644
+index 00000000..cd8568d1
+--- /dev/null
++++ b/ModernGekko/src/runtime/game_data_prefetcher.cpp
+@@ -0,0 +1,68 @@
++#include "game_data_prefetcher.hpp"
++
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <fstream>
++#include <system_error>
++#include <utility>
++#include <vector>
++
++#include "Common/Thread.h"
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++namespace moderngekko {
++namespace {
++constexpr std::size_t kChunkSize = 1 << 20;
++
++// Background mode lowers the thread's disk priority, not only its CPU priority,
++// which is what keeps these reads out of the game's way. It lowers the memory
++// priority of the pages the thread reads as well, and the OS gives low-priority
++// cached pages away first, which would undo the point of reading them: put that
++// one back to normal.
++void LowerCurrentThreadPriority() {
++#ifdef _WIN32
++  SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
++  MEMORY_PRIORITY_INFORMATION memory_priority{MEMORY_PRIORITY_NORMAL};
++  SetThreadInformation(GetCurrentThread(), ThreadMemoryPriority, &memory_priority,
++                       sizeof(memory_priority));
++#endif
++}
++} // namespace
++
++GameDataPrefetcher::GameDataPrefetcher(std::filesystem::path game_root)
++    : m_thread(&GameDataPrefetcher::Run, std::move(game_root)) {}
++
++void GameDataPrefetcher::Run(std::stop_token stop, std::filesystem::path game_root) {
++  Common::SetCurrentThreadName("Game data prefetch");
++  LowerCurrentThreadPriority();
++  const auto started = std::chrono::steady_clock::now();
++
++  std::vector<char> buffer(kChunkSize);
++  std::uint64_t bytes = 0;
++  int files = 0;
++  std::error_code error;
++  for (std::filesystem::recursive_directory_iterator it(
++           game_root, std::filesystem::directory_options::skip_permission_denied, error),
++       end;
++       it != end && !stop.stop_requested(); it.increment(error)) {
++    if (error || !it->is_regular_file(error))
++      continue;
++    std::ifstream file(it->path(), std::ios::binary);
++    while (!stop.stop_requested() && file.read(buffer.data(), buffer.size()))
++      bytes += buffer.size();
++    bytes += static_cast<std::uint64_t>(file.gcount());
++    ++files;
++  }
++  if (stop.stop_requested())
++    return;
++
++  const auto seconds =
++      std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
++  std::fprintf(stderr, "[prefetch] read %d game files (%llu MiB) into the OS file cache in %.1f s\n",
++               files, static_cast<unsigned long long>(bytes >> 20), seconds);
++}
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/game_data_prefetcher.hpp b/ModernGekko/src/runtime/game_data_prefetcher.hpp
+new file mode 100644
+index 00000000..e31b10f9
+--- /dev/null
++++ b/ModernGekko/src/runtime/game_data_prefetcher.hpp
+@@ -0,0 +1,31 @@
++#pragma once
++
++#include <filesystem>
++#include <stop_token>
++#include <thread>
++
++namespace moderngekko {
++// Reads every file of the extracted game once, in the background, so the OS
++// keeps it in its file cache. The emulated DVD drive reads the game in small
++// pieces as it plays, and on a hard disk one such read can take 150-200 ms when
++// the head has to seek; the CPU thread waits for it, which shows up as a hitch
++// in the middle of a fight. Once the files are cached, those reads are memory
++// copies.
++//
++// The reads run at background I/O priority, so the game's own reads go first,
++// and the cache they fill is memory the OS reclaims whenever it needs it.
++class GameDataPrefetcher {
++public:
++  explicit GameDataPrefetcher(std::filesystem::path game_root);
++  // Stops between two reads and waits for the thread.
++  ~GameDataPrefetcher() = default;
++
++  GameDataPrefetcher(const GameDataPrefetcher &) = delete;
++  GameDataPrefetcher &operator=(const GameDataPrefetcher &) = delete;
++
++private:
++  static void Run(std::stop_token stop, std::filesystem::path game_root);
++
++  std::jthread m_thread;
++};
++} // namespace moderngekko
