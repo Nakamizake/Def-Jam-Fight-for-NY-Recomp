@@ -1,0 +1,30 @@
+Def Jam: Fight for NY - PC port
+===============================
+
+This is a fan-made, non-commercial port of the GameCube game. It contains no game data:
+the game is built on this PC from your own copy of the disc, right after installation.
+
+What you need
+-------------
+- A disc image of Def Jam: Fight for NY for GameCube, USA release (disc id GNWE69), as a
+  plain .iso file. Images in other formats (.rvz, .gcz, .nkit) can be converted with
+  Dolphin: right-click the game > Convert File..., format ISO, no compression.
+  Tip: put the .iso next to this installer (or in a folder next to it) and it is found
+  automatically.
+- About 6 GB of free disk space while building (about 2 GB once done).
+- A 64-bit Windows 10 or 11 PC and a graphics card with Vulkan or Direct3D 11.
+
+What happens
+------------
+1. The files are installed in the folder you choose (no administrator rights needed).
+2. A console window opens and builds the game from your disc. This takes several minutes
+   (about 8 on a 6-core PC) and uses all CPU cores; the window closes by itself when done.
+3. Start the game from the Start menu or the desktop shortcut. The first start prepares
+   the graphics shaders for about a minute; later starts are quick. The game opens
+   fullscreen: Alt+Enter switches to a window, Esc opens the settings menu.
+
+Everything the game writes (saves, settings, shader cache) stays in the install folder.
+Uninstalling removes the game and asks whether to keep your saves and settings.
+
+This port is not affiliated with or endorsed by EA, Nintendo or any rights holder. The
+bundled programs are free software; their licences are in the licenses folder.

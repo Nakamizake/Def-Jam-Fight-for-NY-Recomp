@@ -51,71 +51,8 @@ $modulePath = if ($Module) { $Module } else { (Get-Content $activeModuleFile -To
 if (-not [IO.Path]::IsPathRooted($modulePath)) { $modulePath = Join-Path $repoRoot $modulePath }
 $moduleFile = Get-Item $modulePath
 
-New-Item -ItemType Directory -Force $userDir | Out-Null
-
-# Per-game settings tracked in the repo (idle loop, threading, ...).
-$gameSettings = Join-Path $repoRoot "config\GameSettings\$GameId.ini"
-if (Test-Path $gameSettings) {
-    $userGameSettings = Join-Path $userDir 'GameSettings'
-    New-Item -ItemType Directory -Force $userGameSettings | Out-Null
-    Copy-Item $gameSettings $userGameSettings -Force
-}
-
-# Player-tunable defaults: only keys missing from Dolphin.ini are added, so whatever the
-# player picks in the in-game menu is kept on later runs.
-function Add-MissingIniKeys([string] $DefaultsPath, [string] $TargetPath) {
-    $lines = [Collections.Generic.List[string]]::new()
-    if (Test-Path $TargetPath) { $lines.AddRange([string[]](Get-Content $TargetPath)) }
-    $section = ''
-    $changed = $false
-    foreach ($raw in Get-Content $DefaultsPath) {
-        $line = $raw.Trim()
-        if (-not $line -or $line.StartsWith('#')) { continue }
-        if ($line -match '^\[(.+)\]$') { $section = $Matches[1]; continue }
-        $key = ($line -split '=', 2)[0].Trim()
-
-        # Locate the section in the target and look for the key inside it.
-        $sectionStart = -1
-        $sectionEnd = $lines.Count
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i].Trim() -match '^\[(.+)\]$') {
-                if ($sectionStart -ge 0) { $sectionEnd = $i; break }
-                if ($Matches[1] -eq $section) { $sectionStart = $i }
-            }
-        }
-        if ($sectionStart -lt 0) {
-            $lines.Add("[$section]")
-            $lines.Add($line)
-            $changed = $true
-            continue
-        }
-        $present = $false
-        for ($i = $sectionStart + 1; $i -lt $sectionEnd; $i++) {
-            if (($lines[$i] -split '=', 2)[0].Trim() -eq $key) { $present = $true; break }
-        }
-        if (-not $present) {
-            $lines.Insert($sectionEnd, $line)
-            $changed = $true
-        }
-    }
-    if ($changed) {
-        New-Item -ItemType Directory -Force (Split-Path -Parent $TargetPath) | Out-Null
-        [IO.File]::WriteAllLines($TargetPath, $lines, [Text.UTF8Encoding]::new($false))
-    }
-}
-$defaultSettings = Join-Path $repoRoot 'config\Dolphin.defaults.ini'
-if (Test-Path $defaultSettings) {
-    Add-MissingIniKeys $defaultSettings (Join-Path $userDir 'Config\Dolphin.ini')
-}
-
-# Default controller profile (PS2 layout), copied whole and only once: a profile is one
-# coherent set of bindings, so merging keys into a rebound one would scramble it.
-$defaultPad = Join-Path $repoRoot 'config\Controllers\GCPadNew.defaults.ini'
-$userPad = Join-Path $userDir 'Config\GCPadNew.ini'
-if ((Test-Path $defaultPad) -and -not (Test-Path $userPad)) {
-    New-Item -ItemType Directory -Force (Split-Path -Parent $userPad) | Out-Null
-    Copy-Item $defaultPad $userPad
-}
+Import-Module (Join-Path $PSScriptRoot 'GameBuild.psm1') -Force
+Initialize-UserDirectory -UserDir $userDir -ConfigDir (Join-Path $repoRoot 'config') -GameId $GameId
 
 $arguments = @('--game', $gameRoot, '--module', $moduleFile.FullName, '--user-dir', $userDir,
     '--title', 'Def Jam: Fight for NY')

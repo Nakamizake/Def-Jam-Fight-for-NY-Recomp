@@ -39,7 +39,9 @@ lib/RingOut/        submodule: RingOut's DolRecomp + ModernGekko, and the game-m
 patches/RingOut/    local changes to lib/RingOut, applied by build-tools.ps1
 config/             recompiler flags and native regions (recomp/), game settings, default
                     Dolphin settings and controller layout
-scripts/            build, run, benchmark and training scripts (PowerShell)
+scripts/            build, run, benchmark, training and packaging scripts (PowerShell)
+installer/          Windows installer: Inno Setup script, launcher (DefJam.exe) and the
+                    script that builds the game on the player's machine
 tools-src/          profiling and diagnostics helpers (Python)
 docs/               notes and the external-footprint log
 lib/DolRecomp/, lib/ModernGekko/, patches/ModernGekko/, patches/RecompCore/, scripts/run-legacy.ps1
@@ -65,6 +67,32 @@ userdata/           config, memory cards, logs and diagnostics of your game (git
   1 GB to compile; lower `-Jobs` if memory runs short).
 
 Keep the repository in a path without spaces.
+
+## Installer
+
+`scripts/package.ps1` builds a per-user Windows installer, `build/package/DefJamFFNY-Setup-<version>.exe`
+(about 75 MB). It holds the runtime, the recompiler and a trimmed Clang toolchain, and no
+game data: right after installing, the installer builds the game on the player's PC from
+their own disc image (`installer/build-game.ps1`, about 5 minutes on 8 cores).
+
+- No administrator rights. The player picks the install folder; everything the game writes
+  (saves, settings, shader cache, logs) stays in it.
+- The disc page is filled in automatically when the `.iso` sits next to the installer or in
+  a folder next to it, or from `/ISO="path"` on the command line.
+- Start menu: the game, *Rebuild game files* (`DefJam.exe --rebuild`), the game folder and
+  the uninstaller. Uninstalling removes the built game and asks whether to keep the saves.
+- The module is built without the PGO profile and twin chunks (they are trained on this
+  machine and are game-derived): about 79 fps unthrottled in a 2v2 fight against about 100
+  with them, still well above 60 on the development PC.
+
+Needs Inno Setup 6, besides the development requirements below. `-TestInstall` builds a
+variant with no shortcuts and no uninstall registry entry, for test installs into
+`build/`.
+
+```powershell
+.\scripts\build-tools.ps1
+.\scripts\package.ps1 -Version 0.1.0
+```
 
 ## Getting started
 
