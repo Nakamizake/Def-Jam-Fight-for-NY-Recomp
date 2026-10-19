@@ -95,8 +95,27 @@ savestates of your own from `build/states/` (names and lengths are parameters):
 ```
 
 `run.ps1` keeps all runtime data in `userdata/` inside the repository, not in
-`%LOCALAPPDATA%`. Esc opens the runtime's menu (graphics, controls). `-Graphics Vulkan`
-(or `D3D`, `D3D12`, `OGL`) picks a renderer.
+`%LOCALAPPDATA%`. `-Graphics Vulkan` (or `D3D`, `D3D12`, `OGL`) overrides the renderer for
+one run.
+
+## Settings menu
+
+Esc pauses the game and opens the settings menu (arrows to move, Left/Right to change,
+Esc to close; a gamepad works too). Changes are saved as you make them, and the line under
+the list says what the selected setting does.
+
+- **Video:** internal resolution, aspect ratio, V-Sync, anti-aliasing, anisotropic and
+  texture filtering, post-processing filters (CRT, scanlines, FXAA, ...), renderer, shader
+  compilation mode and fullscreen.
+- **Audio:** volume, mute, treble boost, output (Cubeb or WASAPI), latency and buffer
+  size, gap filling and pitch preservation. The GameCube mixes at 32 kHz, so the game
+  never has anything above 16 kHz; Treble Boost brightens it to taste.
+- **System:** emulation speed, CPU overclock, fast disc loading, netplay, reset, quit.
+- **Controls, Cheats, Mods, States, Replays, Shots:** rebinding, cheat codes, texture mods,
+  save states, input recordings and screenshots.
+
+A few settings (renderer, audio output, compile shaders at boot) apply at the next launch;
+the menu says so.
 
 ## Controls
 

@@ -117,7 +117,8 @@ if ((Test-Path $defaultPad) -and -not (Test-Path $userPad)) {
     Copy-Item $defaultPad $userPad
 }
 
-$arguments = @('--game', $gameRoot, '--module', $moduleFile.FullName, '--user-dir', $userDir)
+$arguments = @('--game', $gameRoot, '--module', $moduleFile.FullName, '--user-dir', $userDir,
+    '--title', 'Def Jam: Fight for NY')
 if ($Graphics) { $arguments += @('--graphics', $Graphics) }
 if ($AutomationDir) { $arguments += @('--automation-dir', $AutomationDir) }
 if ($LoadState) { $arguments += @('--load-state', (Resolve-Path $LoadState).Path) }

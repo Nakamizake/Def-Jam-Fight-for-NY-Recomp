@@ -73,6 +73,9 @@ param(
     # Lifts the speed limit (EmulationSpeed = 0): more emulated time per wall second, e.g. to
     # hunt rare timing bugs. Only the bench copy of the config is changed.
     [switch] $Unthrottled,
+    # Extra Dolphin.ini values for this run only, as 'Section.Key=Value', e.g.
+    # -Setting 'DSP.DumpAudio=True','Core.DSPHLE=False'. Only the bench copy is changed.
+    [string[]] $Setting = @(),
     # Starts with an empty shader cache, so every new shader stalls the GPU thread the way
     # a player's first visit to a scene does.
     [switch] $ColdShaderCache
@@ -178,6 +181,13 @@ if (-not $Sound) {
     $benchIni = Join-Path $userDir 'Config\Dolphin.ini'
     $text = if (Test-Path $benchIni) { [IO.File]::ReadAllText($benchIni) } else { $null }
     [IO.File]::WriteAllText($benchIni, (Set-IniValue $text 'DSP' 'Volume' '0'), [Text.UTF8Encoding]::new($false))
+}
+foreach ($entry in $Setting) {
+    if ($entry -notmatch '^([^.=]+)\.([^=]+)=(.*)$') { throw "-Setting '$entry' is not Section.Key=Value" }
+    $benchIni = Join-Path $userDir 'Config\Dolphin.ini'
+    $text = if (Test-Path $benchIni) { [IO.File]::ReadAllText($benchIni) } else { $null }
+    [IO.File]::WriteAllText($benchIni, (Set-IniValue $text $Matches[1] $Matches[2] $Matches[3]),
+        [Text.UTF8Encoding]::new($false))
 }
 
 $runArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'run.ps1'),

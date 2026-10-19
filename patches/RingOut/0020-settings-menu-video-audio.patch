@@ -1,0 +1,680 @@
+diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
+index def7c7f6..5decb23b 100644
+--- a/ModernGekko/CMakeLists.txt
++++ b/ModernGekko/CMakeLists.txt
+@@ -548,6 +548,14 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+         COMMAND ${CMAKE_COMMAND} -E copy_directory
+                 "${CMAKE_CURRENT_SOURCE_DIR}/vendor/dolphin/Data/Sys"
+                 "$<TARGET_FILE_DIR:moderngekko-run>/Sys")
++    # The menu's Scanlines and CRT filters are RingOut's own shaders, kept with
++    # the packaging files rather than in Dolphin's Sys tree; without them the
++    # two rows select a shader that does not exist.
++    add_custom_command(TARGET moderngekko-run POST_BUILD
++        COMMAND ${CMAKE_COMMAND} -E copy
++                "${CMAKE_CURRENT_SOURCE_DIR}/../dist/RingOut-1.0-dist/shaders/crt.glsl"
++                "${CMAKE_CURRENT_SOURCE_DIR}/../dist/RingOut-1.0-dist/shaders/scanlines.glsl"
++                "$<TARGET_FILE_DIR:moderngekko-run>/Sys/Shaders")
+ 
+     add_executable(moderngekko-launcher
+         tools/moderngekko_launcher.cpp
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 020c278a..b16b054d 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -997,6 +997,14 @@ bool RendererCanStart(const std::string &name) {
+   return true;
+ }
+ 
++// Sets a port default without overwriting a value already saved in the user's
++// ini (the base layer is loaded by UICommon::Init before this runs).
++template <typename T>
++void SetBaseIfUnset(const Config::Info<T> &info, const T &value) {
++  if (!Config::GetLayer(Config::LayerType::Base)->Exists(info.GetLocation()))
++    Config::SetBase(info, value);
++}
++
+ void ApplyGraphicsSettings(const GraphicsSettings &graphics, bool headless) {
+   const std::string chosen = Config::Get(RECOMP_RENDERER);
+   std::string backend;
+@@ -1048,9 +1056,11 @@ void ApplyGraphicsSettings(const GraphicsSettings &graphics, bool headless) {
+                                                   : AspectMode::Auto);
+   }
+   Config::SetBase(Config::GFX_SHADER_CACHE, true);
+-  Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
+-                  ShaderCompilationMode::AsynchronousUberShaders);
+-  Config::SetBase(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true);
++  // Defaults only: the VIDEO tab of the in-game menu offers both, and a value
++  // the player saved there must survive the next boot.
++  SetBaseIfUnset(Config::GFX_SHADER_COMPILATION_MODE,
++                 ShaderCompilationMode::AsynchronousUberShaders);
++  SetBaseIfUnset(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING, true);
+   // Frames reach presentation a varying 1-4 ms after their intended time; presented on arrival,
+   // that shows on a 120 Hz display as frames held for one or three refreshes instead of two.
+   Config::SetBase(Config::MAIN_SMOOTH_LATE_PRESENTATION, true);
+@@ -1061,6 +1071,15 @@ void ApplyGraphicsSettings(const GraphicsSettings &graphics, bool headless) {
+ void ApplyAudioSettings(AudioSettings &audio, bool headless) {
+   const std::vector<std::string> audio_backends =
+       AudioCommon::GetSoundBackends();
++  const auto offered = [&](const std::string &backend) {
++    return std::ranges::find(audio_backends, backend) != audio_backends.end();
++  };
++  // No --audio: keep the output picked in the in-game menu (saved as
++  // [DSP] Backend), as long as this machine still has it.
++  const std::string saved = Config::Get(Config::MAIN_AUDIO_BACKEND);
++  if (audio.backend.empty() && !headless && saved != BACKEND_NULLSOUND && offered(saved))
++    audio.backend = saved;
++
+   if (headless) {
+     audio.backend = BACKEND_NULLSOUND;
+   } else if (audio.backend.empty() ||
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt
+index 04ad9672..02c96535 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/CMakeLists.txt
+@@ -7,6 +7,8 @@ add_library(audiocommon
+   Mixer.h
+   SurroundDecoder.cpp
+   SurroundDecoder.h
++  TrebleShelf.cpp
++  TrebleShelf.h
+   NullSoundStream.cpp
+   NullSoundStream.h
+   WaveFile.cpp
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.cpp b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.cpp
+index 120f338c..73da4f2d 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.cpp
+@@ -184,6 +184,8 @@ std::size_t Mixer::Mix(s16* samples, std::size_t num_samples)
+   for (auto& mixer : m_gba_mixers)
+     mixer.Mix(samples, num_samples);
+ 
++  m_treble_shelf.Process(samples, num_samples, m_output_sample_rate);
++
+   return num_samples;
+ }
+ 
+@@ -435,6 +437,7 @@ void Mixer::RefreshConfig()
+   m_config_audio_preserve_pitch = Config::Get(Config::MAIN_AUDIO_PRESERVE_PITCH);
+   m_config_fill_audio_gaps = Config::Get(Config::MAIN_AUDIO_FILL_GAPS);
+   m_config_audio_buffer_ms = Config::Get(Config::MAIN_AUDIO_BUFFER_SIZE);
++  m_treble_shelf.SetGainDb(Config::Get(Config::MAIN_AUDIO_TREBLE_BOOST));
+   m_config_wiimote_routing_enabled = Config::Get(Config::MAIN_WIIMOTE_AUDIO_ROUTING_ENABLED);
+   for (std::size_t i = 0; i < m_config_wiimote_output_enabled.size(); ++i)
+     m_config_wiimote_output_enabled[i] = Config::Get(Config::MAIN_WIIMOTE_AUDIO_OUTPUT_ENABLED[i]);
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.h b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.h
+index bd09218e..7fe030c1 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/Mixer.h
+@@ -8,6 +8,7 @@
+ #include <bit>
+ 
+ #include "AudioCommon/SurroundDecoder.h"
++#include "AudioCommon/TrebleShelf.h"
+ #include "AudioCommon/WaveFile.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/Config/Config.h"
+@@ -193,6 +194,7 @@ private:
+   u32 m_output_sample_rate;
+ 
+   AudioCommon::SurroundDecoder m_surround_decoder;
++  AudioCommon::TrebleShelf m_treble_shelf;
+ 
+   WaveFileWriter m_wave_writer_dtk;
+   WaveFileWriter m_wave_writer_dsp;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/TrebleShelf.cpp b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/TrebleShelf.cpp
+new file mode 100644
+index 00000000..20b478f4
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/TrebleShelf.cpp
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "AudioCommon/TrebleShelf.h"
++
++#include <cmath>
++#include <numbers>
++
++#include "Common/MathUtil.h"
++
++namespace AudioCommon
++{
++namespace
++{
++// Where the shelf is half-way up. Low enough to reach the presence range that
++// reads as "muffled" when missing, high enough to leave voices' body alone.
++constexpr float kCornerHz = 5000.0f;
++}  // namespace
++
++void TrebleShelf::Configure(int gain_db, u32 sample_rate)
++{
++  m_gain_db = gain_db;
++  m_sample_rate = sample_rate;
++  m_channels = {};
++
++  // High shelf, slope S = 1 (the steepest without overshoot).
++  const float a = std::pow(10.0f, static_cast<float>(gain_db) / 40.0f);
++  const float w0 = 2.0f * std::numbers::pi_v<float> * kCornerHz / static_cast<float>(sample_rate);
++  const float cos_w0 = std::cos(w0);
++  const float alpha = std::sin(w0) / 2.0f * std::sqrt(2.0f);
++  const float two_sqrt_a_alpha = 2.0f * std::sqrt(a) * alpha;
++
++  const float a0 = (a + 1.0f) - (a - 1.0f) * cos_w0 + two_sqrt_a_alpha;
++  m_coefficients.b0 = a * ((a + 1.0f) + (a - 1.0f) * cos_w0 + two_sqrt_a_alpha) / a0;
++  m_coefficients.b1 = -2.0f * a * ((a - 1.0f) + (a + 1.0f) * cos_w0) / a0;
++  m_coefficients.b2 = a * ((a + 1.0f) + (a - 1.0f) * cos_w0 - two_sqrt_a_alpha) / a0;
++  m_coefficients.a1 = 2.0f * ((a - 1.0f) - (a + 1.0f) * cos_w0) / a0;
++  m_coefficients.a2 = ((a + 1.0f) - (a - 1.0f) * cos_w0 - two_sqrt_a_alpha) / a0;
++}
++
++void TrebleShelf::Process(s16* samples, std::size_t num_frames, u32 sample_rate)
++{
++  const int gain_db = m_requested_gain_db.load(std::memory_order_relaxed);
++  if (gain_db == 0 || sample_rate == 0)
++  {
++    m_gain_db = 0;
++    return;
++  }
++  if (gain_db != m_gain_db || sample_rate != m_sample_rate)
++    Configure(gain_db, sample_rate);
++
++  const Coefficients& c = m_coefficients;
++  for (std::size_t i = 0; i < num_frames * 2; ++i)
++  {
++    ChannelState& ch = m_channels[i & 1];
++    const float x0 = samples[i];
++    const float y0 = c.b0 * x0 + c.b1 * ch.x1 + c.b2 * ch.x2 - c.a1 * ch.y1 - c.a2 * ch.y2;
++    ch.x2 = ch.x1;
++    ch.x1 = x0;
++    ch.y2 = ch.y1;
++    ch.y1 = y0;
++    samples[i] = MathUtil::SaturatingCast<s16>(std::lround(y0));
++  }
++}
++}  // namespace AudioCommon
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/TrebleShelf.h b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/TrebleShelf.h
+new file mode 100644
+index 00000000..5ef9c0d8
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/AudioCommon/TrebleShelf.h
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// Optional treble boost on the mixer's output: a high-shelf biquad (RBJ Audio EQ
++// Cookbook) per channel. The GameCube DSP runs at 32 kHz, so nothing above 16 kHz
++// ever existed and many games sound dull next to modern audio; lifting the top
++// octaves is a matter of taste, not accuracy, so it is off by default.
++
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <cstddef>
++
++#include "Common/CommonTypes.h"
++
++namespace AudioCommon
++{
++class TrebleShelf
++{
++public:
++  // Safe from any thread; picked up by the next Process call.
++  void SetGainDb(int gain_db) { m_requested_gain_db.store(gain_db, std::memory_order_relaxed); }
++
++  // Filters interleaved stereo s16 in place. Called on the audio thread only.
++  void Process(s16* samples, std::size_t num_frames, u32 sample_rate);
++
++private:
++  struct Coefficients
++  {
++    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
++  };
++  struct ChannelState
++  {
++    float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
++  };
++
++  void Configure(int gain_db, u32 sample_rate);
++
++  std::atomic<int> m_requested_gain_db{0};
++  // Audio-thread state.
++  int m_gain_db = 0;
++  u32 m_sample_rate = 0;
++  Coefficients m_coefficients;
++  std::array<ChannelState, 2> m_channels{};
++};
++}  // namespace AudioCommon
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+index 844cd9ef..fecd817d 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+@@ -80,6 +80,7 @@ const Info<int> MAIN_AUDIO_LATENCY{{System::Main, "Core", "AudioLatency"}, 20};
+ const Info<int> MAIN_AUDIO_BUFFER_SIZE{{System::Main, "Core", "AudioBufferSize"}, 80};
+ const Info<bool> MAIN_AUDIO_FILL_GAPS{{System::Main, "Core", "AudioFillGaps"}, true};
+ const Info<bool> MAIN_AUDIO_PRESERVE_PITCH{{System::Main, "Core", "AudioPreservePitch"}, false};
++const Info<int> MAIN_AUDIO_TREBLE_BOOST{{System::Main, "DSP", "TrebleBoost"}, 0};
+ const Info<std::string> MAIN_MEMCARD_A_PATH{{System::Main, "Core", "MemcardAPath"}, ""};
+ const Info<std::string> MAIN_MEMCARD_B_PATH{{System::Main, "Core", "MemcardBPath"}, ""};
+ const Info<std::string>& GetInfoForMemcardPath(ExpansionInterface::Slot slot)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+index 916b8df8..1edb461c 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+@@ -81,6 +81,8 @@ extern const Info<int> MAIN_AUDIO_LATENCY;
+ extern const Info<int> MAIN_AUDIO_BUFFER_SIZE;
+ extern const Info<bool> MAIN_AUDIO_FILL_GAPS;
+ extern const Info<bool> MAIN_AUDIO_PRESERVE_PITCH;
++// Treble boost on the mixed output, in dB (0 = off). See AudioCommon/TrebleShelf.h.
++extern const Info<int> MAIN_AUDIO_TREBLE_BOOST;
+ extern const Info<std::string> MAIN_MEMCARD_A_PATH;
+ extern const Info<std::string> MAIN_MEMCARD_B_PATH;
+ const Info<std::string>& GetInfoForMemcardPath(ExpansionInterface::Slot slot);
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+index 17d7d255..bfac0185 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+@@ -6,6 +6,7 @@
+ #include "VideoCommon/RecompGameData.h"
+ #include "VideoCommon/RecompMods.h"
+ 
++#include <cctype>
+ #include <cstring>
+ #include <enet/enet.h>
+ 
+@@ -33,6 +34,7 @@
+ #include <filesystem>
+ #include <fstream>
+ 
++#include "AudioCommon/AudioCommon.h"
+ #include "Common/Config/Config.h"
+ #include "VideoCommon/VideoBackendBase.h"
+ #include "Core/NetPlay/NetPlayProto.h"
+@@ -100,13 +102,19 @@ enum class Item
+   LensFlares,
+   Filter,
+   Renderer,
++  ShaderCompilation,
++  WaitForShaders,
+   Fullscreen,
+   FullscreenAtLaunch,
+   // Audio
+   Volume,
+   Muted,
++  TrebleBoost,
++  AudioBackend,
+   AudioLatency,
++  AudioBuffer,
+   FillGaps,
++  PreservePitch,
+   // System
+   Speed,
+   Overclock,
+@@ -188,17 +196,46 @@ const char* TabName(Tab tab)
+   }
+ }
+ 
++// The menu was written for SoulCalibur II (GRS* discs). A few rows read that
++// game's memory or name its effects, so they only appear on those discs.
++bool IsSoulCalibur2()
++{
++  return SConfig::GetInstance().GetGameID().starts_with("GRS");
++}
++
++// The disc's own name for the header line, uppercased to match the tab strip.
++// Falls back to the game ID when the disc has no readable title.
++std::string MenuTitle()
++{
++  const SConfig& sconfig = SConfig::GetInstance();
++  std::string title = sconfig.GetTitleName();
++  if (title.empty())
++    title = sconfig.GetGameID();
++  for (char& c : title)
++    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
++  return title;
++}
++
+ // Controls and Cheats build their rows dynamically, so they have no static list.
+ const std::vector<Item>& TabItems(Tab tab)
+ {
+-  static const std::vector<Item> video = {
++  static const std::vector<Item> video_sc2 = {
+       Item::Widescreen,   Item::InternalRes, Item::AspectRatio,      Item::VSync,
+       Item::AntiAliasing, Item::Anisotropy,  Item::TextureFiltering, Item::TexturePacks,
+       Item::PrefetchTextures, Item::ShowFPS, Item::FreeCamera,       Item::TrainingHud,
+-      Item::LensFlares,       Item::Filter,      Item::Renderer,  Item::Fullscreen,
+-      Item::FullscreenAtLaunch, Item::Apply};
+-  static const std::vector<Item> audio = {Item::Volume, Item::Muted, Item::AudioLatency,
+-                                          Item::FillGaps, Item::Apply};
++      Item::LensFlares,       Item::Filter,      Item::Renderer,  Item::ShaderCompilation,
++      Item::WaitForShaders,   Item::Fullscreen,  Item::FullscreenAtLaunch, Item::Apply};
++  static const std::vector<Item> video = {
++      Item::Widescreen,   Item::InternalRes, Item::AspectRatio,      Item::VSync,
++      Item::AntiAliasing, Item::Anisotropy,  Item::TextureFiltering, Item::TexturePacks,
++      Item::PrefetchTextures, Item::ShowFPS, Item::FreeCamera,       Item::LensFlares,
++      Item::Filter,       Item::Renderer,    Item::ShaderCompilation, Item::WaitForShaders,
++      Item::Fullscreen,   Item::FullscreenAtLaunch, Item::Apply};
++  static const std::vector<Item> audio = {Item::Volume,       Item::Muted,
++                                          Item::TrebleBoost,  Item::AudioBackend,
++                                          Item::AudioLatency,
++                                          Item::AudioBuffer,  Item::FillGaps,
++                                          Item::PreservePitch, Item::Apply};
+   static const std::vector<Item> states = {Item::StateSlot, Item::SaveState, Item::LoadState,
+                                           Item::AutoResume};
+   static const std::vector<Item> system = {Item::Speed,        Item::Overclock,     Item::FastDisc,
+@@ -213,7 +250,7 @@ const std::vector<Item>& TabItems(Tab tab)
+   switch (tab)
+   {
+   case Tab::Video:
+-    return video;
++    return IsSoulCalibur2() ? video_sc2 : video;
+   case Tab::Audio:
+     return audio;
+   case Tab::System:
+@@ -868,7 +905,7 @@ void DrawTrainingHud()
+ {
+   static const bool env_force = std::getenv("RECOMP_TRAINING_HUD") != nullptr;
+   static const bool env_scan = std::getenv("RECOMP_HUD_SCAN") != nullptr;
+-  if (!env_force && !Config::Get(RECOMP_TRAINING_HUD))
++  if (!IsSoulCalibur2() || (!env_force && !Config::Get(RECOMP_TRAINING_HUD)))
+     return;
+ 
+   u32 ram_size = 0;
+@@ -985,7 +1022,7 @@ const char* ItemLabel(Item item)
+   case Item::AspectRatio:
+     return "Aspect Ratio";
+   case Item::LensFlares:
+-    return "Lens Flares";
++    return IsSoulCalibur2() ? "Lens Flares" : "EFB Copies to RAM";
+   case Item::Filter:
+     return "Filter";
+   case Item::VSync:
+@@ -1008,6 +1045,10 @@ const char* ItemLabel(Item item)
+     return "Training HUD";
+   case Item::Renderer:
+     return "Renderer";
++  case Item::ShaderCompilation:
++    return "Shader Compilation";
++  case Item::WaitForShaders:
++    return "Compile Shaders at Boot";
+   case Item::Fullscreen:
+     return "Fullscreen";
+   case Item::FullscreenAtLaunch:
+@@ -1016,10 +1057,18 @@ const char* ItemLabel(Item item)
+     return "Volume";
+   case Item::Muted:
+     return "Mute";
++  case Item::TrebleBoost:
++    return "Treble Boost";
++  case Item::AudioBackend:
++    return "Audio Output";
+   case Item::AudioLatency:
+-    return "Audio Latency";
++    return "Output Latency";
++  case Item::AudioBuffer:
++    return "Audio Buffer";
+   case Item::FillGaps:
+     return "Fill Audio Gaps";
++  case Item::PreservePitch:
++    return "Preserve Pitch";
+   case Item::Speed:
+     return "Emulation Speed";
+   case Item::StateSlot:
+@@ -1079,6 +1128,103 @@ constexpr std::array<FilterEntry, 8> kFilters = {{
+     {"Invert", "invert"},
+ }};
+ 
++// Shader Compilation row, in the enum's own order so the index is the value.
++constexpr std::array<ShaderCompilationMode, 4> kShaderModes = {
++    ShaderCompilationMode::Synchronous,
++    ShaderCompilationMode::SynchronousUberShaders,
++    ShaderCompilationMode::AsynchronousUberShaders,
++    ShaderCompilationMode::AsynchronousSkipRendering,
++};
++
++// The audio outputs worth offering: everything this build has except the
++// silent one (it exists for headless runs, and picking it by accident looks
++// like a broken game).
++std::vector<std::string> ChoosableAudioBackends()
++{
++  std::vector<std::string> out;
++  for (const std::string& backend : AudioCommon::GetSoundBackends())
++    if (backend != BACKEND_NULLSOUND)
++      out.push_back(backend);
++  return out;
++}
++
++// The output this session opened, captured before the menu can change the
++// setting -- which only takes effect at the next launch.
++const std::string& RunningAudioBackend()
++{
++  static const std::string running = Config::Get(Config::MAIN_AUDIO_BACKEND);
++  return running;
++}
++
++const char* ShaderModeName(ShaderCompilationMode mode)
++{
++  switch (mode)
++  {
++  // Short enough for the value column (~15 characters); the hint line says
++  // what each one means.
++  case ShaderCompilationMode::Synchronous:
++    return "Sync";
++  case ShaderCompilationMode::SynchronousUberShaders:
++    return "Ubershaders";
++  case ShaderCompilationMode::AsynchronousUberShaders:
++    return "Hybrid";
++  case ShaderCompilationMode::AsynchronousSkipRendering:
++    return "Skip Drawing";
++  default:
++    return "?";
++  }
++}
++
++// One line under the rows saying what the selected setting does, so the VIDEO
++// and AUDIO tabs can be used without knowing Dolphin's vocabulary. Empty means
++// the row speaks for itself.
++const char* ItemHint(Item item)
++{
++  switch (item)
++  {
++  case Item::InternalRes:
++    return "Rendering resolution. Higher is sharper and costs GPU time.";
++  case Item::AntiAliasing:
++    return "Smooths jagged edges (MSAA). Costs GPU time.";
++  case Item::Anisotropy:
++    return "Keeps textures sharp at steep angles, e.g. the floor.";
++  case Item::TextureFiltering:
++    return "Nearest gives a crisp pixel look; Default is what the game asks for.";
++  case Item::TexturePacks:
++    return "Loads replacement textures from Load/Textures/<game id>/.";
++  case Item::LensFlares:
++    return "OFF is faster; ON is needed by effects that read the frame back.";
++  case Item::Filter:
++    return "Post-processing shader applied to the final picture.";
++  case Item::Renderer:
++    return "Graphics API. Vulkan is the default; applies at next launch.";
++  case Item::ShaderCompilation:
++    return "Hybrid avoids stutter (default). Sync stutters; Skip Drawing flickers.";
++  case Item::WaitForShaders:
++    return "Prepares cached shaders before the game starts. Next launch.";
++  case Item::VSync:
++    return "Syncs to the display refresh. Removes tearing, adds a little input lag.";
++  case Item::TrebleBoost:
++    return "Brightens the GameCube's 32 kHz sound. A matter of taste, not accuracy.";
++  case Item::AudioBackend:
++    return "Cubeb is the default; WASAPI is Windows' own. Next launch.";
++  case Item::AudioLatency:
++    return "Device delay, WASAPI only. Lower reacts faster.";
++  case Item::AudioBuffer:
++    return "Emulator-side buffer. Lower is less delay; raise it if you hear crackle.";
++  case Item::FillGaps:
++    return "Repeats audio instead of going silent when a frame is late.";
++  case Item::PreservePitch:
++    return "When the game runs slow or fast, keeps the pitch normal.";
++  case Item::Speed:
++    return "Game speed. 100% is normal; Unlimited runs as fast as the PC can.";
++  case Item::Overclock:
++    return "Emulated CPU clock. Can smooth slowdowns; higher costs CPU time.";
++  default:
++    return "";
++  }
++}
++
+ // Persists the internal resolution to the frontend's config.ini.
+ //
+ // Without this the row is a lie that lasts one session: moderngekko_run does
+@@ -1455,6 +1601,10 @@ std::string ItemValue(Item item, int state_slot, int netplay_mode,
+       label += "  (next launch)";
+     return label;
+   }
++  case Item::ShaderCompilation:
++    return ShaderModeName(Config::Get(Config::GFX_SHADER_COMPILATION_MODE));
++  case Item::WaitForShaders:
++    return Config::Get(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING) ? "ON" : "OFF";
+   case Item::TexturePacks:
+     return Config::Get(Config::GFX_HIRES_TEXTURES) ? "ON" : "OFF";
+   case Item::PrefetchTextures:
+@@ -1475,10 +1625,28 @@ std::string ItemValue(Item item, int state_slot, int netplay_mode,
+     return std::to_string(Config::Get(Config::MAIN_AUDIO_VOLUME));
+   case Item::Muted:
+     return Config::Get(Config::MAIN_AUDIO_MUTED) ? "ON" : "OFF";
++  case Item::AudioBackend:
++  {
++    const std::string chosen = Config::Get(Config::MAIN_AUDIO_BACKEND);
++    return chosen == RunningAudioBackend() ? chosen : chosen + " (next)";
++  }
+   case Item::AudioLatency:
++    // Only some outputs take a latency request; under the others the row
++    // would change a number that does nothing.
++    if (!AudioCommon::SupportsLatencyControl(Config::Get(Config::MAIN_AUDIO_BACKEND)))
++      return "n/a";
+     return std::to_string(Config::Get(Config::MAIN_AUDIO_LATENCY)) + " ms";
++  case Item::AudioBuffer:
++    return std::to_string(Config::Get(Config::MAIN_AUDIO_BUFFER_SIZE)) + " ms";
++  case Item::TrebleBoost:
++  {
++    const int boost = Config::Get(Config::MAIN_AUDIO_TREBLE_BOOST);
++    return boost == 0 ? "OFF" : "+" + std::to_string(boost) + " dB";
++  }
+   case Item::FillGaps:
+     return Config::Get(Config::MAIN_AUDIO_FILL_GAPS) ? "ON" : "OFF";
++  case Item::PreservePitch:
++    return Config::Get(Config::MAIN_AUDIO_PRESERVE_PITCH) ? "ON" : "OFF";
+   case Item::Speed:
+   {
+     // The CONFIGURED speed (base layer), which is what this row changes. Showing
+@@ -1894,8 +2062,20 @@ bool AdjustItem(Item item, int direction, State& state)
+     Config::SetBase(RECOMP_RENDERER, renderers[index]->GetConfigName());
+     return true;  // saved now, so the choice survives quitting without Apply
+   }
++  case Item::ShaderCompilation:
++  {
++    const int index =
++        std::clamp(static_cast<int>(Config::Get(Config::GFX_SHADER_COMPILATION_MODE)) + direction,
++                   0, static_cast<int>(kShaderModes.size()) - 1);
++    Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE, kShaderModes[index]);
++    break;
++  }
++  case Item::WaitForShaders:
++    Config::SetBase(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING,
++                    !Config::Get(Config::GFX_WAIT_FOR_SHADERS_BEFORE_STARTING));
++    break;
+   case Item::TexturePacks:
+-    // Dolphin-format packs, loaded from <userdir>/Load/Textures/GRSEAF/.
++    // Dolphin-format packs, loaded from <userdir>/Load/Textures/<game id>/.
+     Config::SetBase(Config::GFX_HIRES_TEXTURES, !Config::Get(Config::GFX_HIRES_TEXTURES));
+     break;
+   case Item::PrefetchTextures:
+@@ -1921,18 +2101,55 @@ bool AdjustItem(Item item, int direction, State& state)
+     break;
+   case Item::Muted:
+     Config::SetBase(Config::MAIN_AUDIO_MUTED, !Config::Get(Config::MAIN_AUDIO_MUTED));
++    // Volume is pushed to the output stream only on request (Dolphin's own UI
++    // does the same from its slider); without this it waited for the next boot.
++    AudioCommon::UpdateSoundStream(Core::System::GetInstance());
++    break;
++  case Item::AudioBackend:
++  {
++    // Applied at the next launch: the output stream is created at boot.
++    // dolphin_runtime.cpp keeps a saved choice that this machine offers.
++    RunningAudioBackend();  // pin the running one before the value changes
++    const std::vector<std::string> backends = ChoosableAudioBackends();
++    if (backends.size() < 2)
++      return false;
++    const std::string chosen = Config::Get(Config::MAIN_AUDIO_BACKEND);
++    int index = 0;
++    for (size_t i = 0; i < backends.size(); ++i)
++      if (backends[i] == chosen)
++        index = static_cast<int>(i);
++    index = std::clamp(index + direction, 0, static_cast<int>(backends.size()) - 1);
++    Config::SetBase(Config::MAIN_AUDIO_BACKEND, backends[index]);
+     break;
++  }
+   case Item::AudioLatency:
+     Config::SetBase(Config::MAIN_AUDIO_LATENCY,
+                     std::clamp(Config::Get(Config::MAIN_AUDIO_LATENCY) + direction * 5, 0, 200));
+     break;
++  case Item::AudioBuffer:
++    // Mixer::RefreshConfig picks this up live. Below ~40 ms the queue runs dry
++    // whenever a frame is late, which is heard as crackle.
++    Config::SetBase(Config::MAIN_AUDIO_BUFFER_SIZE,
++                    std::clamp(Config::Get(Config::MAIN_AUDIO_BUFFER_SIZE) + direction * 10, 20,
++                               250));
++    break;
+   case Item::FillGaps:
+     Config::SetBase(Config::MAIN_AUDIO_FILL_GAPS, !Config::Get(Config::MAIN_AUDIO_FILL_GAPS));
+     break;
++  case Item::TrebleBoost:
++    // Live: Mixer::RefreshConfig hands it to the output filter.
++    Config::SetBase(Config::MAIN_AUDIO_TREBLE_BOOST,
++                    std::clamp(Config::Get(Config::MAIN_AUDIO_TREBLE_BOOST) + direction * 2, 0, 8));
++    break;
++  case Item::PreservePitch:
++    Config::SetBase(Config::MAIN_AUDIO_PRESERVE_PITCH,
++                    !Config::Get(Config::MAIN_AUDIO_PRESERVE_PITCH));
++    break;
+   case Item::Volume:
+   {
+     const int volume = std::clamp(Config::Get(Config::MAIN_AUDIO_VOLUME) + direction * 5, 0, 100);
+     Config::SetBase(Config::MAIN_AUDIO_VOLUME, volume);
++    AudioCommon::UpdateSoundStream(Core::System::GetInstance());
+     break;
+   }
+   case Item::Speed:
+@@ -3491,8 +3708,8 @@ void Draw()
+ #ifndef MODERNGEKKO_PROJECT_VERSION
+ #define MODERNGEKKO_PROJECT_VERSION "Ver 1.0"
+ #endif
+-    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f),
+-                       "RING OUT  -  " MODERNGEKKO_PROJECT_VERSION);
++    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s  -  RingOut %s",
++                       MenuTitle().c_str(), MODERNGEKKO_PROJECT_VERSION);
+     ImGui::Separator();
+ 
+     // Tab bar. Selected row 0 means the tab strip itself has focus, so mark it
+@@ -3591,7 +3808,8 @@ void Draw()
+       ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.0f), "  (nothing here)");
+       if (tab == Tab::Cheats)
+         ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.0f),
+-                           "  add codes to GameSettings/GRSEAF.ini");
++                           "  add codes to GameSettings/%s.ini",
++                           SConfig::GetInstance().GetGameID().c_str());
+       if (tab == Tab::Mods)
+         ImGui::TextColored(ImVec4(0.70f, 0.78f, 0.90f, 1.0f),
+                            "  put texture mods in Load/Mods/<name>/");
+@@ -3689,6 +3907,16 @@ void Draw()
+       hint = mod_message.c_str();
+     if (applied_now)
+       hint = "Settings saved.";
++    // What the selected setting does. The line is kept (blank) on rows without a
++    // description so the panel does not change height while walking the list.
++    if (tab == Tab::Video || tab == Tab::Audio || tab == Tab::System)
++    {
++      const std::vector<Item>& items = TabItems(tab);
++      const char* description = selected >= 1 && selected <= static_cast<int>(items.size()) ?
++                                    ItemHint(items[selected - 1]) :
++                                    "";
++      ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.55f, 1.0f), "%s", description);
++    }
+     ImGui::TextColored(applied_now ? ImVec4(0.55f, 0.95f, 0.55f, 1.0f) : ImVec4(0.80f, 0.86f, 0.95f, 1.0f),
+                        "%s", hint);
+ 
