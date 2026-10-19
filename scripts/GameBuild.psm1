@@ -112,7 +112,9 @@ function Invoke-ModuleBuild {
         $profileDir = (Resolve-Path -LiteralPath $PgoInstrumentDir).Path
         # LTO must be off: instrumented objects are LTO IR, and linking them without LTO gives
         # a stub module that loads and does nothing (see MODULE_LTO in RingOut's CMakeLists).
-        $configure += @("-DCMAKE_C_FLAGS=$CFlags -fprofile-generate=$profileDir",
+        # MODULE_PROFILE_RESET exports staticrecomp_profile_reset, which lets a training
+        # run drop the counts of boot and menus (automation command profile_reset).
+        $configure += @("-DCMAKE_C_FLAGS=$CFlags -fprofile-generate=$profileDir -DMODULE_PROFILE_RESET",
             "-DCMAKE_SHARED_LINKER_FLAGS=-fprofile-generate=$profileDir", '-DMODULE_LTO=OFF',
             '-DMODULE_PGO_PROFILE=')
         Write-Host "    instrumented for PGO; counts go to $profileDir"

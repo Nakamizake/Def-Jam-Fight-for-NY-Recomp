@@ -25,7 +25,7 @@ A real install writes the following, and its uninstaller removes it:
 | --- | --- |
 | the chosen folder (default `%LOCALAPPDATA%\Programs\DefJamFFNY`) | the game, the built module, logs, `userdata\` (saves and settings; the uninstaller asks before deleting it) |
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\{EE1476CB-E33D-4B0B-B14F-8CE9E9E79008}_is1` | the entry in Settings > Apps |
-| Start menu folder *Def Jam Fight for NY* | shortcuts: game, rebuild, game folder, uninstall |
+| Start menu folder *Def Jam Fight for NY* | shortcuts: game, rebuild, optimize, game folder, uninstall |
 | desktop (optional task) | game shortcut |
 
 Test builds (`package.ps1 -TestInstall`) create neither the registry entry nor shortcuts;

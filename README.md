@@ -79,11 +79,23 @@ their own disc image (`installer/build-game.ps1`, about 5 minutes on 8 cores).
   (saves, settings, shader cache, logs) stays in it.
 - The disc page is filled in automatically when the `.iso` sits next to the installer or in
   a folder next to it, or from `/ISO="path"` on the command line.
-- Start menu: the game, *Rebuild game files* (`DefJam.exe --rebuild`), the game folder and
-  the uninstaller. Uninstalling removes the built game and asks whether to keep the saves.
-- The module is built without the PGO profile and twin chunks (they are trained on this
-  machine and are game-derived): about 79 fps unthrottled in a 2v2 fight against about 100
-  with them, still well above 60 on the development PC.
+- Start menu: the game, *Rebuild game files* (`DefJam.exe --rebuild`), *Optimize for this
+  PC* (`DefJam.exe --optimize`), the game folder and the uninstaller. Uninstalling removes
+  the built game and asks whether to keep the saves.
+- The module is first built without a PGO profile or twin chunks (profiles are game-derived,
+  so none can ship): about 79 fps unthrottled in a 2v2 fight, well above 60 on the
+  development PC.
+- *Optimize for this PC* is optional (also offered, unticked, at the end of the install).
+  It trains the PGO profile on the player's PC without savestates (`build-game.ps1
+  -Optimize`, about 20 minutes): a measuring build, then the game boots with
+  `--unattended` (player input ignored, settings menu off, a banner on screen) and
+  `scripts/AutoPlay.psm1` drives it through the menus into back-to-back 2v2 fights on a
+  throwaway memory card, then the real build. The counts are zeroed when the first fight
+  starts (automation command `profile_reset`), so boot, intro movie and the Flash menus do
+  not weigh in: counted from power-on, the same training made one 2v2 scene 9% slower.
+  About 14 minutes on the development PC, for 78 → 97 fps in a 2v2 fight (table below).
+  The profile is kept in `module\`, so *Rebuild game files* stays optimised while the
+  recompiler, its settings and Clang are unchanged.
 
 Needs Inno Setup 6, besides the development requirements below. `-TestInstall` builds a
 variant with no shortcuts and no uninstall registry entry, for test installs into
@@ -190,6 +202,16 @@ Unthrottled 2v2 fight on the development PC:
 | native regions + twin chunks | 84.4 |
 | PGO only | 91.1 |
 | all three | 96.6 |
+
+The installer's module has the native regions only; *Optimize for this PC* adds a PGO
+profile trained without savestates. Unthrottled, 30 s of each scene, none of them used for
+that training:
+
+| Scene | installer build | after *Optimize* |
+| --- | --- | --- |
+| 2v2 fight (`2v2-fight`) | 78.0 | 97.2 |
+| 2v2 fight (`2v2-special`) | 78.5 | 97.5 |
+| 1v1 fight (`fight-1v1`) | 107.9 | 128.6 |
 
 ## Freezes and crashes
 

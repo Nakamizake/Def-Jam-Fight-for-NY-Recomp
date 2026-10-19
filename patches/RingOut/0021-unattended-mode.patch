@@ -1,0 +1,522 @@
+diff --git a/ModernGekko/include/moderngekko/runtime.hpp b/ModernGekko/include/moderngekko/runtime.hpp
+index 85304cbf..4873d9ff 100644
+--- a/ModernGekko/include/moderngekko/runtime.hpp
++++ b/ModernGekko/include/moderngekko/runtime.hpp
+@@ -53,6 +53,10 @@ struct InputSettings
+ struct AutomationSettings
+ {
+   std::filesystem::path directory;
++  // The automation directory is the only input: the player's keyboard and pads
++  // are ignored, the settings menu and hotkeys are off, and a banner (set with
++  // the "banner" command) is drawn over the game. Needs a directory.
++  bool unattended = false;
+ };
+ 
+ enum class WindowSystem
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index b16b054d..6966b918 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -359,6 +359,16 @@ std::optional<RuntimeError> ApplyAutomationCommand(Runtime& runtime,
+     if (auto error = WriteAutomationMemory(command.address, command.data))
+       return error;
+     break;
++  case automation::CommandType::Banner:
++    RecompMenu::SetBanner(command.text);
++    break;
++  case automation::CommandType::ProfileReset:
++    if (!g_static_recomp_core || !g_static_recomp_core->ResetModuleProfile())
++    {
++      return RuntimeError{RuntimeErrorCode::InvalidState,
++                          "profile_reset needs a module built for PGO training"};
++    }
++    break;
+   case automation::CommandType::Stop:
+     runtime.RequestStop();
+     break;
+@@ -379,9 +389,11 @@ bool AutomationCommandNeedsReadyCore(automation::CommandType type)
+   case automation::CommandType::ReadMemory:
+   case automation::CommandType::WriteMemory:
+   case automation::CommandType::PadFrames:
++  case automation::CommandType::ProfileReset:
+     return true;
+   case automation::CommandType::Pad:
+   case automation::CommandType::ClearPad:
++  case automation::CommandType::Banner:
+   case automation::CommandType::Stop:
+     return false;
+   }
+@@ -1409,6 +1421,10 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+       ClearAutomationPad(port);
+     }
+     impl->automation_registered = true;
++    if (impl->config.automation.unattended) {
++      ciface::Touch::SetExclusive(true);
++      RecompMenu::SetUnattended(true);
++    }
+   }
+   impl->platform->SetTitle(impl->title);
+ 
+@@ -1443,6 +1459,8 @@ Runtime::~Runtime() {
+     UICommon::ShutdownControllers();
+   if (m_impl->ui_initialized)
+     UICommon::Shutdown();
++  ciface::Touch::SetExclusive(false);
++  RecompMenu::SetUnattended(false);
+   std::lock_guard lock(s_runtime_mutex);
+   s_platform = nullptr;
+   s_window_title.clear();
+diff --git a/ModernGekko/tools/automation_protocol.cpp b/ModernGekko/tools/automation_protocol.cpp
+index 25f4167b..bc9207d6 100644
+--- a/ModernGekko/tools/automation_protocol.cpp
++++ b/ModernGekko/tools/automation_protocol.cpp
+@@ -173,6 +173,10 @@ std::optional<CommandType> ParseCommandType(std::string_view value)
+     return CommandType::ReadMemory;
+   if (text == "write_memory")
+     return CommandType::WriteMemory;
++  if (text == "banner")
++    return CommandType::Banner;
++  if (text == "profile_reset")
++    return CommandType::ProfileReset;
+   if (text == "stop")
+     return CommandType::Stop;
+   return std::nullopt;
+@@ -499,8 +503,28 @@ bool ParseCommandFile(const std::filesystem::path& path, Command* command, std::
+     if (!ParseWriteMemoryCommand(values, &parsed, error))
+       return false;
+     break;
++  case CommandType::Banner:
++  {
++    // One line per key in a command file, so a line break is written as "\n".
++    const auto text_it = values.find("text");
++    const std::string raw = text_it == values.end() ? std::string() : text_it->second;
++    for (std::size_t i = 0; i < raw.size(); ++i)
++    {
++      if (raw[i] == '\\' && i + 1 < raw.size() && raw[i + 1] == 'n')
++      {
++        parsed.text += '\n';
++        ++i;
++      }
++      else
++      {
++        parsed.text += raw[i];
++      }
++    }
++    break;
++  }
+   case CommandType::Pause:
+   case CommandType::Resume:
++  case CommandType::ProfileReset:
+   case CommandType::Stop:
+     break;
+   }
+diff --git a/ModernGekko/tools/automation_protocol.hpp b/ModernGekko/tools/automation_protocol.hpp
+index 2396f01a..7036d611 100644
+--- a/ModernGekko/tools/automation_protocol.hpp
++++ b/ModernGekko/tools/automation_protocol.hpp
+@@ -23,6 +23,10 @@ enum class CommandType
+   Screenshot,
+   ReadMemory,
+   WriteMemory,
++  // Sets the banner shown in unattended mode (text=..., "\n" for a new line).
++  Banner,
++  // Zeroes the PGO counts of a module built for profile training (an error otherwise).
++  ProfileReset,
+   Stop,
+ };
+ 
+@@ -43,6 +47,7 @@ struct Command
+   std::uint32_t size = 0;
+   std::uint32_t frames = 0;
+   std::vector<std::uint8_t> data;
++  std::string text;
+ };
+ 
+ struct Status
+diff --git a/ModernGekko/tools/moderngekko_run.cpp b/ModernGekko/tools/moderngekko_run.cpp
+index 37b68b44..753eb2f2 100644
+--- a/ModernGekko/tools/moderngekko_run.cpp
++++ b/ModernGekko/tools/moderngekko_run.cpp
+@@ -43,6 +43,8 @@ void Usage() {
+                "       [--replay <file.dtm>]  play a recorded session back\n"
+                "       [--load-state <file>]  boot straight into a savestate\n"
+                "       [--automation-dir <dir>]  file-based remote control\n"
++               "       [--unattended]  with --automation-dir: ignore keyboard and\n"
++               "                       pads, menu off, banner over the game\n"
+                "       [--netplay-host | --netplay-join <host>] "
+                "[--netplay-port <port>]\n"
+                "       [--nickname <name>] [--buffer <auto|1-20>] "
+@@ -293,6 +295,8 @@ int RunMain(int argc, char **argv) {
+       config.load_state_path = std::move(state);
+     } else if (arg == "--automation-dir")
+       config.automation.directory = value("--automation-dir");
++    else if (arg == "--unattended")
++      config.automation.unattended = true;
+     else if (arg == "--headless")
+       config.headless = true;
+     else if (arg == "--allow-interpreter")
+@@ -548,6 +552,11 @@ int RunMain(int argc, char **argv) {
+   // this session ends, which is the path a menu press actually takes.
+   ApplyReplayRequest(&config);
+ 
++  if (config.automation.unattended && config.automation.directory.empty()) {
++    std::cerr << "--unattended needs --automation-dir: nothing else could play\n";
++    return 2;
++  }
++
+   // Runtime::Create takes the config by move, so anything needed after the
+   // session ends has to be kept here. The in-game menu's "Start Netplay" needs
+   // both: the user directory to find the request it wrote, and the whole config
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+index e6be013e..f3cea804 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.cpp
+@@ -91,6 +91,20 @@ bool StaticRecompCore::IsModuleActive() const
+   return m_module_active;
+ }
+ 
++bool StaticRecompCore::ResetModuleProfile()
++{
++  if (!m_library.IsOpen())
++    return false;
++  using ResetFn = void (*)();
++  const auto reset =
++      reinterpret_cast<ResetFn>(m_library.GetSymbolAddress("staticrecomp_profile_reset"));
++  if (!reset)
++    return false;
++  // The CPU thread may be counting meanwhile; a few counts more or less do not matter.
++  reset();
++  return true;
++}
++
+ StaticRecompCore::StaticRecompCore(Core::System& system, StaticRecompModuleSource module_source)
+     : JitBase(system), m_module_source(std::move(module_source))
+ {
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+index 66764b13..ff4ae2aa 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/PowerPC/StaticRecomp/StaticRecompCore.h
+@@ -54,6 +54,10 @@ public:
+   void Run() override;
+   void SingleStep() override;
+   bool IsModuleActive() const;
++  // Zeroes the profile counts of a module built for PGO training (its optional
++  // staticrecomp_profile_reset export), so a training run can leave out what came
++  // before. False when the module has no such export.
++  bool ResetModuleProfile();
+   bool DispatchableAt(u32 address);
+   bool FastDispatchableAt(u32 address) const;
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWayland.cpp b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWayland.cpp
+index 6f1f2254..095a6460 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWayland.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWayland.cpp
+@@ -662,6 +662,13 @@ bool PlatformWayland::ModifierActive(const char* name) const
+ void PlatformWayland::HandleHotkey(xkb_keysym_t symbol)
+ {
+   auto& system = Core::System::GetInstance();
++  // Unattended session: Shift+Escape quits, every other key is ignored.
++  if (RecompMenu::IsUnattended())
++  {
++    if (symbol == XKB_KEY_Escape && ModifierActive(XKB_MOD_NAME_SHIFT))
++      RequestShutdown();
++    return;
++  }
+   // Escape opens the in-game settings overlay (and pauses); it used to quit
+   // outright. Quitting now lives in the menu itself, with Shift+Escape kept as
+   // an immediate escape hatch.
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+index fb0f514e..13d9e351 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+@@ -352,6 +352,21 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
+     const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+     const bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+ 
++    // An unattended session (automation playing on its own) takes no keys but
++    // Shift+Escape to quit and Alt+Enter for fullscreen: a stray save-state
++    // load or pause would derail the script.
++    if (RecompMenu::IsUnattended())
++    {
++      if (wParam == VK_ESCAPE && shift)
++        platform->RequestShutdown();
++      else if (wParam == VK_RETURN && alt)
++        platform->ToggleFullscreen();
++      // Same reason as below; Alt+F4 still goes through to close the window.
++      if (msg == WM_SYSKEYDOWN && (wParam == VK_F10 || (wParam == VK_RETURN && alt)))
++        return 0;
++      break;
++    }
++
+     // Hold Tab = unlimited speed; Alt+Tab stays the window manager's. The
+     // repeat flag (bit 30) is filtered so a held key does not re-trigger.
+     if (wParam == VK_TAB && !alt)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp
+index a9a1e7d9..1cb2b094 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformX11.cpp
+@@ -227,6 +227,13 @@ void PlatformX11::ProcessEvents()
+       break;
+     case KeyPress:
+       key = XLookupKeysym((XKeyEvent*)&event, 0);
++      // Unattended session: Shift+Escape quits, every other key is ignored.
++      if (RecompMenu::IsUnattended())
++      {
++        if (key == XK_Escape && (event.xkey.state & ShiftMask))
++          RequestShutdown();
++        break;
++      }
+       if (key == XK_Tab && !(event.xkey.state & Mod1Mask))
+       {
+         // Hold Tab = unlimited speed; Alt+Tab stays the window manager's.
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp
+index 9ddbaffc..51950dbf 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.cpp
+@@ -5,6 +5,7 @@
+ #include "InputCommon/ControllerInterface/Touch/InputOverrider.h"
+ 
+ #include <array>
++#include <atomic>
+ #include <map>
+ #include <optional>
+ #include <string>
+@@ -31,6 +32,9 @@ namespace ciface::Touch
+ {
+ namespace
+ {
++// See SetExclusive.
++std::atomic<bool> s_exclusive{false};
++
+ struct InputState
+ {
+   ControlState normal_state = 0;
+@@ -158,6 +162,8 @@ ControllerEmu::InputOverrideFunction GetInputOverrideFunction(const ControlsMap&
+ 
+     const ControlID control = it->second;
+     InputState& input_state = state_array[control];
++    if (s_exclusive.load(std::memory_order_relaxed))
++      return input_state.overriding ? input_state.override_state : 0.0;
+     if (input_state.normal_state != controller_state)
+     {
+       input_state.normal_state = controller_state;
+@@ -221,6 +227,11 @@ void UnregisterWiiInputOverrider(int controller_index)
+     s_state_arrays[controller_index][i].overriding = false;
+ }
+ 
++void SetExclusive(bool exclusive)
++{
++  s_exclusive.store(exclusive, std::memory_order_relaxed);
++}
++
+ void SetControlState(int controller_index, ControlID control, double state)
+ {
+   InputState& input_state = s_state_arrays[controller_index][control];
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h
+index 6217b44d..4cf3a927 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/Touch/InputOverrider.h
+@@ -81,6 +81,11 @@ void RegisterWiiInputOverrider(int controller_index);
+ void UnregisterGameCubeInputOverrider(int controller_index);
+ void UnregisterWiiInputOverrider(int controller_index);
+ 
++// Exclusive: the overrides are the only input. A control that is not overridden
++// reads as released (0) whatever the player's keyboard or pad does, and real
++// input no longer cancels an override. For unattended automation runs.
++void SetExclusive(bool exclusive);
++
+ void SetControlState(int controller_index, ControlID control, double state);
+ void ClearControlState(int controller_index, ControlID control);
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+index bfac0185..bbe17b90 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+@@ -2333,6 +2333,8 @@ bool IsOpen()
+ 
+ void Toggle()
+ {
++  if (IsUnattended())
++    return;
+   // Read the persisted join address before taking the lock -- same rule the
+   // rest of this file follows for file I/O. Once per process: the runner only
+   // rewrites config.ini on its way out to the lobby, and by then this process
+@@ -2407,6 +2409,8 @@ void CloseAndResume()
+ 
+ void OnKey(Key key)
+ {
++  if (IsUnattended())
++    return;
+   Action action = Action::None;
+   int slot = 1;
+   std::function<void()> fullscreen_callback;
+@@ -3170,6 +3174,8 @@ void OnKey(Key key)
+ 
+ void OnEscape()
+ {
++  if (IsUnattended())
++    return;
+   {
+     std::lock_guard<std::mutex> guard(s_state.mutex);
+ 
+@@ -3220,6 +3226,8 @@ void SetFastForward(bool enable)
+   // through again — restoring a saved value here would instead mask any speed
+   // change made while the key was down.
+   static std::atomic<bool> s_active{false};
++  if (enable && IsUnattended())
++    return;
+   if (s_active.exchange(enable) == enable)
+     return;
+   if (enable)
+@@ -3241,7 +3249,7 @@ void SetActiveReplay(std::string name)
+ 
+ void ScheduleAutoResumeLoad()
+ {
+-  if (!Config::Get(RECOMP_AUTO_RESUME))
++  if (IsUnattended() || !Config::Get(RECOMP_AUTO_RESUME))
+     return;
+   const std::string path = AutoResumePath();
+   if (!File::Exists(path))
+@@ -3417,12 +3425,93 @@ void DrawThumb(const std::string& path, float width, const char* absent)
+   ImGui::Image(*tex, ImVec2(width, static_cast<float>(tex->GetHeight()) * scale));
+ }
+ 
++namespace
++{
++// Unattended mode: the automation directory plays the game and the player only
++// watches, so the menu and its hotkeys stay shut and a banner says what is going
++// on. The flag is read on the host thread, the text written by the automation
++// thread and drawn on the video thread.
++std::atomic<bool> s_unattended{false};
++std::mutex& s_banner_mutex = *new std::mutex;
++std::string& s_banner_text = *new std::string;
++
++// A dark box across the top of the screen: the first line of the text as the
++// heading, in the game-style heavy face, the rest below it.
++void DrawUnattendedBanner()
++{
++  if (!s_unattended.load(std::memory_order_relaxed))
++    return;
++  std::string text;
++  {
++    std::lock_guard<std::mutex> guard(s_banner_mutex);
++    text = s_banner_text;
++  }
++  if (text.empty())
++    return;
++  const std::size_t newline = text.find('\n');
++  const std::string heading = text.substr(0, newline);
++  const std::string body = newline == std::string::npos ? std::string() : text.substr(newline + 1);
++
++  const ImGuiViewport* vp = ImGui::GetMainViewport();
++  // Sized from the window height so it reads from the couch at any resolution.
++  const float ui = std::clamp(vp->Size.y / 720.0f, 1.0f, 3.0f);
++  const float width = std::min(vp->Size.x - 32.0f, 1000.0f * ui);
++  ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + 24.0f * ui),
++                          ImGuiCond_Always, ImVec2(0.5f, 0.0f));
++  ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
++  ImGui::SetNextWindowBgAlpha(0.85f);
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f * ui, 16.0f * ui));
++  ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * ui);
++  ImGui::Begin("UnattendedBanner", nullptr,
++               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
++                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
++                   ImGuiWindowFlags_NoNav);
++  ImGui::PushFont(s_bold_font, 0.0f);
++  ImGui::SetWindowFontScale(2.4f * ui);
++  // Pulses so it reads as a live status rather than part of the game's HUD.
++  const float pulse = 0.75f + 0.25f * static_cast<float>(std::sin(ImGui::GetTime() * 3.0));
++  ImGui::TextColored(ImVec4(1.0f, 0.82f * pulse + 0.1f, 0.2f, 1.0f), "%s", heading.c_str());
++  ImGui::PopFont();
++  if (!body.empty())
++  {
++    ImGui::SetWindowFontScale(1.5f * ui);
++    ImGui::PushTextWrapPos(0.0f);
++    ImGui::TextUnformatted(body.c_str());
++    ImGui::PopTextWrapPos();
++  }
++  ImGui::SetWindowFontScale(1.0f);
++  ImGui::End();
++  ImGui::PopStyleVar(2);
++}
++}  // namespace
++
++void SetUnattended(bool unattended)
++{
++  s_unattended.store(unattended, std::memory_order_relaxed);
++  if (unattended)
++    SetBanner("RUNNING ON ITS OWN\nThe game is being played automatically. Keyboard and "
++              "controllers are ignored; close the window to stop.");
++}
++
++bool IsUnattended()
++{
++  return s_unattended.load(std::memory_order_relaxed);
++}
++
++void SetBanner(std::string text)
++{
++  std::lock_guard<std::mutex> guard(s_banner_mutex);
++  s_banner_text = std::move(text);
++}
++
+ void Draw()
+ {
+   // Refilled every frame: see the comment on kThumbMaxWidth for why exactly one
+   // image is decoded per repaint.
+   s_thumb_budget = 1;
+ 
++  DrawUnattendedBanner();
++
+   // The HUD is independent of the menu: it renders whenever enabled, and first
+   // so an open menu draws over it.
+   DrawTrainingHud();
+@@ -4294,7 +4383,8 @@ void PollMenuGamepad()
+ 
+ void HostTick()
+ {
+-  PollMenuGamepad();
++  if (!IsUnattended())
++    PollMenuGamepad();
+ 
+   // Free Look's camera is driven by its own input mapping (Shift+WASDQE to move,
+   // Shift+mouse to look) and needs pumping from the host thread every iteration
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.h
+index e536f8e3..9d9790c9 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.h
+@@ -82,4 +82,14 @@ void ScheduleAutoResumeLoad();
+ // The file this session is recording to or playing back, so the REPLAYS tab can
+ // name it. The movie system knows the mode but never the filename.
+ void SetActiveReplay(std::string name);
++
++// Unattended mode, for sessions an automation script plays on its own (e.g. a
++// profile-training run): the menu, its hotkeys and auto-resume are off, and a
++// banner is drawn over the game. Set once before boot.
++void SetUnattended(bool unattended);
++bool IsUnattended();
++
++// The banner's text in unattended mode: the first line is the heading, the
++// rest is the body. Callable from any thread.
++void SetBanner(std::string text);
+ }  // namespace RecompMenu
+diff --git a/dist/RingOut-1.0-dist/module-src/deps/module-template/module_export.c b/dist/RingOut-1.0-dist/module-src/deps/module-template/module_export.c
+index 4ad90480..925ae711 100644
+--- a/dist/RingOut-1.0-dist/module-src/deps/module-template/module_export.c
++++ b/dist/RingOut-1.0-dist/module-src/deps/module-template/module_export.c
+@@ -98,3 +98,15 @@ RECOMP_MODULE_EXPORT const u32 staticrecomp_timing_id = DOLRECOMP_TIMING_ID;
+ #define DOLRECOMP_DYN_LOOP_BUDGET 0u
+ #endif
+ RECOMP_MODULE_EXPORT const u32 staticrecomp_dyn_loop_budget = DOLRECOMP_DYN_LOOP_BUDGET;
++
++/* PGO training builds only (-fprofile-generate, with -DMODULE_PROFILE_RESET): zeroes
++   the counts gathered so far, so a training run can start counting where the play
++   worth optimising begins (after boot, intro movie and menus) instead of at load.
++   The chassis calls it for the automation command profile_reset. */
++#ifdef MODULE_PROFILE_RESET
++void __llvm_profile_reset_counters(void);
++RECOMP_MODULE_EXPORT void staticrecomp_profile_reset(void)
++{
++    __llvm_profile_reset_counters();
++}
++#endif

@@ -11,7 +11,7 @@
       toolchain\     llvm-mingw (trimmed, with its Python), CMake and Ninja
       module-src\    RingOut's module CMake project
       config\        recompiler flags and regions, game settings, first-run defaults
-      setup\         build-game.ps1 and GameBuild.psm1
+      setup\         build-game.ps1, GameBuild.psm1 and AutoPlay.psm1 (for -Optimize)
       licenses\      licences of everything bundled
 
     Nothing derived from the disc is staged: no extracted files, generated code, module,
@@ -137,7 +137,13 @@ Copy-Tree (Join-Path $repoRoot 'config\Controllers') (Join-Path $config 'Control
 Copy-Item (Join-Path $repoRoot 'config\Dolphin.defaults.ini') $config
 $setup = Join-Path $stage 'setup'
 New-Item -ItemType Directory -Force $setup | Out-Null
-Copy-Item (Join-Path $repoRoot 'installer\build-game.ps1'), (Join-Path $PSScriptRoot 'GameBuild.psm1') $setup
+Copy-Item (Join-Path $repoRoot 'installer\build-game.ps1'), (Join-Path $PSScriptRoot 'GameBuild.psm1'),
+    (Join-Path $PSScriptRoot 'AutoPlay.psm1') $setup
+# build-game.ps1 -Optimize merges the training counts with llvm-profdata, and the measuring
+# build links Clang's profile runtime; both must survive the toolchain trim above.
+foreach ($needed in 'bin\llvm-profdata.exe', 'lib\clang\*\lib\windows\libclang_rt.profile-x86_64.a') {
+    if (-not (Test-Path (Join-Path $toolchain $needed))) { throw "The trimmed toolchain lacks $needed." }
+}
 Copy-Item (Join-Path $repoRoot 'installer\before-you-install.txt') (Join-Path $stage 'README.txt')
 
 # licenses

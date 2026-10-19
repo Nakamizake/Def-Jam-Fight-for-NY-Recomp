@@ -10,12 +10,19 @@
     3. Recompiles main.dol to C and builds module\gGNWE69_recomp.dll with the bundled Clang.
     4. Prepares userdata\ (game settings, first-run defaults, controller layout).
 
+    With -Optimize, step 3 becomes profile-guided optimisation (PGO): a measuring build of
+    the module, a few minutes of the game playing fights on its own (AutoPlay.psm1, with the
+    player's input locked out and a throwaway memory card), then the real build using those
+    measurements. The profile is kept in module\, so a later rebuild stays optimised as
+    long as the recompiler, its settings and the compiler are the same.
+
     Everything happens inside the install folder; the work files are deleted at the end.
     A log is kept in logs\build-game.log.
 
 .EXAMPLE
     .\build-game.ps1 -Iso D:\Games\DefJam.iso
     .\build-game.ps1            # rebuilds the module from the already extracted game
+    .\build-game.ps1 -Optimize  # rebuilds it optimised for this PC (about 20 minutes)
 #>
 [CmdletBinding()]
 param(
@@ -23,6 +30,10 @@ param(
     [string] $Iso = '',
     # Parallel compile jobs; by default as many as cores and memory allow.
     [int] $Jobs = 0,
+    # Trains a PGO profile by letting the game play itself, and builds with it.
+    [switch] $Optimize,
+    # Seconds of fighting the profile is trained on.
+    [int] $TrainSeconds = 240,
     # Closes the window straight away on failure too (for unattended runs).
     [switch] $NoPause
 )
@@ -40,6 +51,11 @@ $paths = @{
     UserData     = Join-Path $app 'userdata'
     Work         = Join-Path $app 'work'
     Logs         = Join-Path $app 'logs'
+}
+$profilePaths = @{
+    Profile = Join-Path $paths.Module "$GameId.profdata"
+    # What the profile was trained against; see Get-ProfileStamp.
+    Stamp   = Join-Path $paths.Module "$GameId.profdata.stamp"
 }
 Import-Module (Join-Path $PSScriptRoot 'GameBuild.psm1') -Force
 
@@ -115,12 +131,69 @@ function Test-Compiler([string] $Clang) {
     }
 }
 
+# A profile only fits the code it was measured on: that code comes from the recompiler, its
+# settings and the compiler, so their hashes identify it (the disc is always GNWE69).
+function Get-ProfileStamp([string[]] $Inputs) {
+    return ($Inputs | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }) -join "`n"
+}
+
+# The profile from an earlier -Optimize run, when it still fits this build; '' otherwise.
+function Get-SavedProfile([string] $Stamp) {
+    if (-not (Test-Path -LiteralPath $profilePaths.Profile) -or -not (Test-Path -LiteralPath $profilePaths.Stamp)) { return '' }
+    if ((Get-Content -LiteralPath $profilePaths.Stamp -Raw).Trim() -ne $Stamp) { return '' }
+    return $profilePaths.Profile
+}
+
+# Builds a measuring module, lets the game play fights with it and merges the counts into
+# a profile. Returns the profile's path.
+function Invoke-ProfileTraining([hashtable] $Toolchain, [string] $Generated) {
+    $rawDir = Join-Path $paths.Work 'pgo-raw'
+    if (Test-Path -LiteralPath $rawDir) { Remove-Item -Recurse -Force -LiteralPath $rawDir }
+    $instrumented = Invoke-ModuleBuild -Toolchain $Toolchain -ModuleSource $paths.ModuleSource `
+        -GeneratedDir $Generated -BuildDir (Join-Path $paths.Work 'build-train') -GameId $GameId `
+        -Jobs $Jobs -PgoInstrumentDir $rawDir
+
+    $minutes = [math]::Ceiling($TrainSeconds * 1.4 / 60) + 2
+    Write-Host "==> $(Get-StepLabel)  Letting the game play itself (about $minutes min)"
+    Write-Host '    A game window opens and plays on its own; your keyboard and controllers are'
+    Write-Host '    ignored in it. Closing it cancels the optimisation (the game stays as it was).'
+    Import-Module (Join-Path $PSScriptRoot 'AutoPlay.psm1') -Force
+    # One counts file per game process; a restarted attempt adds its own.
+    $env:LLVM_PROFILE_FILE = Join-Path $rawDir '%p.profraw'
+    try {
+        $fought = Invoke-AutoPlay -Runner (Join-Path $paths.Bin 'moderngekko-run.exe') -GameRoot $paths.Game `
+            -Module $instrumented -UserDir (Join-Path $paths.Work 'train-user') -ConfigDir $paths.Config `
+            -AutomationDir (Join-Path $paths.Work 'train-auto') -FightSeconds $TrainSeconds -MaxAttempts 5 -FightsOnlyProfile `
+            -BannerHeading 'OPTIMIZING FOR YOUR PC' `
+            -BannerBody "The game is playing itself to measure how it runs. About {0} min left.`nKeyboard and controllers are ignored. Closing this window cancels the optimization." `
+            -LogFile (Join-Path $paths.Logs 'optimize-game')
+    }
+    finally { Remove-Item Env:LLVM_PROFILE_FILE -ErrorAction SilentlyContinue }
+    $raw = @(Get-ChildItem -LiteralPath $rawDir -Filter *.profraw -ErrorAction SilentlyContinue | Where-Object Length -gt 0)
+    # Half the fighting is plenty for a useful profile; less means the route kept failing or
+    # the window was closed.
+    if ($fought -lt $TrainSeconds / 2 -or $raw.Count -eq 0) {
+        throw ("the game did not get far enough on its own ({0:N0} of {1} s of fighting). The game was left as it was." -f $fought, $TrainSeconds)
+    }
+
+    Write-Host "==> $(Get-StepLabel)  Merging the measurements"
+    $merged = Join-Path $paths.Work "$GameId.profdata"
+    & $Toolchain.Profdata merge "-output=$merged" @($raw | ForEach-Object FullName) | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "llvm-profdata merge failed ($LASTEXITCODE)." }
+    return $merged
+}
+
+$script:step = 0
+function Get-StepLabel { $script:step++; return "$script:step/$script:stepCount" }
+
 New-Item -ItemType Directory -Force $paths.Logs | Out-Null
 Start-Transcript -LiteralPath (Join-Path $paths.Logs 'build-game.log') | Out-Null
 $started = Get-Date
 try {
-    Write-Host 'Def Jam: Fight for NY - building the game from your disc' -ForegroundColor Yellow
+    $heading = if ($Optimize) { 'optimizing the game for this PC' } else { 'building the game from your disc' }
+    Write-Host "Def Jam: Fight for NY - $heading" -ForegroundColor Yellow
     Write-Host ''
+    $script:stepCount = if ($Optimize) { 7 } else { 4 }
 
     $toolchain = @{
         Clang  = Join-Path $paths.Toolchain 'bin\clang.exe'
@@ -128,6 +201,7 @@ try {
         Ninja  = Join-Path $paths.Toolchain 'bin\ninja.exe'
         Python = Join-Path $paths.Toolchain 'python\bin\python.exe'
     }
+    if ($Optimize) { $toolchain.Profdata = Join-Path $paths.Toolchain 'bin\llvm-profdata.exe' }
     $dolrecomp = Join-Path $paths.Bin 'dolrecomp.exe'
     $missing = @(@($toolchain.Values) + $dolrecomp | Where-Object { -not (Test-Path -LiteralPath $_) })
     if ($missing) { Stop-Build "The installation is incomplete; reinstall the game. Missing:`n  $($missing -join "`n  ")" }
@@ -144,6 +218,7 @@ try {
     # Extracted game ~1.4 GB, work files up to ~3 GB while compiling, plus the shader cache.
     $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($app))
     $needGb = if ($Iso) { 6 } else { 4 }
+    if ($Optimize) { $needGb += 2 }  # the measuring build beside the real one
     if ($drive.AvailableFreeSpace / 1GB -lt $needGb) {
         Stop-Build ("Not enough free space on {0}: {1:N1} GB free, about {2} GB needed while building." -f
             $drive.Name, ($drive.AvailableFreeSpace / 1GB), $needGb)
@@ -159,7 +234,7 @@ flagged by mistake). Restore it from quarantine, or reinstall the game.
     if ($Jobs -le 0) { $Jobs = Get-ModuleBuildJobs }
 
     if ($Iso) {
-        Write-Host '==> 1/4  Extracting the disc'
+        Write-Host "==> $(Get-StepLabel)  Extracting the disc"
         if (Test-Path -LiteralPath $paths.Game) { Remove-Item -Recurse -Force -LiteralPath $paths.Game }
         & $dolrecomp extract $Iso $paths.Game 2>&1 | Out-Host
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $paths.Game 'sys\main.dol'))) {
@@ -167,22 +242,39 @@ flagged by mistake). Restore it from quarantine, or reinstall the game.
         }
     }
     else {
-        Write-Host '==> 1/4  Using the game already extracted'
+        Write-Host "==> $(Get-StepLabel)  Using the game already extracted"
     }
 
-    Write-Host "==> 2/4  Recompiling the game's code"
+    Write-Host "==> $(Get-StepLabel)  Recompiling the game's code"
     $flags = Get-RecompilerFlags -FlagsFile (Join-Path $paths.Config "recomp\$GameId.flags") `
         -RegionsFile (Join-Path $paths.Config "recomp\$GameId.regions")
     $generated = Invoke-Recompiler -DolRecomp $dolrecomp -Dol (Join-Path $paths.Game 'sys\main.dol') `
         -Flags $flags -WorkDir $paths.Work -Jobs $Jobs
 
-    Write-Host "==> 3/4  Compiling (the long part: several minutes, $Jobs jobs)"
+    $stamp = Get-ProfileStamp @($dolrecomp, $toolchain.Clang,
+        (Join-Path $paths.Config "recomp\$GameId.flags"), (Join-Path $paths.Config "recomp\$GameId.regions"))
+    if ($Optimize) {
+        Write-Host "==> $(Get-StepLabel)  Compiling a measuring version of the game (several minutes, $Jobs jobs)"
+        $pgoProfile = Invoke-ProfileTraining -Toolchain $toolchain -Generated $generated
+        Write-Host "==> $(Get-StepLabel)  Compiling the optimized game (several minutes, $Jobs jobs)"
+    }
+    else {
+        $pgoProfile = Get-SavedProfile $stamp
+        $how = if ($pgoProfile) { ', optimized with the profile from an earlier run' } else { '' }
+        Write-Host "==> $(Get-StepLabel)  Compiling (the long part: several minutes, $Jobs jobs$how)"
+    }
     $dll = Invoke-ModuleBuild -Toolchain $toolchain -ModuleSource $paths.ModuleSource `
-        -GeneratedDir $generated -BuildDir (Join-Path $paths.Work 'build') -GameId $GameId -Jobs $Jobs
+        -GeneratedDir $generated -BuildDir (Join-Path $paths.Work 'build') -GameId $GameId -Jobs $Jobs `
+        -PgoProfile $pgoProfile
+    # Only a finished build replaces the module, so a failure leaves the game playable.
     New-Item -ItemType Directory -Force $paths.Module | Out-Null
     Copy-Item -LiteralPath $dll $paths.Module -Force
+    if ($Optimize) {
+        Copy-Item -LiteralPath $pgoProfile $profilePaths.Profile -Force
+        $stamp | Set-Content -Encoding ascii -LiteralPath $profilePaths.Stamp
+    }
 
-    Write-Host '==> 4/4  Preparing settings'
+    Write-Host "==> $(Get-StepLabel)  Preparing settings"
     Initialize-UserDirectory -UserDir $paths.UserData -ConfigDir $paths.Config -GameId $GameId
     Remove-Item -Recurse -Force -LiteralPath $paths.Work -ErrorAction SilentlyContinue
 

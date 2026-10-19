@@ -7,6 +7,8 @@
  *   DefJam.exe            play (building first if needed)
  *   DefJam.exe --rebuild  build again: from a newly chosen disc image, or, if the picker is
  *                         cancelled, from the game already extracted
+ *   DefJam.exe --optimize build again optimised for this PC: the game plays itself for a
+ *                         few minutes to measure where its time goes (PGO); ~20 minutes
  *
  * A GUI program, so no console window flashes up. The runtime's own console output goes to
  * logs\runtime.log, which is the first thing to look at when the game will not start.
@@ -93,21 +95,24 @@ static int run(wchar_t *command_line, DWORD flags, HANDLE output)
 }
 
 /* Runs setup\build-game.ps1 in its own console window, so the player can follow it.
- * An empty disc_image rebuilds from the game already extracted. -ExecutionPolicy Bypass
- * applies to that one PowerShell process and changes nothing system-wide. */
-static BOOL build_game(const wchar_t *disc_image)
+ * An empty disc_image rebuilds from the game already extracted; optimize adds -Optimize.
+ * -ExecutionPolicy Bypass applies to that one PowerShell process and changes nothing
+ * system-wide. */
+static BOOL build_game(const wchar_t *disc_image, BOOL optimize)
 {
     wchar_t script[MAX_PATH], command_line[CMDLINE_MAX];
+    const wchar_t *mode = optimize ? L" -Optimize" : L"";
     int code;
 
     root_path(script, MAX_PATH, L"setup\\build-game.ps1");
     if (disc_image[0] != L'\0')
         _snwprintf(command_line, CMDLINE_MAX,
-                   L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%ls\" -Iso \"%ls\"",
-                   script, disc_image);
+                   L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%ls\" -Iso \"%ls\"%ls",
+                   script, disc_image, mode);
     else
         _snwprintf(command_line, CMDLINE_MAX,
-                   L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%ls\"", script);
+                   L"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%ls\"%ls", script,
+                   mode);
     command_line[CMDLINE_MAX - 1] = L'\0';
 
     code = run(command_line, CREATE_NEW_CONSOLE, NULL);
@@ -167,7 +172,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
     wchar_t disc_image[MAX_PATH];
     int argc;
     wchar_t **argv;
-    BOOL rebuild = FALSE;
+    BOOL rebuild = FALSE, optimize = FALSE;
     (void)instance;
     (void)previous;
     (void)arguments;
@@ -185,14 +190,43 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
         for (int i = 1; i < argc; ++i)
             if (_wcsicmp(argv[i], L"--rebuild") == 0)
                 rebuild = TRUE;
+            else if (_wcsicmp(argv[i], L"--optimize") == 0)
+                optimize = TRUE;
         LocalFree(argv);
+    }
+
+    if (optimize) {
+        if (!game_is_built()) {
+            show_error(L"Build the game first: start it once from the Def Jam: Fight for NY "
+                       L"shortcut, then optimize it.");
+            return 1;
+        }
+        if (MessageBoxW(NULL,
+                        L"Optimize the game for this PC?\n\n"
+                        L"This takes about 20 minutes. The game is compiled again, and in the "
+                        L"middle of it a game window opens and plays fights on its own to "
+                        L"measure where its time goes. Keyboard and controllers are ignored "
+                        L"in that window; closing it cancels the optimization.\n\n"
+                        L"Your saves and settings are not touched, and if anything fails the "
+                        L"game stays as it is now. The PC will be busy while it runs.",
+                        APP_TITLE, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
+            return 1;
+        disc_image[0] = L'\0';
+        if (!build_game(disc_image, TRUE)) {
+            show_error(L"The optimization did not finish; the game is unchanged.\n\n"
+                       L"Details are in logs\\build-game.log.");
+            return 1;
+        }
+        MessageBoxW(NULL, L"Done: the game is optimized for this PC. Start it as usual.",
+                    APP_TITLE, MB_OK | MB_ICONINFORMATION);
+        return 0;
     }
 
     if (rebuild) {
         /* Cancelling the picker rebuilds from the extracted game, when there is one. */
         if (!pick_disc_image(disc_image, MAX_PATH) && !exists(L"game\\sys\\main.dol"))
             return 1;
-        if (!build_game(disc_image))
+        if (!build_game(disc_image, FALSE))
             return 1;
         MessageBoxW(NULL, L"The game was rebuilt.", APP_TITLE, MB_OK | MB_ICONINFORMATION);
         return 0;
@@ -208,7 +242,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
             return 1;
         if (!pick_disc_image(disc_image, MAX_PATH))
             return 1;
-        if (!build_game(disc_image))
+        if (!build_game(disc_image, FALSE))
             return 1;
     }
     return play();

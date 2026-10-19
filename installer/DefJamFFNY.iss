@@ -61,12 +61,16 @@ Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdir
 #ifndef TestInstall
 Name: "{group}\{#ShortName}"; Filename: "{app}\DefJam.exe"
 Name: "{group}\Rebuild game files"; Filename: "{app}\DefJam.exe"; Parameters: "--rebuild"
+Name: "{group}\Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "--optimize"
 Name: "{group}\Game folder"; Filename: "{app}"
 Name: "{group}\Uninstall {#ShortName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#ShortName}"; Filename: "{app}\DefJam.exe"; Tasks: desktopicon
 #endif
 
 [Run]
+; Optional and off by default. It runs first and is waited for, so with both ticked the game
+; starts once the optimization is done instead of alongside it.
+Filename: "{app}\DefJam.exe"; Parameters: "--optimize"; Description: "Optimize the game for this PC now (optional, about 20 minutes; also in the Start menu)"; Flags: postinstall unchecked skipifsilent; Check: GameIsBuilt
 Filename: "{app}\DefJam.exe"; Description: "Play now"; Flags: postinstall nowait skipifsilent; Check: GameIsBuilt
 
 [UninstallDelete]
