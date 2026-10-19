@@ -1,0 +1,100 @@
+diff --git a/DolRecomp/src/backend/native_regions.c b/DolRecomp/src/backend/native_regions.c
+index 9a263d67..bca16330 100644
+--- a/DolRecomp/src/backend/native_regions.c
++++ b/DolRecomp/src/backend/native_regions.c
+@@ -665,6 +665,12 @@ static unsigned mem_access(const char* l) {
+     }
+     return 0;
+ }
++/* s is exactly one `mem_writeN(ctx, ea, <value>);` statement: no other statement shares the line */
++static bool is_single_store(const char* s) {
++    if (!starts(s, "mem_write") || !strstr(s, "(ctx, ea, ")) return false;
++    const char* semi = strchr(s, ';');
++    return semi && semi > s && semi[-1] == ')' && *lskip(semi + 1) == 0;
++}
+ /* mem_readN(ctx, ea) -> NREG_RDN(ea); mem_writeN(ctx, ea, -> NREG_WRN(ea,  (word-bounded, as the regex) */
+ static char* sub_mem(const char* l) {
+     static const char* const W[4] = {"8", "16", "32", "64"};
+@@ -879,9 +885,21 @@ static char* transform(char** src, size_t a, size_t b, u32 start, u32 end, const
+             char* m = sub_mem(l);
+             Str o = {0};
+             str_add(&o, l, ind);
+-            str_printf(&o, "if (!nreg_in_ram(ea, %uu)) { NAT_WB(); ctx->pc = 0x%08Xu; %sgoto %s_%08X; } ", sz, block_pc,
+-                       bail_refund(inst_pc, block_pc, block_dc), inst_pc == start ? "nreg_o" : "label", inst_pc);
+-            str_puts(&o, lskip(m));
++            const char* refund = bail_refund(inst_pc, block_pc, block_dc);
++            const char* resume = inst_pc == start ? "nreg_o" : "label";
++            if (is_single_store(lskip(l))) {
++                /* A store that misses RAM because it targets the gather pipe (the GX FIFO page) stays in the region:
++                 * the original mem_writeN call services it exactly as the emitted code does, as inlined callees
++                 * already do. Only that page: any other MMIO store still writes back and leaves. Games that build
++                 * display lists in hot loops (Def Jam's skinning) would otherwise leave the region on every vertex. */
++                str_printf(&o, "if (__builtin_expect(nreg_in_ram(ea, %uu), 1)) %s else if (nreg_gather_pipe(ea)) %s "
++                           "else { NAT_WB(); ctx->pc = 0x%08Xu; %sgoto %s_%08X; }",
++                           sz, lskip(m), lskip(l), block_pc, refund, resume, inst_pc);
++            } else {
++                str_printf(&o, "if (!nreg_in_ram(ea, %uu)) { NAT_WB(); ctx->pc = 0x%08Xu; %sgoto %s_%08X; } ", sz, block_pc,
++                           refund, resume, inst_pc);
++                str_puts(&o, lskip(m));
++            }
+             free(m);
+             free(l);
+             l = str_take(&o);
+@@ -1039,6 +1057,7 @@ static const char kHelpers[] =
+     "/* ---- NATIVE REGION helpers (native_regions.c) ---- */\n"
+     "#define NREG_FN static inline __attribute__((always_inline, no_profile_instrument_function))\n"
+     "NREG_FN bool nreg_in_ram(u32 ea, u32 size) { return (u32)(ea - GC_RAM_BASE) <= GC_MAIN_RAM_SIZE - size; }\n"
++    "NREG_FN bool nreg_gather_pipe(u32 ea) { return (ea & 0xFFFFF000u) == 0xCC008000u; }\n"
+     "#define NREG_H(ea_) (DOLRECOMP_RAM_ARG(ctx) + ((ea_) - GC_RAM_BASE))\n"
+     "#define NREG_RD8(ea_) (*NREG_H(ea_))\n"
+     "#define NREG_RD16(ea_) read_be16(NREG_H(ea_))\n"
+diff --git a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/backend/native_regions.c b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/backend/native_regions.c
+index 9a263d67..bca16330 100644
+--- a/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/backend/native_regions.c
++++ b/dist/RingOut-1.0-dist/module-src/deps/dolrecomp-src/backend/native_regions.c
+@@ -665,6 +665,12 @@ static unsigned mem_access(const char* l) {
+     }
+     return 0;
+ }
++/* s is exactly one `mem_writeN(ctx, ea, <value>);` statement: no other statement shares the line */
++static bool is_single_store(const char* s) {
++    if (!starts(s, "mem_write") || !strstr(s, "(ctx, ea, ")) return false;
++    const char* semi = strchr(s, ';');
++    return semi && semi > s && semi[-1] == ')' && *lskip(semi + 1) == 0;
++}
+ /* mem_readN(ctx, ea) -> NREG_RDN(ea); mem_writeN(ctx, ea, -> NREG_WRN(ea,  (word-bounded, as the regex) */
+ static char* sub_mem(const char* l) {
+     static const char* const W[4] = {"8", "16", "32", "64"};
+@@ -879,9 +885,21 @@ static char* transform(char** src, size_t a, size_t b, u32 start, u32 end, const
+             char* m = sub_mem(l);
+             Str o = {0};
+             str_add(&o, l, ind);
+-            str_printf(&o, "if (!nreg_in_ram(ea, %uu)) { NAT_WB(); ctx->pc = 0x%08Xu; %sgoto %s_%08X; } ", sz, block_pc,
+-                       bail_refund(inst_pc, block_pc, block_dc), inst_pc == start ? "nreg_o" : "label", inst_pc);
+-            str_puts(&o, lskip(m));
++            const char* refund = bail_refund(inst_pc, block_pc, block_dc);
++            const char* resume = inst_pc == start ? "nreg_o" : "label";
++            if (is_single_store(lskip(l))) {
++                /* A store that misses RAM because it targets the gather pipe (the GX FIFO page) stays in the region:
++                 * the original mem_writeN call services it exactly as the emitted code does, as inlined callees
++                 * already do. Only that page: any other MMIO store still writes back and leaves. Games that build
++                 * display lists in hot loops (Def Jam's skinning) would otherwise leave the region on every vertex. */
++                str_printf(&o, "if (__builtin_expect(nreg_in_ram(ea, %uu), 1)) %s else if (nreg_gather_pipe(ea)) %s "
++                           "else { NAT_WB(); ctx->pc = 0x%08Xu; %sgoto %s_%08X; }",
++                           sz, lskip(m), lskip(l), block_pc, refund, resume, inst_pc);
++            } else {
++                str_printf(&o, "if (!nreg_in_ram(ea, %uu)) { NAT_WB(); ctx->pc = 0x%08Xu; %sgoto %s_%08X; } ", sz, block_pc,
++                           refund, resume, inst_pc);
++                str_puts(&o, lskip(m));
++            }
+             free(m);
+             free(l);
+             l = str_take(&o);
+@@ -1039,6 +1057,7 @@ static const char kHelpers[] =
+     "/* ---- NATIVE REGION helpers (native_regions.c) ---- */\n"
+     "#define NREG_FN static inline __attribute__((always_inline, no_profile_instrument_function))\n"
+     "NREG_FN bool nreg_in_ram(u32 ea, u32 size) { return (u32)(ea - GC_RAM_BASE) <= GC_MAIN_RAM_SIZE - size; }\n"
++    "NREG_FN bool nreg_gather_pipe(u32 ea) { return (ea & 0xFFFFF000u) == 0xCC008000u; }\n"
+     "#define NREG_H(ea_) (DOLRECOMP_RAM_ARG(ctx) + ((ea_) - GC_RAM_BASE))\n"
+     "#define NREG_RD8(ea_) (*NREG_H(ea_))\n"
+     "#define NREG_RD16(ea_) read_be16(NREG_H(ea_))\n"

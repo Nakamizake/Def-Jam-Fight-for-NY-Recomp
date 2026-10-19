@@ -1,0 +1,22 @@
+# GNWE69 (Def Jam: Fight for NY, USA) native regions, for dolrecomp --native-regions.
+# START END per line (hex, END exclusive): whole guest functions that a 2v2 fight profile ranked
+# hottest. Inside a region guest registers live in C locals and small leaf callees are inlined; a
+# region the recompiler cannot make native exactly is left as emitted (the build log says why), so
+# this list is a request, not a promise. Functions that call many non-leaf functions are left out:
+# every such call would leave the region.
+#
+# The four callers of the skinning-matrix leaves (801F7CB8 and 801F7F64): blend up to three bone
+# matrices, transform them and write them to the GX FIFO. About a fifth of the CPU time in a 2v2
+# fight. Their FIFO stores stay in the region (the gather-pipe case in native_regions.c).
+801F7968 801F7A1C
+801F7A1C 801F7ACC
+801F7ACC 801F7BA4
+801F7BA4 801F7CB8
+# Other hot functions with no calls, or calls to small leaves only.
+800F5DE0 800F60A4
+80119484 801197C8
+801183E0 80118654
+800F3928 800F3B18
+8011A254 8011A35C
+801F2808 801F28CC
+8028A888 8028A980

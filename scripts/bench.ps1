@@ -319,6 +319,14 @@ if (-not $NoFrameTimes) {
             ($stats.OffPace / $stats.Frames))
     }
 }
+# The next run starts from a fresh user directory: keep the crash reports with the run's results.
+$crashReports = @(Get-ChildItem (Join-Path $userDir 'Diagnostics') -Filter 'crash-*.txt' -ErrorAction SilentlyContinue)
+if ($crashReports) {
+    $crashDir = Join-Path $benchDir $Label
+    New-Item -ItemType Directory -Force $crashDir | Out-Null
+    $crashReports | Copy-Item -Destination $crashDir -Force
+    Write-Host ("[{0}] crash reports: {1} in {2}" -f $Label, $crashReports.Count, $crashDir)
+}
 if ($HitchTraceMs -gt 0) {
     $hitchReports = @(Get-ChildItem (Join-Path $userDir 'Diagnostics') -Filter 'hitch-*.txt' -ErrorAction SilentlyContinue)
     if ($hitchReports) {

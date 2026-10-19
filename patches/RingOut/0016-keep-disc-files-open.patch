@@ -1,0 +1,72 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp b/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
+index b2fadeb8..4b7fe3ab 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.cpp
+@@ -57,6 +57,8 @@ constexpr u8 DIRECTORY_ENTRY = 1;
+ DiscContent::DiscContent(u64 offset, u64 size, ContentSource source)
+     : m_offset(offset), m_size(size), m_content_source(std::move(source))
+ {
++  if (std::holds_alternative<ContentFile>(m_content_source))
++    m_open_file = std::make_shared<OpenFile>();
+ }
+ 
+ DiscContent::DiscContent(u64 offset) : m_offset(offset)
+@@ -93,8 +95,19 @@ bool DiscContent::Read(u64* offset, u64* length, u8** buffer, DirectoryBlobReade
+     if (std::holds_alternative<ContentFile>(m_content_source))
+     {
+       const auto& content = std::get<ContentFile>(m_content_source);
+-      File::DirectIOFile file(content.m_filename, File::AccessMode::Read);
+-      if (!file.OffsetRead(content.m_offset + offset_in_content, *buffer, bytes_to_read))
++      std::call_once(m_open_file->opened, [&] {
++        m_open_file->file.Open(content.m_filename, File::AccessMode::Read);
++      });
++      // Positional reads keep no state in the file, so threads can share it. Should the first
++      // open have failed, open the file for this read alone, as before.
++      File::DirectIOFile own_file;
++      File::DirectIOFile* file = &m_open_file->file;
++      if (!file->IsOpen())
++      {
++        own_file.Open(content.m_filename, File::AccessMode::Read);
++        file = &own_file;
++      }
++      if (!file->OffsetRead(content.m_offset + offset_in_content, *buffer, bytes_to_read))
+       {
+         return false;
+       }
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.h b/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.h
+index a8add132..ec997e4a 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/DiscIO/DirectoryBlob.h
+@@ -8,6 +8,7 @@
+ #include <functional>
+ #include <map>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <set>
+ #include <string>
+@@ -15,6 +16,7 @@
+ #include <vector>
+ 
+ #include "Common/CommonTypes.h"
++#include "Common/DirectIOFile.h"
+ #include "DiscIO/Blob.h"
+ #include "DiscIO/Volume.h"
+ #include "DiscIO/WiiEncryptionCache.h"
+@@ -152,6 +154,16 @@ private:
+ 
+   // Where and how to find the data for this content chunk.
+   ContentSource m_content_source;
++
++  // The file of a ContentFile source, opened on the first read and kept open after. Opening a
++  // file can wait for hundreds of milliseconds while another process (a virus scanner, the search
++  // indexer) holds it, and the emulated DVD drive would otherwise open the file for every read.
++  struct OpenFile
++  {
++    std::once_flag opened;
++    File::DirectIOFile file;
++  };
++  std::shared_ptr<OpenFile> m_open_file;
+ };
+ 
+ class DiscContentContainer

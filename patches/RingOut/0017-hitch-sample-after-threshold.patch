@@ -1,0 +1,26 @@
+diff --git a/ModernGekko/src/runtime/hitch_recorder.cpp b/ModernGekko/src/runtime/hitch_recorder.cpp
+index cd534d1c..f753c93a 100644
+--- a/ModernGekko/src/runtime/hitch_recorder.cpp
++++ b/ModernGekko/src/runtime/hitch_recorder.cpp
+@@ -117,7 +117,11 @@ void HitchRecorder::OnIntervalEnd(Span span, IntervalClock &clock) {
+ 
+ void HitchRecorder::SamplerLoop(std::stop_token stop) {
+   Common::SetCurrentThreadName("Hitch stack sampler");
+-  // Half the threshold in, and then every half threshold until the interval ends.
++  // Once the interval is over the threshold (a hitch by then), and then every half threshold until
++  // it ends. Capturing every thread's stack costs a good share of a core, so a slow stretch of
++  // frames just under the threshold must not pay for it: sampling earlier made those stretches
++  // slower than they were.
++  const std::int64_t first_sample_after_ns = ToNs(m_options.threshold);
+   const std::int64_t sample_every_ns = ToNs(m_options.threshold) / 2;
+   struct Watch {
+     Span span;
+@@ -137,7 +141,7 @@ void HitchRecorder::SamplerLoop(std::stop_token stop) {
+         continue;
+       if (start_ns != watch.interval_start_ns) {
+         watch.interval_start_ns = start_ns;
+-        watch.next_sample_ns = start_ns + sample_every_ns;
++        watch.next_sample_ns = start_ns + first_sample_after_ns;
+         watch.samples = 0;
+       }
+       const std::int64_t now_ns = HitchTrace::NowNs();

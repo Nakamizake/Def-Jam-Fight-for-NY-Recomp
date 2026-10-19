@@ -295,6 +295,9 @@ def main() -> int:
     parser.add_argument("--rate", type=int, default=1000, help="sampling rounds per second")
     parser.add_argument("--top-offsets", type=int, default=0,
                         help="also print the hottest offsets inside each busy module")
+    parser.add_argument("--offset-bytes", type=int, default=256,
+                        help="size of the address ranges --top-offsets counts (a power of two; "
+                             "1 gives exact instruction addresses)")
     parser.add_argument("--wait", action="store_true",
                         help="wait for --process to start instead of failing")
     parser.add_argument("--stop-file",
@@ -311,6 +314,9 @@ def main() -> int:
                         help="report samples that took longer than this: the thread could not be "
                              "suspended because it was busy in the kernel (a driver call, a page fault)")
     args = parser.parse_args()
+    if args.offset_bytes < 1 or args.offset_bytes & (args.offset_bytes - 1):
+        parser.error("--offset-bytes must be a power of two")
+    offset_mask = ~(args.offset_bytes - 1)
 
     pid = args.pid
     if args.process:
@@ -368,7 +374,7 @@ def main() -> int:
                 trace[tid].append((now, name, offset))
             per_thread[tid][name] += 1
             window[tid][name] += 1
-            offsets[name][offset & ~0xFF] += 1
+            offsets[name][offset & offset_mask] += 1
             if args.functions:
                 exact[tid][(name, offset)] += 1
         rounds += 1
@@ -404,7 +410,7 @@ def main() -> int:
     if args.top_offsets:
         totals = collections.Counter({name: sum(c.values()) for name, c in offsets.items()})
         for name, _ in totals.most_common(4):
-            print(f"\nhottest 256-byte ranges in {name}:")
+            print(f"\nhottest {args.offset_bytes}-byte ranges in {name}:")
             for offset, n in offsets[name].most_common(args.top_offsets):
                 print(f"  +0x{offset:08X}  {n}")
 

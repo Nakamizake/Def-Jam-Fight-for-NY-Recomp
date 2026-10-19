@@ -1,0 +1,674 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDL.cpp b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDL.cpp
+index f6912f67..b814d4ce 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDL.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDL.cpp
+@@ -40,10 +40,16 @@ private:
+   void OpenAndAddDevice(SDL_JoystickID instance_id);
+ 
+   bool HandleEventAndContinue(const SDL_Event& e);
++  // Hands every open gamepad's input state over and sends its rumble changes. Runs on the
++  // hotplug thread after each batch of events, which SDL produces whenever an input changes.
++  void UpdateGamepads();
+ 
+   Common::Event m_init_event;
+   Uint32 m_stop_event_type;
+   Uint32 m_populate_event_type;
++  Uint32 m_wake_event_type;
++  // The gamepads this backend opened; only touched on the hotplug thread.
++  std::vector<std::weak_ptr<Gamepad>> m_gamepads;
+   std::thread m_hotplug_thread;
+ };
+ 
+@@ -204,7 +210,7 @@ InputBackend::InputBackend(ControllerInterface* controller_interface)
+         return;
+       }
+ 
+-      const Uint32 custom_events_start = SDL_RegisterEvents(2);
++      const Uint32 custom_events_start = SDL_RegisterEvents(3);
+       if (custom_events_start == static_cast<Uint32>(-1))
+       {
+         ERROR_LOG_FMT(CONTROLLERINTERFACE, "SDL failed to register custom events");
+@@ -212,6 +218,7 @@ InputBackend::InputBackend(ControllerInterface* controller_interface)
+       }
+       m_stop_event_type = custom_events_start;
+       m_populate_event_type = custom_events_start + 1;
++      m_wake_event_type = custom_events_start + 2;
+ 
+       // Drain all of the events and add the initial joysticks before returning. Otherwise, the
+       // individual joystick events as well as the custom populate event will be handled _after_
+@@ -229,8 +236,14 @@ InputBackend::InputBackend(ControllerInterface* controller_interface)
+     SDL_Event e;
+     while (SDL_WaitEvent(&e))
+     {
+-      if (!HandleEventAndContinue(e))
+-        return;
++      // Handle everything queued, then hand the new input state over once.
++      do
++      {
++        if (!HandleEventAndContinue(e))
++          return;
++      } while (SDL_PollEvent(&e));
++
++      UpdateGamepads();
+     }
+   });
+ 
+@@ -259,7 +272,22 @@ void InputBackend::PopulateDevices()
+ 
+ void InputBackend::UpdateInput(std::vector<std::weak_ptr<ciface::Core::Device>>&)
+ {
+-  SDL_UpdateGamepads();
++  // Nothing to do: the hotplug thread pumps SDL's events (which updates the gamepads) and hands
++  // their state over. Calling SDL here would wait on SDL's joystick lock, which its thread holds
++  // for as long as a device enumeration takes.
++}
++
++void InputBackend::UpdateGamepads()
++{
++  std::erase_if(m_gamepads, [](const std::weak_ptr<Gamepad>& gamepad) { return gamepad.expired(); });
++  for (const std::weak_ptr<Gamepad>& weak_gamepad : m_gamepads)
++  {
++    if (const std::shared_ptr<Gamepad> gamepad = weak_gamepad.lock())
++    {
++      gamepad->ApplyRumble();
++      gamepad->ReadState();
++    }
++  }
+ }
+ 
+ void InputBackend::OpenAndAddDevice(SDL_JoystickID instance_id)
+@@ -277,9 +305,12 @@ void InputBackend::OpenAndAddDevice(SDL_JoystickID instance_id)
+       // SDL tries parsing these as Joysticks
+       return;
+     }
+-    auto gamepad = std::make_shared<Gamepad>(gc, js);
++    auto gamepad = std::make_shared<Gamepad>(gc, js, m_wake_event_type);
+     if (!gamepad->Inputs().empty() || !gamepad->Outputs().empty())
++    {
++      m_gamepads.push_back(gamepad);
+       GetControllerInterface().AddDevice(std::move(gamepad));
++    }
+   }
+ }
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
+index 09457598..f805976d 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
+@@ -7,6 +7,8 @@
+ #include <span>
+ #include <unordered_set>
+ 
++#include <SDL3/SDL_events.h>
++
+ #include "Common/Logging/Log.h"
+ #include "Common/ScopeGuard.h"
+ 
+@@ -19,8 +21,9 @@ static bool IsTriggerAxis(int index)
+   return index >= 4;
+ }
+ 
+-Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+-    : m_gamepad(gamepad), m_joystick(joystick)
++Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick,
++                 Uint32 wake_event_type)
++    : m_gamepad(gamepad), m_joystick(joystick), m_wake_event_type(wake_event_type)
+ {
+   const char* const sdl_name =
+       (gamepad != nullptr) ? SDL_GetGamepadName(gamepad) : SDL_GetJoystickName(joystick);
+@@ -64,20 +67,20 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+       switch (binding->output_type)
+       {
+       case SDL_GAMEPAD_BINDTYPE_BUTTON:
+-        AddInput(new Button(gamepad, *binding));
++        AddInput(new Button(m_state, *binding));
+         break;
+       case SDL_GAMEPAD_BINDTYPE_AXIS:
+       {
+         const auto axis = binding->output.axis.axis;
+         if (IsTriggerAxis(axis))
+         {
+-          AddInput(new Axis(m_gamepad, 32767, axis));
++          AddInput(new Axis(m_state, 32767, axis));
+         }
+         else
+         {
+           // Each axis gets a negative and a positive input instance associated with it
+-          AddInput(new Axis(m_gamepad, -32768, axis));
+-          AddInput(new Axis(m_gamepad, 32767, axis));
++          AddInput(new Axis(m_state, -32768, axis));
++          AddInput(new Axis(m_state, 32767, axis));
+         }
+         break;
+       }
+@@ -107,12 +110,12 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+     if (SDL_GetNumGamepadTouchpads(m_gamepad) > 0)
+     {
+       const char* const name_x = "Touchpad X";
+-      AddInput(new NonDetectableDirectionalInput<-1>(name_x, &m_touchpad_x));
+-      AddInput(new NonDetectableDirectionalInput<+1>(name_x, &m_touchpad_x));
++      AddInput(new NonDetectableDirectionalInput<-1>(name_x, &m_state.touchpad_x));
++      AddInput(new NonDetectableDirectionalInput<+1>(name_x, &m_state.touchpad_x));
+       const char* const name_y = "Touchpad Y";
+-      AddInput(new NonDetectableDirectionalInput<-1>(name_y, &m_touchpad_y));
+-      AddInput(new NonDetectableDirectionalInput<+1>(name_y, &m_touchpad_y));
+-      AddInput(new NormalizedInput("Touchpad Pressure", &m_touchpad_pressure));
++      AddInput(new NonDetectableDirectionalInput<-1>(name_y, &m_state.touchpad_y));
++      AddInput(new NonDetectableDirectionalInput<+1>(name_y, &m_state.touchpad_y));
++      AddInput(new NormalizedInput("Touchpad Pressure", &m_state.touchpad_pressure));
+     }
+ 
+     // Motion
+@@ -120,10 +123,12 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+                                    const SDLMotionAxisList& axes) {
+       if (SDL_SetGamepadSensorEnabled(m_gamepad, type, true))
+       {
++        const std::size_t sensor_slot = m_sensor_types.size();
++        m_sensor_types.push_back(type);
+         for (const SDLMotionAxis& axis : axes)
+         {
+-          AddInput(new MotionInput(fmt::format("{} {}", sensor_name, axis.name), m_gamepad, type,
+-                                   axis.index, axis.scale));
++          AddInput(new MotionInput(fmt::format("{} {}", sensor_name, axis.name), m_state,
++                                   sensor_slot, axis.index, axis.scale));
+         }
+       }
+     };
+@@ -150,7 +155,7 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+     if (registered_buttons.contains(i))
+       continue;
+ 
+-    AddInput(new LegacyButton(m_joystick, i));
++    AddInput(new LegacyButton(m_state, i));
+   }
+ 
+   // Axes
+@@ -165,8 +170,8 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+     const bool is_registered = registered_axes.contains(i);
+ 
+     // each axis gets a negative and a positive input instance associated with it
+-    AddFullAnalogSurfaceInputs(new LegacyAxis(m_joystick, i, -32768, is_registered),
+-                               new LegacyAxis(m_joystick, i, 32767, is_registered));
++    AddFullAnalogSurfaceInputs(new LegacyAxis(m_state, i, -32768, is_registered),
++                               new LegacyAxis(m_state, i, 32767, is_registered));
+   }
+ 
+   // Hats
+@@ -183,7 +188,7 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+ 
+     // each hat gets 4 input instances associated with it, (up down left right)
+     for (u8 d = 0; d != 4; ++d)
+-      AddInput(new LegacyHat(m_joystick, i, d));
++      AddInput(new LegacyHat(m_state, i, d));
+   }
+ 
+   // Haptics
+@@ -224,20 +229,111 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick)
+   }
+ 
+   // Battery
+-  if (UpdateBatteryLevel())
+-    AddInput(new BatteryInput{&m_battery_value});
++  if (ReadBatteryLevel(m_state))
++    AddInput(new BatteryInput{&m_state.battery});
++
++  // Size the state for the inputs found above. The copies keep these sizes, so handing the state
++  // over between threads never allocates.
++  m_state.legacy_buttons.resize(n_legacy_buttons);
++  m_state.legacy_axes.resize(n_legacy_axes);
++  m_state.legacy_hats.resize(n_legacy_hats);
++  m_state.sensors.resize(m_sensor_types.size());
++  m_read_state = m_state;
++  ReadState();
++  m_state = m_latest_state;
+ }
+ 
+-bool Gamepad::UpdateBatteryLevel()
++bool Gamepad::ReadBatteryLevel(InputState& state) const
+ {
+   int battery_percent = 0;
+   if (SDL_GetJoystickPowerInfo(m_joystick, &battery_percent) == SDL_POWERSTATE_ERROR)
+     return false;
+ 
+-  m_battery_value = std::max(0, battery_percent);
++  state.battery = std::max(0, battery_percent);
+   return true;
+ }
+ 
++void Gamepad::ReadState()
++{
++  InputState& state = m_read_state;
++
++  if (m_gamepad != nullptr)
++  {
++    for (int i = 0; i != SDL_GAMEPAD_BUTTON_COUNT; ++i)
++      state.buttons[i] = SDL_GetGamepadButton(m_gamepad, SDL_GamepadButton(i));
++    for (int i = 0; i != SDL_GAMEPAD_AXIS_COUNT; ++i)
++      state.axes[i] = SDL_GetGamepadAxis(m_gamepad, SDL_GamepadAxis(i));
++    for (std::size_t i = 0; i != m_sensor_types.size(); ++i)
++    {
++      state.sensors[i] = {};
++      SDL_GetGamepadSensorData(m_gamepad, m_sensor_types[i], state.sensors[i].data(),
++                               int(state.sensors[i].size()));
++    }
++
++    // We only support one touchpad and one finger.
++    const int touchpad_index = 0;
++    const int finger_index = 0;
++
++    if (SDL_GetNumGamepadTouchpads(m_gamepad) > touchpad_index &&
++        SDL_GetNumGamepadTouchpadFingers(m_gamepad, touchpad_index) > finger_index)
++    {
++      SDL_GetGamepadTouchpadFinger(m_gamepad, touchpad_index, finger_index, nullptr,
++                                   &state.touchpad_x, &state.touchpad_y,
++                                   &state.touchpad_pressure);
++      state.touchpad_x = state.touchpad_x * 2 - 1;
++      state.touchpad_y = state.touchpad_y * 2 - 1;
++    }
++  }
++
++  for (std::size_t i = 0; i != state.legacy_buttons.size(); ++i)
++    state.legacy_buttons[i] = SDL_GetJoystickButton(m_joystick, int(i));
++  for (std::size_t i = 0; i != state.legacy_axes.size(); ++i)
++    state.legacy_axes[i] = SDL_GetJoystickAxis(m_joystick, int(i));
++  for (std::size_t i = 0; i != state.legacy_hats.size(); ++i)
++    state.legacy_hats[i] = SDL_GetJoystickHat(m_joystick, int(i));
++
++  ReadBatteryLevel(state);
++
++  std::lock_guard lock(m_state_mutex);
++  m_latest_state = state;
++}
++
++Core::DeviceRemoval Gamepad::UpdateInput()
++{
++  std::lock_guard lock(m_state_mutex);
++  m_state = m_latest_state;
++  return Core::DeviceRemoval::Keep;
++}
++
++void Gamepad::UpdateRumble()
++{
++  m_rumble_changed.store(true, std::memory_order_release);
++  SDL_Event wake_event{m_wake_event_type};
++  SDL_PushEvent(&wake_event);
++}
++
++void Gamepad::UpdateRumbleTriggers()
++{
++  m_trigger_rumble_changed.store(true, std::memory_order_release);
++  SDL_Event wake_event{m_wake_event_type};
++  SDL_PushEvent(&wake_event);
++}
++
++void Gamepad::ApplyRumble()
++{
++  if (m_rumble_changed.exchange(false, std::memory_order_acquire))
++  {
++    SDL_RumbleGamepad(m_gamepad, m_low_freq_rumble.load(std::memory_order_relaxed),
++                      m_high_freq_rumble.load(std::memory_order_relaxed), RUMBLE_LENGTH_MS);
++  }
++  if (m_trigger_rumble_changed.exchange(false, std::memory_order_acquire))
++  {
++    SDL_RumbleGamepadTriggers(m_gamepad, m_trigger_l_rumble.load(std::memory_order_relaxed),
++                              m_trigger_r_rumble.load(std::memory_order_relaxed),
++                              RUMBLE_LENGTH_MS);
++  }
++}
++
+ Gamepad::~Gamepad()
+ {
+   if (m_haptic)
+@@ -301,12 +397,14 @@ std::string Gamepad::Axis::GetName() const
+ 
+ ControlState Gamepad::Button::GetState() const
+ {
+-  return SDL_GetGamepadButton(m_gc, m_binding.output.button);
++  const auto button = std::size_t(m_binding.output.button);
++  return button < m_state.buttons.size() ? m_state.buttons[button] : 0;
+ }
+ 
+ ControlState Gamepad::Axis::GetState() const
+ {
+-  return ControlState(SDL_GetGamepadAxis(m_gc, m_axis)) / m_range;
++  const auto axis = std::size_t(m_axis);
++  return axis < m_state.axes.size() ? ControlState(m_state.axes[axis]) / m_range : 0;
+ }
+ 
+ bool Gamepad::Button::IsMatchingName(std::string_view name) const
+@@ -341,25 +439,23 @@ bool Gamepad::Button::IsMatchingName(std::string_view name) const
+ 
+ ControlState Gamepad::MotionInput::GetState() const
+ {
+-  std::array<float, 3> data{};
+-  SDL_GetGamepadSensorData(m_gc, m_type, data.data(), (int)data.size());
+-  return m_scale * data[m_index];
++  return m_scale * m_state.sensors[m_sensor_slot][m_index];
+ }
+ 
+ // Legacy input
+ ControlState Gamepad::LegacyButton::GetState() const
+ {
+-  return SDL_GetJoystickButton(m_js, m_index);
++  return m_state.legacy_buttons[m_index];
+ }
+ 
+ ControlState Gamepad::LegacyAxis::GetState() const
+ {
+-  return ControlState(SDL_GetJoystickAxis(m_js, m_index)) / m_range;
++  return ControlState(m_state.legacy_axes[m_index]) / m_range;
+ }
+ 
+ ControlState Gamepad::LegacyHat::GetState() const
+ {
+-  return (SDL_GetJoystickHat(m_js, m_index) & (1 << m_direction)) > 0;
++  return (m_state.legacy_hats[m_index] & (1 << m_direction)) > 0;
+ }
+ 
+ void Gamepad::HapticEffect::UpdateEffect()
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h
+index 0a431866..e4238d06 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h
+@@ -4,6 +4,9 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
++#include <mutex>
++#include <vector>
+ 
+ #include <SDL3/SDL_gamepad.h>
+ #include <SDL3/SDL_haptic.h>
+@@ -45,17 +48,40 @@ namespace ciface::SDL
+ class Gamepad : public Core::Device
+ {
+ private:
++  // Everything the inputs report, read from SDL on the SDL thread and handed over to the thread
++  // that polls the inputs (the emulated CPU). SDL guards all joysticks with one lock, and its
++  // thread holds that lock while it enumerates devices after a USB or Bluetooth device comes or
++  // goes, which can take hundreds of milliseconds. Reading SDL directly from the CPU thread froze
++  // the game for that long; reading this copy never waits for SDL.
++  struct InputState
++  {
++    std::array<Uint8, SDL_GAMEPAD_BUTTON_COUNT> buttons{};
++    std::array<Sint16, SDL_GAMEPAD_AXIS_COUNT> axes{};
++    std::vector<Uint8> legacy_buttons;
++    std::vector<Sint16> legacy_axes;
++    std::vector<Uint8> legacy_hats;
++    // One reading per enabled sensor, in the order of m_sensor_types.
++    std::vector<std::array<float, 3>> sensors;
++    float touchpad_x = 0.f;
++    float touchpad_y = 0.f;
++    float touchpad_pressure = 0.f;
++    ControlState battery = 0;
++  };
++
+   // Gamepad inputs
+   class Button : public Core::Device::Input
+   {
+   public:
+     std::string GetName() const override;
+-    Button(SDL_Gamepad* gc, const SDL_GamepadBinding& binding) : m_gc(gc), m_binding(binding) {}
++    Button(const InputState& state, const SDL_GamepadBinding& binding)
++        : m_state(state), m_binding(binding)
++    {
++    }
+     ControlState GetState() const override;
+     bool IsMatchingName(std::string_view name) const override;
+ 
+   private:
+-    SDL_Gamepad* const m_gc;
++    const InputState& m_state;
+     const SDL_GamepadBinding m_binding;
+   };
+ 
+@@ -63,14 +89,14 @@ private:
+   {
+   public:
+     std::string GetName() const override;
+-    Axis(SDL_Gamepad* gc, Sint16 range, SDL_GamepadAxis axis)
+-        : m_gc(gc), m_range(range), m_axis(axis)
++    Axis(const InputState& state, Sint16 range, SDL_GamepadAxis axis)
++        : m_state(state), m_range(range), m_axis(axis)
+     {
+     }
+     ControlState GetState() const override;
+ 
+   private:
+-    SDL_Gamepad* const m_gc;
++    const InputState& m_state;
+     const Sint16 m_range;
+     const SDL_GamepadAxis m_axis;
+   };
+@@ -80,11 +106,11 @@ private:
+   {
+   public:
+     std::string GetName() const override { return GetLegacyButtonName(m_index); }
+-    LegacyButton(SDL_Joystick* js, int index) : m_js(js), m_index(index) {}
++    LegacyButton(const InputState& state, int index) : m_state(state), m_index(index) {}
+     ControlState GetState() const override;
+ 
+   private:
+-    SDL_Joystick* const m_js;
++    const InputState& m_state;
+     const int m_index;
+   };
+ 
+@@ -92,8 +118,9 @@ private:
+   {
+   public:
+     std::string GetName() const override { return GetLegacyAxisName(m_index, m_range); }
+-    LegacyAxis(SDL_Joystick* js, int index, s16 range, bool is_handled_elsewhere)
+-        : m_js(js), m_index(index), m_range(range), m_is_handled_elsewhere(is_handled_elsewhere)
++    LegacyAxis(const InputState& state, int index, s16 range, bool is_handled_elsewhere)
++        : m_state(state), m_index(index), m_range(range),
++          m_is_handled_elsewhere(is_handled_elsewhere)
+     {
+     }
+     ControlState GetState() const override;
+@@ -101,7 +128,7 @@ private:
+     bool IsDetectable() const override { return !IsHidden(); }
+ 
+   private:
+-    SDL_Joystick* const m_js;
++    const InputState& m_state;
+     const int m_index;
+     const s16 m_range;
+     const bool m_is_handled_elsewhere;
+@@ -111,14 +138,14 @@ private:
+   {
+   public:
+     std::string GetName() const override { return GetLegacyHatName(m_index, m_direction); }
+-    LegacyHat(SDL_Joystick* js, int index, u8 direction)
+-        : m_js(js), m_index(index), m_direction(direction)
++    LegacyHat(const InputState& state, int index, u8 direction)
++        : m_state(state), m_index(index), m_direction(direction)
+     {
+     }
+     ControlState GetState() const override;
+ 
+   private:
+-    SDL_Joystick* const m_js;
++    const InputState& m_state;
+     const int m_index;
+     const u8 m_direction;
+   };
+@@ -141,51 +168,55 @@ private:
+   public:
+     using UpdateCallback = void (Gamepad::*)(void);
+ 
+-    Rumble(const char* name, Gamepad& gc, Uint16* state, UpdateCallback update_callback)
++    Rumble(const char* name, Gamepad& gc, std::atomic<Uint16>* state,
++           UpdateCallback update_callback)
+         : m_name{name}, m_gc{gc}, m_state{*state}, m_update_callback{update_callback}
+     {
+     }
+     std::string GetName() const override { return m_name; }
+     void SetState(ControlState state) override
+     {
+-      const auto new_state = std::lround(state * std::numeric_limits<Uint16>::max());
+-      if (m_state == new_state)
++      const auto new_state = Uint16(std::lround(state * std::numeric_limits<Uint16>::max()));
++      if (m_state.load(std::memory_order_relaxed) == new_state)
+         return;
+ 
+-      m_state = new_state;
++      m_state.store(new_state, std::memory_order_relaxed);
+       (m_gc.*m_update_callback)();
+     }
+ 
+   private:
+     const char* const m_name;
+     Gamepad& m_gc;
+-    Uint16& m_state;
++    std::atomic<Uint16>& m_state;
+     UpdateCallback const m_update_callback;
+   };
+ 
+   class CombinedMotor : public Output
+   {
+   public:
+-    CombinedMotor(Gamepad& gc, Uint16* low_state, Uint16* high_state)
++    CombinedMotor(Gamepad& gc, std::atomic<Uint16>* low_state, std::atomic<Uint16>* high_state)
+         : m_gc{gc}, m_low_state{*low_state}, m_high_state{*high_state}
+     {
+     }
+     std::string GetName() const override { return "Motor"; }
+     void SetState(ControlState state) override
+     {
+-      const auto new_state = std::lround(state * std::numeric_limits<Uint16>::max());
+-      if (m_low_state == new_state && m_high_state == new_state)
++      const auto new_state = Uint16(std::lround(state * std::numeric_limits<Uint16>::max()));
++      if (m_low_state.load(std::memory_order_relaxed) == new_state &&
++          m_high_state.load(std::memory_order_relaxed) == new_state)
++      {
+         return;
++      }
+ 
+-      m_low_state = new_state;
+-      m_high_state = new_state;
++      m_low_state.store(new_state, std::memory_order_relaxed);
++      m_high_state.store(new_state, std::memory_order_relaxed);
+       m_gc.UpdateRumble();
+     }
+ 
+   private:
+     Gamepad& m_gc;
+-    Uint16& m_low_state;
+-    Uint16& m_high_state;
++    std::atomic<Uint16>& m_low_state;
++    std::atomic<Uint16>& m_high_state;
+   };
+ 
+   class HapticEffect : public Output
+@@ -295,9 +326,10 @@ private:
+   class MotionInput : public Input
+   {
+   public:
+-    MotionInput(std::string name, SDL_Gamepad* gc, SDL_SensorType type, int index,
++    MotionInput(std::string name, const InputState& state, std::size_t sensor_slot, int index,
+                 ControlState scale)
+-        : m_name(std::move(name)), m_gc(gc), m_type(type), m_index(index), m_scale(scale)
++        : m_name(std::move(name)), m_state(state), m_sensor_slot(sensor_slot), m_index(index),
++          m_scale(scale)
+     {
+     }
+ 
+@@ -308,67 +340,58 @@ private:
+   private:
+     std::string m_name;
+ 
+-    SDL_Gamepad* const m_gc;
+-    SDL_SensorType const m_type;
++    const InputState& m_state;
++    std::size_t const m_sensor_slot;
+     int const m_index;
+ 
+     ControlState const m_scale;
+   };
+ 
+ public:
+-  Gamepad(SDL_Gamepad* gamepad, SDL_Joystick* joystick);
++  // wake_event_type is a custom SDL event that wakes the SDL thread, so it applies rumble changes.
++  Gamepad(SDL_Gamepad* gamepad, SDL_Joystick* joystick, Uint32 wake_event_type);
+   ~Gamepad() override;
+ 
+   std::string GetName() const override;
+   std::string GetSource() const override;
+   SDL_JoystickID GetSDLInstanceID() const;
+-  Core::DeviceRemoval UpdateInput() override
+-  {
+-    UpdateBatteryLevel();
+ 
+-    // We only support one touchpad and one finger.
+-    const int touchpad_index = 0;
+-    const int finger_index = 0;
++  // Takes the latest state read on the SDL thread. Never waits for SDL.
++  Core::DeviceRemoval UpdateInput() override;
+ 
+-    if (SDL_GetNumGamepadTouchpads(m_gamepad) > touchpad_index &&
+-        SDL_GetNumGamepadTouchpadFingers(m_gamepad, touchpad_index) > finger_index)
+-    {
+-      SDL_GetGamepadTouchpadFinger(m_gamepad, touchpad_index, finger_index, nullptr, &m_touchpad_x,
+-                                   &m_touchpad_y, &m_touchpad_pressure);
+-      m_touchpad_x = m_touchpad_x * 2 - 1;
+-      m_touchpad_y = m_touchpad_y * 2 - 1;
+-    }
+-
+-    return Core::DeviceRemoval::Keep;
+-  }
++  // SDL thread only: read the inputs from SDL, and send rumble changes to the device.
++  void ReadState();
++  void ApplyRumble();
+ 
+ private:
+-  void UpdateRumble()
+-  {
+-    SDL_RumbleGamepad(m_gamepad, m_low_freq_rumble, m_high_freq_rumble, RUMBLE_LENGTH_MS);
+-  }
+-
+-  void UpdateRumbleTriggers()
+-  {
+-    SDL_RumbleGamepadTriggers(m_gamepad, m_trigger_l_rumble, m_trigger_r_rumble, RUMBLE_LENGTH_MS);
+-  }
++  void UpdateRumble();
++  void UpdateRumbleTriggers();
+ 
+-  bool UpdateBatteryLevel();
++  // Reads the battery level into state.battery; false when the device does not report one.
++  bool ReadBatteryLevel(InputState& state) const;
+ 
+-  Uint16 m_low_freq_rumble = 0;
+-  Uint16 m_high_freq_rumble = 0;
++  std::atomic<Uint16> m_low_freq_rumble = 0;
++  std::atomic<Uint16> m_high_freq_rumble = 0;
++  std::atomic<bool> m_rumble_changed = false;
+ 
+-  Uint16 m_trigger_l_rumble = 0;
+-  Uint16 m_trigger_r_rumble = 0;
++  std::atomic<Uint16> m_trigger_l_rumble = 0;
++  std::atomic<Uint16> m_trigger_r_rumble = 0;
++  std::atomic<bool> m_trigger_rumble_changed = false;
+ 
+   SDL_Gamepad* const m_gamepad;
+   std::string m_name;
+   SDL_Joystick* const m_joystick;
+   SDL_Haptic* m_haptic = nullptr;
+-  ControlState m_battery_value;
+-  float m_touchpad_x = 0.f;
+-  float m_touchpad_y = 0.f;
+-  float m_touchpad_pressure = 0.f;
++  Uint32 const m_wake_event_type;
++  std::vector<SDL_SensorType> m_sensor_types;
++
++  // What the inputs read, on the thread that polls them.
++  InputState m_state;
++  // The latest state, written by the SDL thread under m_state_mutex.
++  InputState m_latest_state;
++  // Where the SDL thread reads into, so m_state_mutex is never held while SDL is busy.
++  InputState m_read_state;
++  std::mutex m_state_mutex;
+ };
+ 
+ struct SDLMotionAxis

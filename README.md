@@ -79,6 +79,34 @@ turn them into function names
 with `python -I tools-src\profiling\resolve_report.py <report>`. With the variable unset the
 trace is off and costs next to nothing.
 
+## Profile-guided build
+
+`scripts\train-pgo.ps1` builds an instrumented game module, plays two fight savestates with
+it (`build/states/fight-1v1.sav` and `2v2-special.sav` by default), merges the counts into
+`build/pgo/GNWE69.profdata` and rebuilds the module with them. `scripts\build-module.ps1`
+then uses that profile on every build (`-NoPgo` turns it off). On the development PC this made
+an unthrottled 2v2 fight run about 13% faster, and removed the 30+ ms frames seen in a 2v2
+special move at full speed. Retrain after changing `config/recomp/GNWE69.flags`, dolrecomp
+or the Clang toolchain: the profile only fits the code it was trained on. The profile is
+derived from the game, so it stays in `build/` and is never committed.
+
+## Native regions and twin chunks
+
+Two more of RingOut's recompiler passes are on for this game:
+
+- **Native regions** (`config/recomp/GNWE69.regions`): the hottest guest functions of a 2v2 fight,
+  chiefly the skinning code that blends bone matrices and writes them to the GX FIFO, run as
+  native C with guest registers in C locals and small leaf calls inlined. Patch
+  `0019-region-gather-pipe-stores` keeps their FIFO stores inside the region.
+- **Twin chunks** (`build/pgo/GNWE69.hot`, made by `scripts\train-twin.ps1`): every chunk gets a
+  fast copy entered only at the entry points a training run used, with the ordinary chunk as the
+  fallback for any other entry.
+
+`scripts\build-module.ps1` uses both when their lists exist (`-NoRegions`, `-NoTwin`). Both change
+the generated code, so run `scripts\train-pgo.ps1` after changing either list. On the development
+PC, unthrottled 2v2: 78.6 fps without either or PGO, 84.4 with both, and 96.6 with both plus a
+retrained profile (91.1 with PGO alone).
+
 ## Licence
 
 Project code: GPL-3.0-or-later (to match DolRecomp and ModernGekko). See each submodule
