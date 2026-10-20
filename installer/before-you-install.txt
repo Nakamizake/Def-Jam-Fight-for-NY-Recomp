@@ -32,6 +32,10 @@ Any gamepad works. Esc > CONTROLS > Layout picks how it plays: like the PlayStat
 or GameCube release. On Auto (the default) it follows the pad you use - a DualSense plays
 like the PlayStation 2 release, an Xbox pad like the Xbox one. Menus use the game's own
 buttons: the kick button goes back.
+The keyboard plays too: W A S D move, I punch, J kick, K grapple, L run, E block, Q strong
+attack, Tab target, arrow keys taunt, Enter pause. The button icons in the game show the
+pad or the keys you are using, and switch as soon as you change; Esc > CONTROLS > Button
+icons can keep one style (PlayStation, Xbox, Switch, GameCube, keyboard) or turn them off.
 
 Playing online
 --------------

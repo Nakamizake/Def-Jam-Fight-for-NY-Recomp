@@ -170,6 +170,8 @@ function Get-ModuleBuildJobs {
 #   bindings, so merging keys into a rebound one would scramble it).
 # - Controllers\Layouts\*.ini (the control layouts the in-game menu offers) are copied to
 #   Config\Profiles\GCPad every time, like GameSettings: they are the port's, not the player's.
+# - ButtonIcons\ (the icon targets and glyph art RecompButtonIcons draws from) replaces
+#   Load\ButtonIcons every time, so art removed from the port does not linger.
 function Initialize-UserDirectory {
     param(
         [Parameter(Mandatory)] [string] $UserDir,
@@ -202,6 +204,15 @@ function Initialize-UserDirectory {
         $userLayouts = Join-Path $UserDir 'Config\Profiles\GCPad'
         New-Item -ItemType Directory -Force $userLayouts | Out-Null
         Copy-Item -Path (Join-Path $layouts '*.ini') $userLayouts -Force
+    }
+
+    $icons = Join-Path $ConfigDir 'ButtonIcons'
+    if (Test-Path -LiteralPath (Join-Path $icons 'targets.ini')) {
+        $userIcons = Join-Path $UserDir 'Load\ButtonIcons'
+        if (Test-Path -LiteralPath $userIcons) { Remove-Item -LiteralPath $userIcons -Recurse -Force }
+        New-Item -ItemType Directory -Force $userIcons | Out-Null
+        Copy-Item -LiteralPath (Join-Path $icons 'targets.ini') $userIcons
+        Copy-Item -LiteralPath (Join-Path $icons 'glyphs') $userIcons -Recurse
     }
 }
 

@@ -38,11 +38,12 @@ controller layout, fixes to the stack (as patches), and the build, run and bench
 lib/RingOut/        submodule: RingOut's DolRecomp + ModernGekko, and the game-module CMake project
 patches/RingOut/    local changes to lib/RingOut, applied by build-tools.ps1
 config/             recompiler flags and native regions (recomp/), game settings, default
-                    Dolphin settings and the controller layouts
+                    Dolphin settings, the controller layouts and the button icon art
 scripts/            build, run, benchmark, training and packaging scripts (PowerShell)
 installer/          Windows installer: Inno Setup script, launcher (DefJam.exe) and the
                     script that builds the game on the player's machine
-tools-src/          profiling and diagnostics helpers, and the .viv modding tool (Python)
+tools-src/          profiling and diagnostics helpers, the .viv modding tool (Python) and the
+                    button glyph generator
 docs/               notes, the modding guide and the external-footprint log
 lib/DolRecomp/, lib/ModernGekko/, patches/ModernGekko/, patches/RecompCore/, scripts/run-legacy.ps1
                     the earlier upstream stack, kept for reference only
@@ -199,22 +200,50 @@ a DualSense plays the PlayStation 2 release's layout, an Xbox pad the Xbox relea
 GameCube or Switch pad the GameCube release's. The face buttons sit in the same place on
 all three; the shoulders differ:
 
-| Action | PlayStation | Xbox | GameCube |
-| --- | --- | --- | --- |
-| Punch | Triangle | Y | Y |
-| Kick (and Back in menus) | Square | X | B |
-| Grapple / throw / pick up (and Select) | Cross | A | A |
-| Run | Circle | B | X |
-| Block | R1 | right trigger | R (right trigger) |
-| Strong attack modifier | L1 | left trigger | L (left trigger) |
-| Target (multi-fighter) | R2 / L2 | either bumper | Z (right bumper) |
-| Taunt / Blazin' | right stick | right stick | C-stick |
+| Action | PlayStation | Xbox | GameCube | Keyboard |
+| --- | --- | --- | --- | --- |
+| Move | left stick | left stick | control stick | W A S D |
+| Punch | Triangle | Y | Y | I |
+| Kick (and Back in menus) | Square | X | B | J |
+| Grapple / throw / pick up (and Select) | Cross | A | A | K |
+| Run | Circle | B | X | L |
+| Block | R1 | right trigger | R (right trigger) | E |
+| Strong attack modifier | L1 | left trigger | L (left trigger) | Q |
+| Target (multi-fighter) | R2 / L2 | either bumper | Z (right bumper) | Tab |
+| Taunt / Blazin' | right stick | right stick | C-stick | arrow keys |
+| Pause | Start | Start | Start | Enter |
 
 The layouts are Dolphin pad profiles in `config/Controllers/Layouts/`, copied to
 `userdata/Config/Profiles/GCPad/` each time the game is set up (a profile of your own in
-that folder shows up in the list too). Rebinding a button in the menu switches the layout
-to Custom, which Auto then leaves alone. The bindings in use are in
+that folder shows up in the list too). Every layout also binds the keyboard, by its full
+device name, so it plays alongside any pad. Rebinding a button in the menu switches the
+layout to Custom, which Auto then leaves alone. The bindings in use are in
 `userdata/Config/GCPadNew.ini`.
+
+### Button icons
+
+The game's button icons (the A, B, X, Y, L, R and stick icons in menus, dialogs and the
+tutorial) are redrawn for the controls actually in use: each shows what performs that action
+on player 1's device, in that device's style (PlayStation symbols, Xbox letters, Switch,
+GameCube), and turns into keyboard keys as soon as a bound key is pressed, and back at the
+next pad input. A rebind in the menu shows up in the icons right away.
+
+Esc > CONTROLS > Button icons picks the style: Auto (the above), GameCube, PlayStation, Xbox,
+Switch or Keyboard to always draw that one whatever is plugged in, or Off for the game's own
+icons. A style change shows at once; Off (or back on) takes effect at the next start. The
+choice is `ButtonIcons` under `[RecompMenu]` in `userdata/Config/Dolphin.ini`.
+
+The runtime side is RingOut's `RecompButtonIcons`. What it draws comes from
+`config/ButtonIcons/`, copied to `userdata/Load/ButtonIcons/` each time the game is set up:
+
+- `targets.ini` lists the game textures that show a button: which control each one shows
+  and where the glyph goes (with the lines and tabs some icons carry, redrawn from
+  measurements: nothing from the disc is used);
+- `glyphs/<style>/<input>.png` is the art, one 128x128 image per physical input, drawn by
+  `tools-src/button-icons/make-button-glyphs.ps1` (`-Preview` writes a sheet of all of them
+  to `build/`).
+
+The drawn icons go to `userdata/Cache/ButtonIcons/`.
 
 ## Performance
 

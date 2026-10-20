@@ -10,7 +10,8 @@
       bin\           moderngekko-run.exe, dolrecomp.exe, their MSVC runtime DLLs, Sys\
       toolchain\     llvm-mingw (trimmed, with its Python), CMake and Ninja
       module-src\    RingOut's module CMake project
-      config\        recompiler flags and regions, game settings, first-run defaults
+      config\        recompiler flags and regions, game settings, first-run defaults, layouts
+                     and the button icon art
       setup\         build-game.ps1, GameBuild.psm1 and AutoPlay.psm1 (for -Optimize)
       modding\       viv.py / refpack.py (the .viv archive tool) and the modding guide
       licenses\      licences of everything bundled
@@ -135,6 +136,7 @@ New-Item -ItemType Directory -Force (Join-Path $config 'recomp') | Out-Null
 Copy-Item (Join-Path $repoRoot 'config\recomp\GNWE69.flags'), (Join-Path $repoRoot 'config\recomp\GNWE69.regions') (Join-Path $config 'recomp')
 Copy-Tree (Join-Path $repoRoot 'config\GameSettings') (Join-Path $config 'GameSettings')
 Copy-Tree (Join-Path $repoRoot 'config\Controllers') (Join-Path $config 'Controllers')
+Copy-Tree (Join-Path $repoRoot 'config\ButtonIcons') (Join-Path $config 'ButtonIcons')
 Copy-Item (Join-Path $repoRoot 'config\Dolphin.defaults.ini') $config
 $setup = Join-Path $stage 'setup'
 New-Item -ItemType Directory -Force $setup | Out-Null

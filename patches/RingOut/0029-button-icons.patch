@@ -1,0 +1,1277 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 2522f853..fd6559d2 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -40,6 +40,7 @@
+ #include "InputCommon/InputConfig.h"
+ #include "UICommon/UICommon.h"
+ #include "VideoCommon/PerformanceMetrics.h"
++#include "VideoCommon/RecompButtonIcons.h"
+ #include "VideoCommon/RecompGameData.h"
+ #include "VideoCommon/RecompMenu.h"
+ #include "VideoCommon/RecompMods.h"
+@@ -1464,6 +1465,9 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   RebindPadsToPresentDevices();
+   // After the rebind: Auto picks the layout from the device a port ends up on.
+   RecompPadLayout::ApplyAll();
++  // After the layouts: the icons show what the bindings ended up being. Before the boot: the
++  // texture loader reads the drawn icons when the video backend starts.
++  RecompButtonIcons::Initialize();
+   EnsureAutomationDirectories(impl->config.automation.directory);
+   if (!impl->config.automation.directory.empty()) {
+     for (int port = 0; port < 4; ++port) {
+@@ -1505,6 +1509,7 @@ Runtime::~Runtime() {
+     m_impl->automation_registered = false;
+   }
+   m_impl->state_hook = {};
++  RecompButtonIcons::Shutdown();
+   if (m_impl->controllers_initialized)
+     UICommon::ShutdownControllers();
+   if (m_impl->ui_initialized)
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp b/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp
+index 01dc87bc..7cc73113 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/UICommon/UICommon.cpp
+@@ -6,8 +6,10 @@
+ #include <algorithm>
+ #include <clocale>
+ #include <cmath>
++#include <cstdlib>
+ #include <locale>
+ #include <memory>
++#include <string_view>
+ #ifdef _WIN32
+ #include <shlobj.h>  // for SHGetFolderPath
+ 
+@@ -136,7 +138,11 @@ void Init()
+   };
+   s_config_changed_callback_id = Config::AddConfigChangedCallback(config_changed_callback);
+   Config::AddLayer(ConfigLoaders::GenerateBaseConfigLoader());
+-  Config::SetBaseOrCurrent(Config::GFX_DUMP_TEXTURES, false);
++  // Dumping is never left on from a previous session: it writes a file for every new texture
++  // and slows the game. RINGOUT_DUMP_TEXTURES=1 turns it on for one session (texture modding).
++  const char* const dump_textures = std::getenv("RINGOUT_DUMP_TEXTURES");
++  Config::SetBaseOrCurrent(Config::GFX_DUMP_TEXTURES,
++                           dump_textures != nullptr && std::string_view(dump_textures) == "1");
+   Config::Save();
+   SConfig::Init();
+   g_Config.Init();
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
+index 70873fd9..3f0d09c7 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
+@@ -146,6 +146,8 @@ add_library(videocommon
+   PostProcessing.h
+   Present.cpp
+   Present.h
++  RecompButtonIcons.cpp
++  RecompButtonIcons.h
+   RecompMenu.cpp
+   RecompMenu.h
+   RecompGameData.cpp
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/HiresTextures.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/HiresTextures.cpp
+index 930dadc6..e76c9c63 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/HiresTextures.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/HiresTextures.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "VideoCommon/HiresTextures.h"
+ 
++#include "VideoCommon/RecompButtonIcons.h"
+ #include "VideoCommon/RecompMods.h"
+ 
+ #include <memory>
+@@ -100,6 +101,10 @@ void HiresTexture::Update()
+   // ordered vector instead is what makes "a mod outranks the HD pack" true.
+   std::vector<std::string> texture_directories = RecompMods::EnabledDirectories();
+   const size_t mod_directory_count = texture_directories.size();
++  // The button icons drawn for the player's controls come next: above the HD pack, which only
++  // knows the GameCube's buttons, and below the mods, which the player chose explicitly.
++  if (std::string icons = RecompButtonIcons::TextureDirectory(); !icons.empty())
++    texture_directories.push_back(std::move(icons));
+   texture_directories.insert(texture_directories.end(), pack_directories.begin(),
+                              pack_directories.end());
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompButtonIcons.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompButtonIcons.cpp
+new file mode 100644
+index 00000000..480079cd
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompButtonIcons.cpp
+@@ -0,0 +1,1012 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "VideoCommon/RecompButtonIcons.h"
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++#include <cmath>
++#include <cstdio>
++#include <filesystem>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <span>
++#include <sstream>
++#include <string_view>
++#include <system_error>
++#include <thread>
++#include <utility>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/Buffer.h"
++#include "Common/CommonTypes.h"
++#include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
++#include "Common/HookableEvent.h"
++#include "Common/Image.h"
++#include "Common/IniFile.h"
++#include "Common/StringUtil.h"
++#include "Common/WorkQueueThread.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/HW/GCPad.h"
++#include "Core/Host.h"
++#include "Core/System.h"
++#include "InputCommon/ControlReference/ControlReference.h"
++#include "InputCommon/ControllerEmu/Control/Control.h"
++#include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
++#include "InputCommon/ControllerEmu/ControllerEmu.h"
++#include "InputCommon/ControllerInterface/ControllerInterface.h"
++#include "InputCommon/ControllerInterface/CoreDevice.h"
++#include "InputCommon/InputConfig.h"
++#include "VideoCommon/Resources/CustomResourceManager.h"
++#include "VideoCommon/VideoEvents.h"
++
++namespace RecompButtonIcons
++{
++namespace
++{
++using ButtonLabels = ciface::Core::Device::ButtonLabels;
++
++// The Button icons choice (the CONTROLS tab): Auto, one of the styles below, or Off.
++const Config::Info<std::string> CHOICE{{Config::System::Main, "RecompMenu", "ButtonIcons"},
++                                       std::string(kAuto)};
++
++// Each style the player can force, with the glyphs/ folder it draws from.
++constexpr std::array<std::pair<std::string_view, std::string_view>, 5> kStyles = {{
++    {"GameCube", "gamecube"},
++    {"PlayStation", "playstation"},
++    {"Xbox", "xbox"},
++    {"Switch", "switch"},
++    {"Keyboard", "keyboard"},
++}};
++
++// The glyphs folder a choice forces; empty for Auto (and Off).
++std::string_view GlyphsOf(std::string_view choice)
++{
++  for (const auto& [name, glyphs] : kStyles)
++  {
++    if (name == choice)
++      return glyphs;
++  }
++  return {};
++}
++
++// Icons are drawn at this multiple of the game's own texture size.
++constexpr int kScale = 4;
++// How often (in frames) the bindings and devices are looked at again: cheap, and picks up a
++// rebind in the menu or a pad plugged in without anyone having to tell this module.
++constexpr int kResolveInterval = 30;
++// A stick or trigger counts as used past this; anything less is drift or a resting finger.
++constexpr double kPressed = 0.5;
++constexpr std::string_view kKeyboard = "DInput/0/Keyboard Mouse";
++constexpr std::string_view kManifest = "manifest.txt";
++
++// ---- targets ---------------------------------------------------------------------------------
++
++struct Color
++{
++  float r = 0, g = 0, b = 0;
++};
++
++struct Box
++{
++  int x = 0, y = 0, w = 0, h = 0;
++};
++
++struct Rect
++{
++  Color color;
++  Box box;
++};
++
++struct Target
++{
++  std::string name;    // the texture's Dolphin name
++  std::string button;  // "Buttons/A", "Triggers/L", "Main Stick", ...
++  int width = 0, height = 0;
++  Box glyph;
++  std::optional<std::pair<Color, int>> outline;
++  std::vector<Rect> rects;
++  std::string spec;  // the section as written, so an edit to it redraws the icon
++};
++
++std::optional<Color> ParseColor(std::string_view text)
++{
++  if (text.size() != 7 || text[0] != '#')
++    return std::nullopt;
++  u32 value = 0;
++  if (!TryParse("0x" + std::string(text.substr(1)), &value))
++    return std::nullopt;
++  return Color{((value >> 16) & 0xff) / 255.0f, ((value >> 8) & 0xff) / 255.0f,
++               (value & 0xff) / 255.0f};
++}
++
++std::optional<Box> ParseBox(std::istream& in)
++{
++  Box box;
++  if (!(in >> box.x >> box.y >> box.w >> box.h) || box.w <= 0 || box.h <= 0)
++    return std::nullopt;
++  return box;
++}
++
++std::optional<Target> ParseTarget(const Common::IniFile::Section& section, std::string* error)
++{
++  Target target;
++  target.name = section.GetName();
++  if (std::sscanf(target.name.c_str(), "tex1_%dx%d_", &target.width, &target.height) != 2 ||
++      target.width <= 0 || target.height <= 0)
++  {
++    *error = "not a texture name";
++    return std::nullopt;
++  }
++
++  std::string glyph, outline, rects;
++  section.Get("button", &target.button);
++  section.Get("glyph", &glyph);
++  section.Get("outline", &outline);
++  section.Get("rects", &rects);
++  target.spec = fmt::format("{}|{}|{}|{}", target.button, glyph, outline, rects);
++  if (target.button.empty())
++  {
++    *error = "no button";
++    return std::nullopt;
++  }
++
++  std::istringstream glyph_in(glyph);
++  const std::optional<Box> box = ParseBox(glyph_in);
++  if (!box)
++  {
++    *error = "glyph is not 'x y w h'";
++    return std::nullopt;
++  }
++  target.glyph = *box;
++
++  if (!outline.empty())
++  {
++    std::istringstream in(outline);
++    std::string color;
++    int width = 0;
++    const std::optional<Color> parsed = (in >> color >> width) ? ParseColor(color) : std::nullopt;
++    if (!parsed || width <= 0)
++    {
++      *error = "outline is not '#rrggbb n'";
++      return std::nullopt;
++    }
++    target.outline = std::make_pair(*parsed, width);
++  }
++
++  for (const std::string& item : SplitString(rects, ','))
++  {
++    if (StripWhitespace(item).empty())
++      continue;
++    std::istringstream in(item);
++    std::string color;
++    in >> color;
++    const std::optional<Color> parsed = ParseColor(color);
++    const std::optional<Box> rect_box = ParseBox(in);
++    if (!parsed || !rect_box)
++    {
++      *error = "a rect is not '#rrggbb x y w h'";
++      return std::nullopt;
++    }
++    target.rects.push_back({*parsed, *rect_box});
++  }
++  return target;
++}
++
++std::vector<Target> LoadTargets(const std::string& path)
++{
++  std::vector<Target> targets;
++  Common::IniFile ini;
++  if (!ini.Load(path))
++    return targets;
++  for (const Common::IniFile::Section& section : ini.GetSections())
++  {
++    std::string error;
++    if (std::optional<Target> target = ParseTarget(section, &error))
++      targets.push_back(std::move(*target));
++    else if (!section.GetName().empty())
++      std::fprintf(stderr, "[icons] %s: %s\n", section.GetName().c_str(), error.c_str());
++  }
++  return targets;
++}
++
++// ---- images ----------------------------------------------------------------------------------
++// Premultiplied RGBA in floats while composing: scaling and layering stay free of dark fringes.
++
++struct Layer
++{
++  int width = 0, height = 0;
++  std::vector<float> px;
++
++  Layer() = default;
++  Layer(int w, int h) : width(w), height(h), px(static_cast<size_t>(w) * h * 4, 0.0f) {}
++  float* At(int x, int y) { return &px[(static_cast<size_t>(y) * width + x) * 4]; }
++  const float* At(int x, int y) const { return &px[(static_cast<size_t>(y) * width + x) * 4]; }
++};
++
++// A glyph PNG, cropped to what it actually draws so the box it is fitted into is filled.
++std::optional<Layer> LoadGlyph(const std::string& path)
++{
++  std::string bytes;
++  if (!File::ReadFileToString(path, bytes))
++    return std::nullopt;
++  Common::UniqueBuffer<u8> rgba;
++  u32 width = 0, height = 0;
++  if (!Common::LoadPNG(std::span(reinterpret_cast<const u8*>(bytes.data()), bytes.size()), &rgba,
++                       &width, &height))
++  {
++    return std::nullopt;
++  }
++
++  int left = static_cast<int>(width), top = static_cast<int>(height), right = -1, bottom = -1;
++  for (int y = 0; y < static_cast<int>(height); ++y)
++  {
++    for (int x = 0; x < static_cast<int>(width); ++x)
++    {
++      if (rgba.data()[(static_cast<size_t>(y) * width + x) * 4 + 3] != 0)
++      {
++        left = std::min(left, x);
++        right = std::max(right, x);
++        top = std::min(top, y);
++        bottom = std::max(bottom, y);
++      }
++    }
++  }
++  if (right < left)
++    return std::nullopt;
++
++  Layer layer(right - left + 1, bottom - top + 1);
++  for (int y = 0; y < layer.height; ++y)
++  {
++    for (int x = 0; x < layer.width; ++x)
++    {
++      const u8* in = &rgba.data()[(static_cast<size_t>(y + top) * width + x + left) * 4];
++      float* out = layer.At(x, y);
++      const float a = in[3] / 255.0f;
++      out[0] = in[0] / 255.0f * a;
++      out[1] = in[1] / 255.0f * a;
++      out[2] = in[2] / 255.0f * a;
++      out[3] = a;
++    }
++  }
++  return layer;
++}
++
++// Bilinear, with everything outside the image transparent.
++void Sample(const Layer& src, float u, float v, float* out)
++{
++  const int x0 = static_cast<int>(std::floor(u)), y0 = static_cast<int>(std::floor(v));
++  const float fx = u - x0, fy = v - y0;
++  for (int c = 0; c < 4; ++c)
++    out[c] = 0;
++  for (int dy = 0; dy < 2; ++dy)
++  {
++    for (int dx = 0; dx < 2; ++dx)
++    {
++      const int x = x0 + dx, y = y0 + dy;
++      if (x < 0 || y < 0 || x >= src.width || y >= src.height)
++        continue;
++      const float weight = (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
++      const float* p = src.At(x, y);
++      for (int c = 0; c < 4; ++c)
++        out[c] += p[c] * weight;
++    }
++  }
++}
++
++// Draws `src` scaled into the box at (bx, by) of size (bw, bh), averaging a 4x4 grid of samples
++// per pixel so a 128px glyph shrinks cleanly.
++void DrawScaled(Layer& dst, const Layer& src, float bx, float by, float bw, float bh)
++{
++  constexpr int kGrid = 4;
++  const int x0 = std::max(0, static_cast<int>(std::floor(bx)));
++  const int y0 = std::max(0, static_cast<int>(std::floor(by)));
++  const int x1 = std::min(dst.width, static_cast<int>(std::ceil(bx + bw)));
++  const int y1 = std::min(dst.height, static_cast<int>(std::ceil(by + bh)));
++  for (int y = y0; y < y1; ++y)
++  {
++    for (int x = x0; x < x1; ++x)
++    {
++      float sum[4] = {};
++      for (int sy = 0; sy < kGrid; ++sy)
++      {
++        for (int sx = 0; sx < kGrid; ++sx)
++        {
++          const float px = x + (sx + 0.5f) / kGrid, py = y + (sy + 0.5f) / kGrid;
++          float sample[4];
++          Sample(src, (px - bx) / bw * src.width - 0.5f, (py - by) / bh * src.height - 0.5f,
++                 sample);
++          for (int c = 0; c < 4; ++c)
++            sum[c] += sample[c];
++        }
++      }
++      float* out = dst.At(x, y);
++      for (int c = 0; c < 4; ++c)
++        out[c] = sum[c] / (kGrid * kGrid);
++    }
++  }
++}
++
++void Over(Layer& dst, const Layer& src)
++{
++  for (size_t i = 0; i < dst.px.size(); i += 4)
++  {
++    const float keep = 1 - src.px[i + 3];
++    for (int c = 0; c < 4; ++c)
++      dst.px[i + c] = src.px[i + c] + dst.px[i + c] * keep;
++  }
++}
++
++// A border `radius` pixels wide following the shape of `shape`'s alpha.
++Layer Outline(const Layer& shape, const Color& color, int radius)
++{
++  Layer out(shape.width, shape.height);
++  std::vector<std::pair<int, int>> disc;
++  for (int dy = -radius; dy <= radius; ++dy)
++    for (int dx = -radius; dx <= radius; ++dx)
++      if (dx * dx + dy * dy <= radius * radius + radius)
++        disc.emplace_back(dx, dy);
++
++  for (int y = 0; y < shape.height; ++y)
++  {
++    for (int x = 0; x < shape.width; ++x)
++    {
++      float alpha = 0;
++      for (const auto& [dx, dy] : disc)
++      {
++        const int sx = x + dx, sy = y + dy;
++        if (sx >= 0 && sy >= 0 && sx < shape.width && sy < shape.height)
++          alpha = std::max(alpha, shape.At(sx, sy)[3]);
++      }
++      float* p = out.At(x, y);
++      p[0] = color.r * alpha;
++      p[1] = color.g * alpha;
++      p[2] = color.b * alpha;
++      p[3] = alpha;
++    }
++  }
++  return out;
++}
++
++bool SaveLayer(const Layer& layer, const std::string& path)
++{
++  std::vector<u8> rgba(layer.px.size());
++  for (size_t i = 0; i < layer.px.size(); i += 4)
++  {
++    const float a = layer.px[i + 3];
++    for (int c = 0; c < 3; ++c)
++    {
++      const float straight = a > 0 ? layer.px[i + c] / a : 0;
++      rgba[i + c] = static_cast<u8>(std::clamp(straight, 0.0f, 1.0f) * 255 + 0.5f);
++    }
++    rgba[i + 3] = static_cast<u8>(std::clamp(a, 0.0f, 1.0f) * 255 + 0.5f);
++  }
++  // Written aside and renamed over the old one: the texture loader may be reading it right now.
++  const std::string temporary = path + ".tmp";
++  if (!Common::SavePNG(temporary, rgba.data(), Common::ImageByteFormat::RGBA, layer.width,
++                       layer.height, layer.width * 4, 6))
++  {
++    return false;
++  }
++  for (int attempt = 0; attempt < 10; ++attempt)
++  {
++    if (File::Rename(temporary, path))
++      return true;
++    std::this_thread::sleep_for(std::chrono::milliseconds(20));
++  }
++  File::Delete(temporary);
++  return false;
++}
++
++// ---- composing (worker thread) ---------------------------------------------------------------
++
++// What one icon is drawn from: its glyph file (and that file's age, so regenerated art
++// redraws) and the target's own description.
++std::string Recipe(const Target& target, const std::string& glyph)
++{
++  std::error_code ec;
++  const auto age = std::filesystem::last_write_time(StringToPath(glyph), ec);
++  return fmt::format("{}|{}|{}", glyph, ec ? 0 : age.time_since_epoch().count(), target.spec);
++}
++
++class Composer
++{
++public:
++  explicit Composer(std::string directory) : m_directory(std::move(directory))
++  {
++    std::string manifest;
++    if (!File::ReadFileToString(m_directory + std::string(kManifest), manifest))
++      return;
++    for (const std::string& line : SplitString(manifest, '\n'))
++    {
++      const size_t tab = line.find('\t');
++      if (tab != std::string::npos && File::Exists(m_directory + line.substr(0, tab) + ".png"))
++        m_written.emplace(line.substr(0, tab), line.substr(tab + 1));
++    }
++  }
++
++  // Draws every icon whose recipe changed. `notify` marks the texture for reloading; it is off
++  // at startup, when the loader has not read anything yet.
++  void Compose(const std::vector<Target>& targets, const std::map<std::string, std::string>& plan,
++               bool notify)
++  {
++    bool changed = false;
++    for (const Target& target : targets)
++    {
++      const auto glyph = plan.find(target.name);
++      if (glyph == plan.end())
++        continue;
++      const std::string recipe = Recipe(target, glyph->second);
++      const auto written = m_written.find(target.name);
++      if (written != m_written.end() && written->second == recipe)
++        continue;
++      if (!Draw(target, glyph->second))
++        continue;
++      m_written[target.name] = recipe;
++      changed = true;
++      if (notify)
++        Core::System::GetInstance().GetCustomResourceManager().MarkAssetDirty(target.name);
++    }
++    if (changed)
++      SaveManifest();
++  }
++
++private:
++  const Layer* Glyph(const std::string& path)
++  {
++    auto it = m_glyphs.find(path);
++    if (it == m_glyphs.end())
++      it = m_glyphs.emplace(path, LoadGlyph(path)).first;
++    return it->second ? &*it->second : nullptr;
++  }
++
++  bool Draw(const Target& target, const std::string& glyph_path)
++  {
++    const Layer* const glyph = Glyph(glyph_path);
++    if (glyph == nullptr)
++    {
++      std::fprintf(stderr, "[icons] cannot read %s\n", glyph_path.c_str());
++      return false;
++    }
++
++    Layer canvas(target.width * kScale, target.height * kScale);
++    for (const Rect& rect : target.rects)
++    {
++      const int x1 = std::min(canvas.width, (rect.box.x + rect.box.w) * kScale);
++      const int y1 = std::min(canvas.height, (rect.box.y + rect.box.h) * kScale);
++      for (int y = std::max(0, rect.box.y * kScale); y < y1; ++y)
++      {
++        for (int x = std::max(0, rect.box.x * kScale); x < x1; ++x)
++        {
++          float* p = canvas.At(x, y);
++          p[0] = rect.color.r;
++          p[1] = rect.color.g;
++          p[2] = rect.color.b;
++          p[3] = 1;
++        }
++      }
++    }
++
++    // Fitted into the box, proportions kept, centred.
++    const float box_w = static_cast<float>(target.glyph.w * kScale);
++    const float box_h = static_cast<float>(target.glyph.h * kScale);
++    const float fit = std::min(box_w / glyph->width, box_h / glyph->height);
++    const float w = glyph->width * fit, h = glyph->height * fit;
++    Layer layer(canvas.width, canvas.height);
++    DrawScaled(layer, *glyph, target.glyph.x * kScale + (box_w - w) / 2,
++               target.glyph.y * kScale + (box_h - h) / 2, w, h);
++
++    if (target.outline)
++      Over(canvas, Outline(layer, target.outline->first, target.outline->second * kScale));
++    Over(canvas, layer);
++    if (!SaveLayer(canvas, m_directory + target.name + ".png"))
++    {
++      std::fprintf(stderr, "[icons] cannot write %s\n", target.name.c_str());
++      return false;
++    }
++    return true;
++  }
++
++  void SaveManifest() const
++  {
++    std::string text;
++    for (const auto& [name, recipe] : m_written)
++      text += name + '\t' + recipe + '\n';
++    File::WriteStringToFile(m_directory + std::string(kManifest), text);
++  }
++
++  std::string m_directory;
++  std::map<std::string, std::string> m_written;  // icon -> the recipe its file was drawn from
++  std::map<std::string, std::optional<Layer>> m_glyphs;
++};
++
++// ---- resolving (video thread) ----------------------------------------------------------------
++
++enum class Source
++{
++  Pad,
++  Keyboard,
++};
++
++struct Binding
++{
++  std::string device;  // empty: the port's default device
++  std::string input;
++};
++
++// Every input an expression names, in order: `Button X`, `DInput/0/Keyboard Mouse:J`, and the
++// bare words the expression language also takes for inputs (Start), but not its functions
++// (toggle(...)), variables ($x) or numbers.
++std::vector<Binding> ParseBindings(const std::string& expression)
++{
++  const auto is_word = [](char c) {
++    return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
++  };
++  std::vector<Binding> bindings;
++  size_t pos = 0;
++  while (pos < expression.size())
++  {
++    std::string token;
++    if (expression[pos] == '`')
++    {
++      const size_t end = expression.find('`', pos + 1);
++      if (end == std::string::npos)
++        break;
++      token = expression.substr(pos + 1, end - pos - 1);
++      pos = end + 1;
++    }
++    else if (std::isalpha(static_cast<unsigned char>(expression[pos])) &&
++             (pos == 0 || expression[pos - 1] != '$'))
++    {
++      const size_t start = pos;
++      while (pos < expression.size() && is_word(expression[pos]))
++        ++pos;
++      if (pos < expression.size() && expression[pos] == '(')
++        continue;
++      token = expression.substr(start, pos - start);
++    }
++    else
++    {
++      // Skip a whole variable or number, not just its first character.
++      const bool skip_word = expression[pos] == '$' || is_word(expression[pos]);
++      ++pos;
++      while (skip_word && pos < expression.size() && is_word(expression[pos]))
++        ++pos;
++      continue;
++    }
++    // A qualified input is "<source>/<id>/<name>:<input>".
++    const size_t colon = token.find(':');
++    if (colon != std::string::npos && std::count(token.begin(), token.begin() + colon, '/') >= 2)
++      bindings.push_back({token.substr(0, colon), token.substr(colon + 1)});
++    else
++      bindings.push_back({{}, token});
++  }
++  return bindings;
++}
++
++const char* StyleOf(ButtonLabels labels)
++{
++  switch (labels)
++  {
++  case ButtonLabels::PlayStation:
++    return "playstation";
++  case ButtonLabels::NintendoSwitch:
++    return "switch";
++  case ButtonLabels::GameCube:
++    return "gamecube";
++  default:
++    return "xbox";
++  }
++}
++
++// A pad input's glyph: the face buttons by position (SDL calls them both "Button A" and
++// "Button S"), a whole stick for any of its axes, the d-pad for any direction.
++std::string PadGlyph(std::string_view input)
++{
++  static const std::map<std::string_view, std::string_view> face = {
++      {"Button A", "Button_S"}, {"Button B", "Button_E"}, {"Button X", "Button_W"},
++      {"Button Y", "Button_N"}, {"Button S", "Button_S"}, {"Button E", "Button_E"},
++      {"Button W", "Button_W"}, {"Button N", "Button_N"}};
++  if (const auto it = face.find(input); it != face.end())
++    return std::string(it->second);
++  if (input.starts_with("Left "))
++    return "Left_Stick";
++  if (input.starts_with("Right "))
++    return "Right_Stick";
++  if (input.starts_with("Pad "))
++    return "Pad";
++  std::string name(input);
++  while (!name.empty() && (name.back() == '+' || name.back() == '-'))
++    name.pop_back();
++  std::ranges::replace(name, ' ', '_');
++  return name;
++}
++
++// The GameCube's own button for a target, when nothing else applies.
++std::string DefaultGlyph(std::string_view button)
++{
++  static const std::map<std::string_view, std::string_view> defaults = {
++      {"Buttons/A", "Button_S"},    {"Buttons/B", "Button_W"},   {"Buttons/X", "Button_E"},
++      {"Buttons/Y", "Button_N"},    {"Buttons/Z", "Shoulder_R"}, {"Buttons/Start", "Start"},
++      {"Triggers/L", "Trigger_L"},  {"Triggers/R", "Trigger_R"}, {"Main Stick", "Left_Stick"},
++      {"C-Stick", "Right_Stick"},   {"D-Pad", "Pad"}};
++  const auto it = defaults.find(button);
++  return it != defaults.end() ? std::string(it->second) : std::string();
++}
++
++class Resolver
++{
++public:
++  Resolver(std::string glyph_root) : m_glyph_root(std::move(glyph_root)) {}
++
++  // Reads port 1's bindings and devices; returns false while there is no pad configuration.
++  bool Refresh()
++  {
++    InputConfig* const config = Pad::GetConfig();
++    if (config == nullptr || config->GetControllerCount() == 0)
++      return false;
++    {
++      // The bindings under the pad state lock (the menu may be rebinding); the devices after it,
++      // so the device list's own lock is never taken while holding this one.
++      const auto lock = ControllerEmu::EmulatedController::GetStateLock();
++      ControllerEmu::EmulatedController* const pad = config->GetController(0);
++      m_default = pad->GetDefaultDevice().ToString();
++      m_controls.clear();
++      for (const auto& group : pad->groups)
++        for (const auto& control : group->controls)
++          m_controls[group->name + '/' + control->name] =
++              ParseBindings(control->control_ref->GetExpression());
++    }
++
++    ciface::Core::DeviceQualifier qualifier;
++    qualifier.FromString(m_default);
++    m_pad = IsKeyboard(m_default) ? nullptr : g_controller_interface.FindDevice(qualifier);
++    qualifier.FromString(std::string(kKeyboard));
++    m_keyboard = g_controller_interface.FindDevice(qualifier);
++    m_style = m_pad != nullptr ? StyleOf(m_pad->GetButtonLabels()) : "xbox";
++
++    // Only inputs that drive the game decide which device is in use: Esc opening the menu or
++    // a function key must not turn the icons into keyboard keys.
++    m_pad_inputs.clear();
++    m_keyboard_inputs.clear();
++    for (const auto& [name, bindings] : m_controls)
++    {
++      for (const Binding& binding : bindings)
++      {
++        if (IsOnKeyboard(binding) && m_keyboard != nullptr)
++          Watch(m_keyboard_inputs, *m_keyboard, binding.input);
++        else if (IsOnPad(binding) && m_pad != nullptr)
++          Watch(m_pad_inputs, *m_pad, binding.input);
++      }
++    }
++    return true;
++  }
++
++  bool HasPad() const { return m_pad != nullptr; }
++
++  // Draws the pad's bindings in this style whatever the pad is; empty follows the pad.
++  void ForceStyle(std::string_view style) { m_forced_style = style; }
++
++  // Which device the player is pressing something on right now, if either.
++  std::optional<Source> Active() const
++  {
++    const bool pad = AnyPressed(m_pad_inputs);
++    const bool keyboard = AnyPressed(m_keyboard_inputs);
++    if (pad == keyboard)
++      return std::nullopt;
++    return pad ? Source::Pad : Source::Keyboard;
++  }
++
++  // Target name -> the glyph file to draw it with.
++  std::map<std::string, std::string> Plan(const std::vector<Target>& targets, Source source)
++  {
++    std::map<std::string, std::string> glyph_for_button;
++    std::map<std::string, std::string> plan;
++    for (const Target& target : targets)
++    {
++      auto it = glyph_for_button.find(target.button);
++      if (it == glyph_for_button.end())
++        it = glyph_for_button.emplace(target.button, GlyphFor(target.button, source)).first;
++      if (!it->second.empty())
++        plan.emplace(target.name, it->second);
++    }
++    return plan;
++  }
++
++private:
++  static bool IsKeyboard(std::string_view device) { return device == kKeyboard; }
++
++  bool IsOnKeyboard(const Binding& binding) const
++  {
++    return IsKeyboard(binding.device.empty() ? m_default : binding.device);
++  }
++
++  bool IsOnPad(const Binding& binding) const
++  {
++    return !IsOnKeyboard(binding) && (binding.device.empty() || binding.device == m_default);
++  }
++
++  static void Watch(std::vector<ciface::Core::Device::Input*>& inputs,
++                    const ciface::Core::Device& device, const std::string& name)
++  {
++    if (ciface::Core::Device::Input* const input = device.FindInput(name))
++      inputs.push_back(input);
++  }
++
++  static bool AnyPressed(const std::vector<ciface::Core::Device::Input*>& inputs)
++  {
++    return std::ranges::any_of(inputs, [](auto* input) { return input->GetState() > kPressed; });
++  }
++
++  // The first binding of `control` on the device in use.
++  std::optional<std::string> InputFor(const std::string& control, Source source) const
++  {
++    const auto it = m_controls.find(control);
++    if (it == m_controls.end())
++      return std::nullopt;
++    for (const Binding& binding : it->second)
++    {
++      if (source == Source::Keyboard ? IsOnKeyboard(binding) : IsOnPad(binding))
++        return binding.input;
++    }
++    return std::nullopt;
++  }
++
++  std::string KeyboardGlyph(const std::string& button) const
++  {
++    if (button.find('/') != std::string::npos)
++    {
++      const std::optional<std::string> key = InputFor(button, Source::Keyboard);
++      return key ? Existing("keyboard", *key) : std::string();
++    }
++    // A whole stick: a W A S D or arrow cluster when it is exactly one of those.
++    std::array<std::string, 4> keys;
++    for (size_t i = 0; i < keys.size(); ++i)
++    {
++      const std::optional<std::string> key =
++          InputFor(button + '/' + named_directions[i], Source::Keyboard);
++      keys[i] = key.value_or("");
++    }
++    if (keys == std::array<std::string, 4>{"W", "S", "A", "D"})
++      return Existing("keyboard", "WASD");
++    if (keys == std::array<std::string, 4>{"UP", "DOWN", "LEFT", "RIGHT"})
++      return Existing("keyboard", "ARROWS");
++    return keys[0].empty() ? std::string() : Existing("keyboard", keys[0]);
++  }
++
++  std::string PadGlyphFor(const std::string& button) const
++  {
++    const std::string control =
++        button.find('/') != std::string::npos ? button : button + '/' + named_directions[0];
++    const std::optional<std::string> input = InputFor(control, Source::Pad);
++    const std::string_view style = m_forced_style.empty() ? m_style : m_forced_style;
++    return input ? Existing(style, PadGlyph(*input)) : std::string();
++  }
++
++  // The device in use first; failing that the other one (a hint beats a wrong button); failing
++  // that the GameCube's own.
++  std::string GlyphFor(const std::string& button, Source source)
++  {
++    const bool keyboard = source == Source::Keyboard;
++    std::string glyph = keyboard ? KeyboardGlyph(button) : PadGlyphFor(button);
++    if (glyph.empty())
++      glyph = keyboard ? PadGlyphFor(button) : KeyboardGlyph(button);
++    if (glyph.empty())
++      glyph = Existing("gamecube", DefaultGlyph(button));
++    return glyph;
++  }
++
++  // The glyph file's path, or empty when the art has no such input.
++  std::string Existing(std::string_view style, std::string_view id) const
++  {
++    if (id.empty())
++      return {};
++    std::string path = fmt::format("{}{}/{}.png", m_glyph_root, style, id);
++    auto it = m_exists.find(path);
++    if (it == m_exists.end())
++      it = m_exists.emplace(path, File::Exists(path)).first;
++    return it->second ? path : std::string();
++  }
++
++  std::string m_glyph_root;
++  std::string m_default;
++  const char* m_style = "xbox";
++  std::string_view m_forced_style;
++  std::map<std::string, std::vector<Binding>> m_controls;  // "Buttons/A" -> its bindings
++  std::shared_ptr<ciface::Core::Device> m_pad;
++  std::shared_ptr<ciface::Core::Device> m_keyboard;
++  std::vector<ciface::Core::Device::Input*> m_pad_inputs;
++  std::vector<ciface::Core::Device::Input*> m_keyboard_inputs;
++  mutable std::map<std::string, bool> m_exists;
++};
++
++// ---- state -----------------------------------------------------------------------------------
++
++struct State
++{
++  std::vector<Target> targets;
++  std::string directory;
++  std::unique_ptr<Resolver> resolver;
++  std::shared_ptr<Composer> composer;
++  Common::AsyncWorkThread worker;
++  Common::EventHook frame_hook;
++  Source source = Source::Pad;
++  bool source_forced = false;  // a style was chosen: no following the device in use
++  std::map<std::string, std::string> plan;  // what the worker was last asked to draw
++  int frames = 0;
++};
++
++std::mutex s_mutex;  // guards s_state's existence; the frame hook runs on the video thread
++std::unique_ptr<State> s_state;
++bool s_running = false;  // Initialize found the icons on; Off and On wait for the next start
++
++// Points the resolver and the source at `choice`, the device in use for Auto.
++void ApplyChoice(State& state, std::string_view choice)
++{
++  const std::string_view glyphs = GlyphsOf(choice);
++  state.source_forced = !glyphs.empty();
++  if (glyphs == "keyboard")
++  {
++    state.resolver->ForceStyle({});
++    state.source = Source::Keyboard;
++  }
++  else if (!glyphs.empty())
++  {
++    state.resolver->ForceStyle(glyphs);
++    state.source = Source::Pad;
++  }
++  else
++  {
++    state.resolver->ForceStyle({});
++    state.source = state.resolver->HasPad() ? Source::Pad : Source::Keyboard;
++  }
++}
++
++void Submit(State& state)
++{
++  std::map<std::string, std::string> plan = state.resolver->Plan(state.targets, state.source);
++  if (plan == state.plan)
++    return;
++  state.plan = plan;
++  state.worker.Push([composer = state.composer, targets = state.targets, plan = std::move(plan)] {
++    composer->Compose(targets, plan, true);
++  });
++}
++
++void OnFrame()
++{
++  std::lock_guard lock(s_mutex);
++  if (s_state == nullptr)
++    return;
++  State& state = *s_state;
++
++  bool refresh = ++state.frames % kResolveInterval == 0;
++  if (refresh)
++  {
++    state.resolver->Refresh();
++    if (!state.source_forced && !state.resolver->HasPad())
++      state.source = Source::Keyboard;
++  }
++  // The same rule the game's own input follows: keys typed into another window, or into the
++  // port's menu, are not the player switching devices.
++  const bool listening = !state.source_forced &&
++                         (Config::Get(Config::MAIN_INPUT_BACKGROUND_INPUT) ||
++                          Host_RendererHasFocus()) &&
++                         !Host_UIBlocksControllerState();
++  if (const std::optional<Source> active =
++          listening ? state.resolver->Active() : std::nullopt;
++      active && *active != state.source)
++  {
++    state.source = *active;
++    std::fprintf(stderr, "[icons] %s\n", state.source == Source::Pad ? "pad" : "keyboard");
++    refresh = true;
++  }
++  if (refresh)
++    Submit(state);
++}
++}  // namespace
++
++std::vector<std::string> Choices()
++{
++  std::vector<std::string> choices{std::string(kAuto)};
++  for (const auto& style : kStyles)
++    choices.emplace_back(style.first);
++  choices.emplace_back(kOff);
++  return choices;
++}
++
++std::string GetChoice()
++{
++  const std::string choice = Config::Get(CHOICE);
++  // Older builds stored a plain on/off switch.
++  if (choice == "False" || choice == "false")
++    return std::string(kOff);
++  const std::vector<std::string> choices = Choices();
++  return std::ranges::find(choices, choice) != choices.end() ? choice : std::string(kAuto);
++}
++
++void SetChoice(const std::string& choice)
++{
++  Config::SetBase(CHOICE, choice);
++  std::lock_guard lock(s_mutex);
++  if (s_state == nullptr || choice == kOff)
++    return;
++  ApplyChoice(*s_state, choice);
++  Submit(*s_state);
++}
++
++std::string Describe()
++{
++  const std::string choice = GetChoice();
++  bool running;
++  {
++    std::lock_guard lock(s_mutex);
++    running = s_running;
++  }
++  return running == (choice != kOff) ? choice : choice + " (NEXT START)";
++}
++
++void Initialize()
++{
++  std::lock_guard lock(s_mutex);
++  s_state.reset();
++  s_running = false;
++  const std::string choice = GetChoice();
++  if (choice == kOff)
++    return;
++
++  const std::string root = File::GetUserPath(D_LOAD_IDX) + "ButtonIcons/";
++  auto state = std::make_unique<State>();
++  state->targets = LoadTargets(root + "targets.ini");
++  if (state->targets.empty())
++    return;
++
++  state->directory = File::GetUserPath(D_CACHE_IDX) + "ButtonIcons/";
++  File::CreateFullPath(state->directory);
++  state->resolver = std::make_unique<Resolver>(root + "glyphs/");
++  if (!state->resolver->Refresh())
++    return;
++  ApplyChoice(*state, choice);
++
++  // Drawn right here, before the texture loader first lists the directory; after this only
++  // what changes is redrawn, off the video thread.
++  state->composer = std::make_shared<Composer>(state->directory);
++  state->plan = state->resolver->Plan(state->targets, state->source);
++  state->composer->Compose(state->targets, state->plan, false);
++  std::fprintf(stderr, "[icons] %zu icons, %s, %s\n", state->targets.size(), choice.c_str(),
++               state->source == Source::Pad ? "pad" : "keyboard");
++
++  state->worker.Reset("Button icons");
++  state->frame_hook =
++      GetVideoEvents().after_frame_event.Register([](Core::System&) { OnFrame(); });
++  s_state = std::move(state);
++  s_running = true;
++}
++
++void Shutdown()
++{
++  std::unique_ptr<State> state;
++  {
++    std::lock_guard lock(s_mutex);
++    state = std::move(s_state);
++    s_running = false;
++  }
++  if (state != nullptr)
++  {
++    state->frame_hook.reset();
++    state->worker.Shutdown();
++  }
++}
++
++std::string TextureDirectory()
++{
++  std::lock_guard lock(s_mutex);
++  return s_state != nullptr ? s_state->directory : std::string();
++}
++}  // namespace RecompButtonIcons
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompButtonIcons.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompButtonIcons.h
+new file mode 100644
+index 00000000..3d0c511e
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompButtonIcons.h
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// RingOut: button icons that follow the player's controls.
++//
++// A GameCube game draws GameCube buttons: a green A, a red B. Played on a PlayStation pad, an
++// Xbox pad or the keyboard, and with remappable controls, those icons point at buttons the
++// player does not have. This replaces each icon texture the game lists in
++// Load/ButtonIcons/targets.ini with one drawn for what actually performs that action: the pad
++// control's binding on port 1, in the style of the device in use (glyphs/<style>/<input>.png),
++// switching to the keyboard's keys when a bound key is pressed and back on pad input.
++//
++// The icons are composed into the cache directory and served by the texture loader as custom
++// textures, so they are host-side only: nothing reaches guest RAM, netplay is unaffected.
++
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace RecompButtonIcons
++{
++// The player's CHOICE (Dolphin.ini [RecompMenu] ButtonIcons): kAuto follows the device in use,
++// a style name (GameCube, PlayStation, Xbox, Switch, Keyboard) always draws that one, kOff
++// leaves the game's own icons.
++inline constexpr std::string_view kAuto = "Auto";
++inline constexpr std::string_view kOff = "Off";
++
++// Every choice, in menu order.
++std::vector<std::string> Choices();
++std::string GetChoice();
++// Records the choice in the base config layer (the caller saves the config). A style change
++// shows at once; turning the icons on or off takes effect the next time the game starts, as the
++// texture loader only lists its directories then.
++void SetChoice(const std::string& choice);
++// The choice as the menu shows it, marked when it waits for the next start.
++std::string Describe();
++
++// Reads the targets and composes every icon for the device port 1 is on, then watches for the
++// player switching devices. Call once the pads are configured and before the game boots: the
++// texture loader picks the composed icons up when the video backend starts.
++void Initialize();
++void Shutdown();
++
++// The directory the composed icons are written to; empty while the choice is Off or the game
++// lists no targets.
++std::string TextureDirectory();
++}  // namespace RecompButtonIcons
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+index 2132cf23..0eb0e2b8 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "VideoCommon/RecompMenu.h"
+ 
++#include "VideoCommon/RecompButtonIcons.h"
+ #include "VideoCommon/RecompGameData.h"
+ #include "VideoCommon/RecompMods.h"
+ #include "VideoCommon/RecompPadLayout.h"
+@@ -156,15 +157,16 @@ enum class Tab
+ constexpr int kTabCount = static_cast<int>(Tab::Count);
+ 
+ // The CONTROLS tab's non-binding rows, in on-screen order: which port is being
+-// configured, its backend and device, its control layout, and whether port 2 is
+-// plugged in at all. Rebind rows follow, so they are offset by
+-// kControlsHeaderRows when indexing control_rows.
++// configured, its backend and device, its control layout, the button icons the
++// game draws, and whether port 2 is plugged in at all. Rebind rows follow, so
++// they are offset by kControlsHeaderRows when indexing control_rows.
+ constexpr int kPortRow = 0;
+ constexpr int kBackendRow = 1;
+ constexpr int kDeviceRow = 2;
+ constexpr int kLayoutRow = 3;
+-constexpr int kPort2Row = 4;
+-constexpr int kControlsHeaderRows = 5;
++constexpr int kIconsRow = 4;
++constexpr int kPort2Row = 5;
++constexpr int kControlsHeaderRows = 6;
+ 
+ // SHOTS is a GRID, not a list: a gallery you have to walk one row at a time to
+ // see anything is not a gallery. Left/Right step one image, Up/Down step a whole
+@@ -1907,6 +1909,16 @@ std::string CycleLayout(const LayoutSnapshot& layout, int direction)
+   return options[(index + direction + count) % count];
+ }
+ 
++// Auto, each icon style, then Off.
++std::string CycleIcons(int direction)
++{
++  const std::vector<std::string> options = RecompButtonIcons::Choices();
++  const auto iter = std::ranges::find(options, RecompButtonIcons::GetChoice());
++  const int index = iter == options.end() ? 0 : static_cast<int>(iter - options.begin());
++  const int count = static_cast<int>(options.size());
++  return options[(index + direction + count) % count];
++}
++
+ std::string LayoutLabel(const LayoutSnapshot& layout)
+ {
+   std::string label;
+@@ -2591,6 +2603,7 @@ void OnKey(Key key)
+   bool port2_enabled = false;
+   std::string new_device;
+   std::string new_layout_choice;
++  std::string new_icons_choice;
+   // Set under the lock, acted on after it: removing a file is I/O, and the
+   // video thread blocks on this mutex inside Draw. A save state and a recording
+   // each have a preview beside them, so this is a list rather than one path.
+@@ -2898,6 +2911,10 @@ void OnKey(Key key)
+             new_layout_choice = CycleLayout(s_state.layout, dir);
+             s_state.layout.choice = new_layout_choice;
+           }
++          else if (index == kIconsRow)
++          {
++            new_icons_choice = CycleIcons(dir);
++          }
+           else if (index == kPort2Row)
+           {
+             toggle_port2 = true;
+@@ -2982,6 +2999,10 @@ void OnKey(Key key)
+             new_layout_choice = CycleLayout(s_state.layout, 1);
+             s_state.layout.choice = new_layout_choice;
+           }
++          else if (index == kIconsRow)
++          {
++            new_icons_choice = CycleIcons(1);
++          }
+           else if (index == kPort2Row)
+           {
+             toggle_port2 = true;
+@@ -3196,6 +3217,12 @@ void OnKey(Key key)
+     needs_config_save = true;
+   }
+ 
++  if (!new_icons_choice.empty())
++  {
++    RecompButtonIcons::SetChoice(new_icons_choice);
++    needs_config_save = true;
++  }
++
+   if (changed_pad_control != nullptr)
+   {
+     if (auto* const pad = GetConfiguredPad())
+@@ -3809,6 +3836,7 @@ void Draw()
+       rows.emplace_back("Device", has_device ? DeviceName(s_state.device_current) : "none found",
+                         false);
+       rows.emplace_back("Layout", LayoutLabel(s_state.layout), false);
++      rows.emplace_back("Button icons", RecompButtonIcons::Describe(), false);
+       const bool port2 = Port2Attached();
+       rows.emplace_back("Player 2 pad", port2 ? "ON" : "OFF", port2);
+       for (const auto& row : s_state.control_rows)
+@@ -4248,6 +4276,8 @@ void Draw()
+       hint = "Left/Right switch player   the rows below bind that pad   Esc close";
+     else if (tab == Tab::Controls && selected == kLayoutRow + 1)
+       hint = "Left/Right change   Auto follows the pad   rebinding makes it Custom";
++    else if (tab == Tab::Controls && selected == kIconsRow + 1)
++      hint = "Left/Right change   Auto shows the pad or keys in use   player 1's buttons";
+     else if (tab == Tab::Controls && selected == kPort2Row + 1)
+       hint = "Space toggle   off means one-player only   Esc close";
+     else if (tab == Tab::Controls && selected >= kBackendRow + 1 &&

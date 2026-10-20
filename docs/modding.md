@@ -25,10 +25,20 @@ Replacement textures are Dolphin custom textures: `.png` or `.dds` files named a
 they replace (`tex1_<width>x<height>_<hash>_<format>.png`), anywhere inside the mod folder. They
 switch on and off at once, with no restart.
 
-To find a texture's name, let the game dump the textures it uses: set `DumpTextures = True` under
-`[Settings]` in `userdata/Config/GFX.ini`, play to where the texture appears, then set it back.
-The dumps land in `userdata/Dump/Textures/GNWE69/`; copy the one you want into your mod and edit
-it (a larger image of the same aspect ratio is fine).
+To find a texture's name, let the game dump the textures it uses. Dumping slows the game and is
+never left on between sessions, so it is switched on for one session from the environment: in
+PowerShell, in the game folder, run
+
+```powershell
+$env:RINGOUT_DUMP_TEXTURES = '1'; .\DefJam.exe
+```
+
+(from a clone, `scripts\run.ps1` instead of `.\DefJam.exe`), then play to where the texture
+appears. The dumps land in `userdata/Dump/Textures/GNWE69/`; copy the one you want into your mod
+and edit it (a larger image of the same aspect ratio is fine).
+
+The button icons are drawn by the port itself (see *Button icons* in the README), above the HD
+texture pack and below the mods: a mod that replaces one of them wins.
 
 A loose HD texture pack also works in `userdata/Load/Textures/GNWE69/` (the *HD texture pack*
 row in MODS). Where a mod and the pack replace the same texture, the mod wins; between two mods,
