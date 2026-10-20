@@ -1,0 +1,37 @@
+diff --git a/ModernGekko/src/runtime/diagnostic_reporter.cpp b/ModernGekko/src/runtime/diagnostic_reporter.cpp
+index f173856e..902b1f7a 100644
+--- a/ModernGekko/src/runtime/diagnostic_reporter.cpp
++++ b/ModernGekko/src/runtime/diagnostic_reporter.cpp
+@@ -342,6 +342,10 @@ void DiagnosticReporter::WatchLoop(std::stop_token stop_token) {
+   std::int64_t not_running_until_ns = 0;
+   std::filesystem::path open_stall_report;
+   std::int64_t stalled_frame_ns = 0;
++  // Booting takes longer than a frame gap may: a few thresholds before a frameless boot counts.
++  constexpr std::int64_t kBootStallFactor = 4;
++  std::int64_t first_running_ns = 0;
++  bool boot_stall_reported = false;
+ 
+   while (!stop_token.stop_requested()) {
+     std::this_thread::sleep_for(std::chrono::milliseconds(100));
+@@ -357,8 +361,19 @@ void DiagnosticReporter::WatchLoop(std::stop_token stop_token) {
+       continue;
+     }
+     const std::int64_t last_frame = m_last_new_frame_ns.load(std::memory_order_relaxed);
+-    if (last_frame == 0)
+-      continue;  // still booting: no frame yet
++    if (last_frame == 0) {
++      // Still booting: no frame yet. A boot that never draws one is a stall too (a netplay
++      // peer waiting for input that never comes looks exactly like this), so it gets one
++      // report once the core has run for several thresholds without a frame.
++      if (first_running_ns == 0)
++        first_running_ns = now;
++      const std::int64_t boot_baseline = std::max(first_running_ns, not_running_until_ns);
++      if (!boot_stall_reported && now - boot_baseline >= kBootStallFactor * threshold_ns) {
++        boot_stall_reported = true;
++        WriteReport(Trigger::Stall, (now - first_running_ns) / 1e9);
++      }
++      continue;
++    }
+ 
+     if (!open_stall_report.empty()) {
+       if (last_frame != stalled_frame_ns) {

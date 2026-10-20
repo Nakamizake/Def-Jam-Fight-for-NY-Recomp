@@ -26,6 +26,18 @@ What happens
    in the game folder) makes the game run faster (about 20 minutes). A game window opens
    and plays fights on its own while it measures; your saves and settings are not touched.
 
+Playing online
+--------------
+Esc > System > Netplay. One player picks HOST ONLINE and Start Netplay; the game restarts
+into a lobby that shows a host code (8 characters, with a Copy button) - send it to the
+others. They pick JOIN ONLINE, press Space on Host Code to paste it (or enter it digit by
+digit), then Start Netplay. The host clicks Start game once everyone is in. Both players
+need the same disc (USA) and the same version of this port.
+Windows Firewall asks once whether the game may use the network: allow it (private
+networks are enough), above all on the PC that hosts. The players are introduced through
+Dolphin's public netplay server (stun.dolphin-emu.org), with thanks to the Dolphin team;
+the match itself runs directly between the PCs.
+
 Everything the game writes (saves, settings, shader cache) stays in the install folder.
 Uninstalling removes the game and asks whether to keep your saves and settings.
 

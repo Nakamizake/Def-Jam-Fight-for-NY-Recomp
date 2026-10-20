@@ -158,6 +158,31 @@ the list says what the selected setting does.
 A few settings (renderer, audio output, compile shaders at boot) apply at the next launch;
 the menu says so.
 
+## Netplay
+
+Two to four PCs play one session over Dolphin's netplay (delay-based, both peers run the
+same inputs on the same frame). Set **System > Netplay** and pick *Start Netplay*; the game
+restarts into a lobby, and the host clicks *Start game* once everyone is in.
+
+- **HOST ONLINE / JOIN ONLINE** — over the internet with nothing to set up: the host's
+  lobby shows a *host code* (8 characters, with a Copy button); the others choose JOIN
+  ONLINE and press Space on *Host Code* to paste it (or enter it digit by digit on a pad).
+  The PCs find each other through
+  [Dolphin's traversal server](https://github.com/dolphin-emu/dolphin/tree/master/Source/Core/Common/TraversalServer.cpp)
+  (`stun.dolphin-emu.org`), run by the Dolphin team for Dolphin's own netplay: it only
+  introduces the peers so they can connect through their routers; the match itself goes
+  directly between the PCs. Thanks to the Dolphin project for running it.
+- **HOST / JOIN** — a local network or a VPN: the joiner enters the host's address, or
+  uses *Scan for Hosts* to find it on the same network.
+
+Windows Firewall asks once whether `moderngekko-run.exe` may use the network. Allowing it
+(private networks are enough at home) is what lets others reach a host; JOIN usually works
+either way.
+
+Command line: `--netplay-host-online`, `--netplay-join-code <code>`, `--netplay-host`,
+`--netplay-join <address>`, with `--netplay-port`, `--nickname`, `--buffer` (input delay in
+frames) and `--headless` for scripted sessions (`moderngekko-run.exe --help`).
+
 ## Controls
 
 Any SDL gamepad works; the default layout is the PlayStation 2 release's:

@@ -1,0 +1,761 @@
+diff --git a/ModernGekko/tools/moderngekko_run.cpp b/ModernGekko/tools/moderngekko_run.cpp
+index 753eb2f2..1885c82f 100644
+--- a/ModernGekko/tools/moderngekko_run.cpp
++++ b/ModernGekko/tools/moderngekko_run.cpp
+@@ -47,6 +47,10 @@ void Usage() {
+                "                       pads, menu off, banner over the game\n"
+                "       [--netplay-host | --netplay-join <host>] "
+                "[--netplay-port <port>]\n"
++               "       [--netplay-host-online | --netplay-join-code <code>]\n"
++               "                                 (online through Dolphin's traversal\n"
++               "                                  server: no port to open; the host\n"
++               "                                  is given the code to share)\n"
+                "       [--nickname <name>] [--buffer <auto|1-20>] "
+                "[--controller <device>]...\n"
+                "       [--netplay-players <n>]   (host: machines to wait for, "
+@@ -247,6 +251,7 @@ int RunMain(int argc, char **argv) {
+   std::filesystem::path module_path;
+   std::optional<moderngekko::frontend::NetplayRole> netplay_role;
+   std::string netplay_address;
++  bool netplay_online = false;
+   std::optional<std::uint16_t> netplay_port;
+   std::string netplay_nickname;
+   std::string netplay_buffer;
+@@ -303,7 +308,14 @@ int RunMain(int argc, char **argv) {
+       config.allow_interpreter = true;
+     else if (arg == "--netplay-host")
+       netplay_role = moderngekko::frontend::NetplayRole::Host;
+-    else if (arg == "--netplay-join") {
++    else if (arg == "--netplay-host-online") {
++      netplay_role = moderngekko::frontend::NetplayRole::Host;
++      netplay_online = true;
++    } else if (arg == "--netplay-join-code") {
++      netplay_role = moderngekko::frontend::NetplayRole::Join;
++      netplay_online = true;
++      netplay_address = value("--netplay-join-code");
++    } else if (arg == "--netplay-join") {
+       netplay_role = moderngekko::frontend::NetplayRole::Join;
+       netplay_address = value("--netplay-join");
+     } else if (arg == "--netplay-port") {
+@@ -473,6 +485,7 @@ int RunMain(int argc, char **argv) {
+   if (netplay_role) {
+     moderngekko::frontend::NetplayOptions options;
+     options.role = *netplay_role;
++    options.online = netplay_online;
+     options.address = netplay_address.empty() ? frontend_config.netplay_address
+                                               : netplay_address;
+     options.port = netplay_port.value_or(frontend_config.netplay_port);
+@@ -505,7 +518,9 @@ int RunMain(int argc, char **argv) {
+       std::cerr << "netplay requires at least one selected controller\n";
+       return 2;
+     }
+-    frontend_config.netplay_address = options.address;
++    // A host code is not an address; the saved LAN address stays as it was.
++    if (!options.online)
++      frontend_config.netplay_address = options.address;
+     frontend_config.netplay_port = options.port;
+     frontend_config.netplay_nickname = options.nickname;
+     frontend_config.netplay_buffer = options.buffer;
+@@ -622,6 +637,7 @@ int RunMain(int argc, char **argv) {
+     if (std::filesystem::is_regular_file(request_path, ec)) {
+       std::string mode;
+       std::string address;
++      std::string code;
+       int port = 0;
+       {
+         std::ifstream request(request_path);
+@@ -642,6 +658,8 @@ int RunMain(int argc, char **argv) {
+             mode = value;
+           else if (key == "address")
+             address = value;
++          else if (key == "code")
++            code = value;
+           else if (key == "port")
+             port = std::atoi(value.c_str());
+         }
+@@ -650,18 +668,24 @@ int RunMain(int argc, char **argv) {
+       // user in a relaunch loop with no way back to single player.
+       std::filesystem::remove(request_path, ec);
+ 
+-      if (mode == "host" || mode == "join") {
++      // host/join reach a LAN address; host_online/join_online meet through
++      // the traversal server, the joiner by the host code the host was given.
++      const bool online = mode == "host_online" || mode == "join_online";
++      if (mode == "host" || mode == "join" || online) {
+         created.runtime.reset();   // release the single-runtime guard
+ 
+         moderngekko::frontend::NetplayOptions netplay;
+-        netplay.role = mode == "host"
++        netplay.role = mode == "host" || mode == "host_online"
+                            ? moderngekko::frontend::NetplayRole::Host
+                            : moderngekko::frontend::NetplayRole::Join;
++        netplay.online = online;
+         // The menu writes an address only when joining. Falling back to the
+         // configured one keeps a host request -- and any older request file --
+         // behaving exactly as before.
+         netplay.address =
+             address.empty() ? frontend_config.netplay_address : address;
++        if (mode == "join_online")
++          netplay.address = code;
+         netplay.port = port > 0 ? static_cast<std::uint16_t>(port)
+                                 : frontend_config.netplay_port;
+         netplay.nickname = frontend_config.netplay_nickname;
+@@ -682,7 +706,8 @@ int RunMain(int argc, char **argv) {
+         // time is tolerable once and tedious every launch. A failure here is
+         // not worth refusing the session over -- the address is already in
+         // netplay.address and this session will connect either way.
+-        frontend_config.netplay_address = netplay.address;
++        if (!online)
++          frontend_config.netplay_address = netplay.address;
+         frontend_config.netplay_port = netplay.port;
+         std::string save_error;
+         if (!moderngekko::frontend::SaveConfig(session_config.user_directory,
+diff --git a/ModernGekko/tools/netplay_session.cpp b/ModernGekko/tools/netplay_session.cpp
+index 797d43ac..08a6ae55 100644
+--- a/ModernGekko/tools/netplay_session.cpp
++++ b/ModernGekko/tools/netplay_session.cpp
+@@ -50,6 +50,7 @@
+ #include <imgui_impl_sdlrenderer3.h>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+@@ -225,11 +226,49 @@ public:
+     Log("connection error: " + message);
+   }
+ 
+-  void OnTraversalError(Common::TraversalClient::FailureReason) override {
+-    OnConnectionError("direct connection failed");
++  void OnTraversalError(Common::TraversalClient::FailureReason reason) override {
++    OnConnectionError(TraversalFailureText(reason));
+   }
+ 
+-  void OnTraversalStateChanged(Common::TraversalClient::State) override {}
++  // Online hosting: the traversal server hands out the host code once it has
++  // seen us. Called from the netplay thread; the lobby polls HostCode().
++  void OnTraversalStateChanged(Common::TraversalClient::State state) override {
++    if (!m_hosting || state != Common::TraversalClient::State::Connected ||
++        !Common::g_TraversalClient)
++      return;
++    const Common::TraversalHostId id = Common::g_TraversalClient->GetHostID();
++    std::string code(id.data(), id.size());
++    {
++      std::lock_guard lock(m_mutex);
++      if (code == m_host_code)
++        return;
++      m_host_code = code;
++    }
++    Log("host code: " + code);
++  }
++
++  // Empty until the traversal server has answered (or when not hosting online).
++  std::string HostCode() {
++    std::lock_guard lock(m_mutex);
++    return m_host_code;
++  }
++
++  static std::string TraversalFailureText(Common::TraversalClient::FailureReason reason) {
++    using Reason = Common::TraversalClient::FailureReason;
++    switch (reason) {
++    case Reason::BadHost:
++      return "Could not reach the matchmaking server (Dolphin's traversal server). "
++             "Check the internet connection.";
++    case Reason::VersionTooOld:
++      return "The matchmaking server no longer accepts this version.";
++    case Reason::ServerForgotAboutUs:
++    case Reason::ResendTimeout:
++      return "Lost contact with the matchmaking server. Try again.";
++    case Reason::SocketSendError:
++      return "Could not send to the matchmaking server (blocked by a firewall?).";
++    }
++    return "The matchmaking server reported an error.";
++  }
+ 
+   void OnGameStartAborted() override {
+     {
+@@ -286,6 +325,7 @@ private:
+   std::atomic<u32> m_desync_frame{0};
+   std::unique_ptr<BootSessionData> m_boot_data;
+   std::string m_error;
++  std::string m_host_code;
+ };
+ 
+ // Give every connected player one controller port, lowest player id first, so
+@@ -699,11 +739,27 @@ bool RunLobbyWindow(RuntimeConfig &runtime_config, NetplayOptions &options,
+                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                      ImGuiWindowFlags_NoSavedSettings);
+ 
+-    if (server)
++    if (server && options.online) {
++      // The code is all a friend needs to join; it arrives once the traversal
++      // server has answered, usually well under a second.
++      const std::string code = ui.HostCode();
++      if (code.empty()) {
++        ImGui::TextUnformatted("Connecting to the matchmaking server...");
++      } else {
++        ImGui::Text("Host code: %s", code.c_str());
++        ImGui::SameLine();
++        if (ImGui::Button("Copy"))
++          ImGui::SetClipboardText(code.c_str());
++        ImGui::TextDisabled("Send this code to the players who will join.");
++      }
++    } else if (server) {
+       ImGui::Text("Hosting on port %u", unsigned{server->GetPort()});
+-    else
++    } else if (options.online) {
++      ImGui::Text("Joined host code %s", options.address.c_str());
++    } else {
+       ImGui::Text("Connected to %s:%u", options.address.c_str(),
+                   unsigned{options.port});
++    }
+     ImGui::Separator();
+ 
+     const NetPlay::PadMappingArray &map = client.GetPadMapping();
+@@ -810,6 +866,21 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+   UICommon::SetUserDirectory(runtime_config.user_directory.string());
+   // Opened here, before anything can fail: every line below reaches the file.
+   OpenSessionLog(runtime_config.user_directory);
++
++  if (options.online && options.role == NetplayRole::Join) {
++    const std::string code = NormalizeHostCode(options.address);
++    if (code.empty()) {
++      const std::string reason = "\"" + options.address +
++                                 "\" is not a host code. A host code is 8 characters, "
++                                 "0-9 and a-f, as shown in the host's lobby.";
++      Log(reason);
++      if (!runtime_config.headless)
++        ShowConnectError(runtime_config.window_system, reason, SessionLogPath());
++      return static_cast<int>(NetplayExitCode::InvalidConfiguration);
++    }
++    options.address = code;
++  }
++
+   UICommon::Init();
+   detail::SetExternalUICommon(true);
+ 
+@@ -916,6 +987,14 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+ 
+   SessionUI ui(game);
+   const NetPlay::NetTraversalConfig direct{};
++  // Online sessions meet through Dolphin's traversal server, which tells each
++  // side the other's public address so both can punch through their NAT. The
++  // match itself still runs peer to peer; the server only makes introductions.
++  const NetPlay::NetTraversalConfig online{
++      true, Config::Get(Config::NETPLAY_TRAVERSAL_SERVER),
++      Config::Get(Config::NETPLAY_TRAVERSAL_PORT),
++      Config::Get(Config::NETPLAY_TRAVERSAL_PORT_ALT)};
++  const NetPlay::NetTraversalConfig &traversal = options.online ? online : direct;
+   std::unique_ptr<NetPlay::NetPlayServer> server;
+   std::unique_ptr<NetPlay::NetPlayClient> client;
+ 
+@@ -923,10 +1002,11 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+   // host that already owns it, or retry. Headless keeps the old behaviour --
+   // a script has nobody to ask and wants the exit code.
+   while (options.role == NetplayRole::Host) {
+-    Log("hosting on port " + std::to_string(options.port));
++    Log(options.online ? "hosting online through " + online.traversal_host
++                       : "hosting on port " + std::to_string(options.port));
+     ui.SetHosting(true);
+-    server =
+-        std::make_unique<NetPlay::NetPlayServer>(options.port, false, &ui, direct);
++    server = std::make_unique<NetPlay::NetPlayServer>(options.port, false, &ui,
++                                                      traversal);
+     if (server->is_connected)
+       break;
+ 
+@@ -972,9 +1052,12 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+     client = std::make_unique<NetPlay::NetPlayClient>(
+         "127.0.0.1", server->GetPort(), &ui, options.nickname, direct);
+   } else {
+-    Log("connecting to " + options.address + ":" + std::to_string(options.port));
++    Log(options.online ? "joining host code " + options.address + " through " +
++                             online.traversal_host
++                       : "connecting to " + options.address + ":" +
++                             std::to_string(options.port));
+     client = std::make_unique<NetPlay::NetPlayClient>(
+-        options.address, options.port, &ui, options.nickname, direct);
++        options.address, options.port, &ui, options.nickname, traversal);
+   }
+ 
+   if (!client->IsConnected()) {
+@@ -990,9 +1073,12 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+     // there wondering why nothing happened.
+     if (!runtime_config.headless) {
+       ShowConnectError(runtime_config.window_system,
+-                       error.empty() ? "The host did not respond. Check the address, the port, "
+-                                       "and that the host has started the session."
+-                                     : error,
++                       !error.empty() ? error
++                       : options.online
++                           ? "The host did not respond. Check the host code, and that the "
++                             "host is still waiting in the lobby."
++                           : "The host did not respond. Check the address, the port, "
++                             "and that the host has started the session.",
+                        SessionLogPath());
+     }
+     client.reset();
+@@ -1196,4 +1282,22 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+   UICommon::Shutdown();
+   return result;
+ }
++
++std::string NormalizeHostCode(std::string_view text) {
++  const auto first = text.find_first_not_of(" \t\r\n");
++  const auto last = text.find_last_not_of(" \t\r\n");
++  if (first == std::string_view::npos)
++    return {};
++  text = text.substr(first, last - first + 1);
++  if (text.size() != Common::NETPLAY_CODE_SIZE)
++    return {};
++  std::string code;
++  for (const char c : text) {
++    const char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    if (!std::isxdigit(static_cast<unsigned char>(lower)))
++      return {};
++    code += lower;
++  }
++  return code;
++}
+ } // namespace moderngekko::frontend
+diff --git a/ModernGekko/tools/netplay_session.hpp b/ModernGekko/tools/netplay_session.hpp
+index a7f734e0..2b897f60 100644
+--- a/ModernGekko/tools/netplay_session.hpp
++++ b/ModernGekko/tools/netplay_session.hpp
+@@ -5,6 +5,7 @@
+ 
+ #include <cstdint>
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ namespace moderngekko::frontend {
+@@ -27,6 +28,9 @@ enum class NetplayExitCode {
+ 
+ struct NetplayOptions {
+   NetplayRole role = NetplayRole::Join;
++  // Online: meet through Dolphin's traversal server instead of a direct address, so no port
++  // has to be opened. The host is given a host code; a joiner puts that code in `address`.
++  bool online = false;
+   std::string address = "127.0.0.1";
+   std::uint16_t port = 2626;
+   std::string nickname = "Player";
+@@ -42,4 +46,8 @@ struct NetplayOptions {
+ 
+ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+                     NetplayOptions options);
++
++// A host code as the traversal server issues it: 8 lowercase hex digits. Accepts
++// the code as people paste it (spaces around it, upper case); empty if it is not one.
++std::string NormalizeHostCode(std::string_view text);
+ } // namespace moderngekko::frontend
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/NetPlay/NetPlayClient.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/NetPlay/NetPlayClient.cpp
+index ea1ef3c3..6f5e6ddd 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/NetPlay/NetPlayClient.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/NetPlay/NetPlayClient.cpp
+@@ -234,7 +234,9 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
+       if (connect_timer.ElapsedMs() > 5000)
+         break;
+     }
+-    m_dialog->OnConnectionError(_trans("Could not communicate with host."));
++    // A traversal failure has already told the dialog why; this generic line would replace it.
++    if (m_connection_state != ConnectionState::Failure)
++      m_dialog->OnConnectionError(_trans("Could not communicate with host."));
+   }
+ }
+ 
+@@ -1422,19 +1424,26 @@ void NetPlayClient::OnConnectFailed(Common::TraversalConnectFailedReason reason)
+ {
+   m_connecting = false;
+   m_connection_state = ConnectionState::Failure;
++  // Reported through the dialog rather than a panic alert: the front end shows it in its own
++  // error screen, and a modal alert would block a headless session.
+   switch (reason)
+   {
+   case Common::TraversalConnectFailedReason::ClientDidntRespond:
+-    PanicAlertFmtT("Traversal server timed out connecting to the host");
++    m_dialog->OnConnectionError(
++        _trans("The host did not answer through the matchmaking server. It may have closed "
++               "the lobby, or a firewall may be blocking it."));
+     break;
+   case Common::TraversalConnectFailedReason::ClientFailure:
+-    PanicAlertFmtT("Server rejected traversal attempt");
++    m_dialog->OnConnectionError(_trans("The matchmaking server rejected the connection."));
+     break;
+   case Common::TraversalConnectFailedReason::NoSuchClient:
+-    PanicAlertFmtT("Invalid host");
++    m_dialog->OnConnectionError(
++        _trans("No game is waiting with that host code. Check the code, and that the host is "
++               "still in the lobby."));
+     break;
+   default:
+-    PanicAlertFmtT("Unknown error {0:x}", static_cast<int>(reason));
++    m_dialog->OnConnectionError(
++        fmt::format("The matchmaking server reported error {0:x}.", static_cast<int>(reason)));
+     break;
+   }
+ }
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+index bbe17b90..e6a24cf6 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+@@ -23,6 +23,7 @@
+ #include <mutex>
+ #include <optional>
+ #include <string>
++#include <string_view>
+ #include <thread>
+ #include <tuple>
+ #include <utility>
+@@ -126,6 +127,7 @@ enum class Item
+   NetplayMode,
+   NetplayScan,
+   NetplayAddress,
++  NetplayCode,
+   NetplayPort,
+   NetplayStart,
+   Reset,
+@@ -242,6 +244,7 @@ const std::vector<Item>& TabItems(Tab tab)
+                                            Item::NetplayMode,
+                                            Item::NetplayScan,
+                                            Item::NetplayAddress,
++                                           Item::NetplayCode,
+                                            Item::NetplayPort,  Item::NetplayStart,
+                                            Item::Apply,        Item::Reset,
+                                            Item::Quit};
+@@ -440,7 +443,8 @@ struct State
+   // NetPlay_Enable happens inside NetPlayClient::StartGame, so entering a
+   // session means starting one from scratch. These rows therefore compose a
+   // request, and Start writes it out and quits -- the runner picks it up and
+-  // brings up the lobby. 0 = off, 1 = host, 2 = join.
++  // brings up the lobby. 0 = off, 1 = host, 2 = join, 3 = host online, 4 = join
++  // online (both through Dolphin's traversal server, which hands the host a code).
+   int netplay_mode = 0;
+   int netplay_port = 2626;
+   // 0 = off, 1 = record the next session, 2 = play one back. Like netplay,
+@@ -506,6 +510,13 @@ struct State
+   int netplay_addr_run = 0;
+   int netplay_addr_run_dir = 0;
+ 
++  // The host code to join online: 8 hex digits, as the host's lobby shows it.
++  // Space on the row pastes one from the clipboard when it holds one (the usual
++  // way it arrives, through a chat); otherwise it starts a digit edit that works
++  // like the octet editor, for a pad with no clipboard behind it. -1 = not editing.
++  std::array<int, 8> netplay_code = {};
++  int netplay_code_digit = -1;
++
+   // Row 0 is always the tab selector; rows 1.. are that tab's entries.
+   Tab tab = Tab::System;
+   std::vector<ControlRow> control_rows;
+@@ -1089,6 +1100,8 @@ const char* ItemLabel(Item item)
+     return "Scan for Hosts";
+   case Item::NetplayAddress:
+     return "Join Address";
++  case Item::NetplayCode:
++    return "Host Code";
+   case Item::NetplayPort:
+     return "Netplay Port";
+   case Item::NetplayStart:
+@@ -1445,13 +1458,53 @@ std::string FormatAddress(const std::array<int, 4>& addr, int editing_octet)
+   return out;
+ }
+ 
++// The code as hex text, and while it is being edited the live digit marked with
++// >< the way FormatAddress marks an octet.
++std::string FormatHostCode(const std::array<int, 8>& code, int editing_digit)
++{
++  static constexpr char kHex[] = "0123456789abcdef";
++  std::string out;
++  for (int i = 0; i < static_cast<int>(code.size()); ++i)
++  {
++    if (i == editing_digit)
++      out += '>';
++    out += kHex[code[i] & 0xf];
++    if (i == editing_digit)
++      out += '<';
++  }
++  return out;
++}
++
++// True when the text is a host code (spaces around it and upper case allowed, as
++// people paste it), in which case its digits are filled in.
++bool ParseHostCode(std::string_view text, std::array<int, 8>* code)
++{
++  const auto first = text.find_first_not_of(" \t\r\n");
++  if (first == std::string_view::npos)
++    return false;
++  text = text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
++  if (text.size() != code->size())
++    return false;
++  std::array<int, 8> digits{};
++  for (size_t i = 0; i < text.size(); ++i)
++  {
++    const unsigned char c = static_cast<unsigned char>(text[i]);
++    if (!std::isxdigit(c))
++      return false;
++    digits[i] = std::isdigit(c) ? c - '0' : std::tolower(c) - 'a' + 10;
++  }
++  *code = digits;
++  return true;
++}
++
+ std::string ItemValue(Item item, int state_slot, int netplay_mode,
+                       int netplay_port, const std::string& netplay_addr_text,
+                       const std::array<int, 4>& netplay_addr,
+                       int netplay_addr_octet,
+                       const std::vector<State::FoundHost>& netplay_hosts,
+                       int netplay_host_index, bool netplay_scanning,
+-                      bool netplay_scanned)
++                      bool netplay_scanned, const std::array<int, 8>& netplay_code,
++                      int netplay_code_digit)
+ {
+   switch (item)
+   {
+@@ -1462,6 +1515,10 @@ std::string ItemValue(Item item, int state_slot, int netplay_mode,
+       return "HOST";
+     case 2:
+       return "JOIN";
++    case 3:
++      return "HOST ONLINE";
++    case 4:
++      return "JOIN ONLINE";
+     default:
+       return "OFF";
+     }
+@@ -1501,8 +1558,16 @@ std::string ItemValue(Item item, int state_slot, int netplay_mode,
+     return netplay_addr_octet >= 0
+                ? FormatAddress(netplay_addr, netplay_addr_octet)
+                : netplay_addr_text;
++  case Item::NetplayCode:
++    // The host is given its code by the traversal server once the lobby is up.
++    if (netplay_mode == 3)
++      return "IN LOBBY";
++    if (netplay_mode != 4)
++      return "-";
++    return FormatHostCode(netplay_code, netplay_code_digit);
+   case Item::NetplayPort:
+-    return netplay_mode == 0 ? "-" : std::to_string(netplay_port);
++    // An online joiner dials a code, not a port.
++    return netplay_mode == 0 || netplay_mode == 4 ? "-" : std::to_string(netplay_port);
+   case Item::NetplayStart:
+     // Short enough to FIT: the value column is only 110*scale wide, and the
+     // full sentence was clipped mid-word ("OFF - GAME DATA MO") against the
+@@ -1954,7 +2019,7 @@ bool AdjustItem(Item item, int direction, State& state)
+     break;
+   }
+   case Item::NetplayMode:
+-    state.netplay_mode = std::clamp(state.netplay_mode + direction, 0, 2);
++    state.netplay_mode = std::clamp(state.netplay_mode + direction, 0, 4);
+     break;
+   case Item::NetplayPort:
+     // Ports are not worth paging one at a time; step by 1 and let the value
+@@ -2248,15 +2313,21 @@ void QuitOnceResumed(const std::function<void()>& quit_callback)
+ // process's emulation session: the core is torn down, then the runner reads
+ // this, deletes it, and brings up the lobby. Netplay cannot be entered in
+ // place -- the lobby runs before the core boots.
+-bool WriteNetplayRequest(int mode, int port, const std::string& addr)
++bool WriteNetplayRequest(int mode, int port, const std::string& addr,
++                         const std::string& code)
+ {
++  static constexpr const char* kModes[] = {"off", "host", "join", "host_online", "join_online"};
++  if (mode < 1 || mode > 4)
++    return false;
+   const std::string path = File::GetUserPath(D_USER_IDX) + "netplay-request.ini";
+   std::ofstream out(path, std::ios::trunc);
+   if (!out)
+     return false;
+   out << "[Netplay]\n"
+-      << "mode = " << (mode == 1 ? "host" : "join") << '\n'
++      << "mode = " << kModes[mode] << '\n'
+       << "port = " << port << '\n';
++  if (mode == 4)
++    out << "code = " << code << '\n';
+   // Only meaningful to a joiner, and writing it unconditionally would let a
+   // stale address from an earlier join override the host path's own settings.
+   // Empty is left out entirely so the runner falls back to the configured one
+@@ -2267,7 +2338,8 @@ bool WriteNetplayRequest(int mode, int port, const std::string& addr)
+   return static_cast<bool>(out);
+ }
+ 
+-Action DecideAction(Item item, State& state, bool* needs_config_save)
++Action DecideAction(Item item, State& state, const std::string& clipboard,
++                    bool* needs_config_save)
+ {
+   switch (item)
+   {
+@@ -2300,6 +2372,12 @@ Action DecideAction(Item item, State& state, bool* needs_config_save)
+       state.netplay_addr_text = PlainAddress(state.netplay_addr);
+     }
+     return Action::None;
++  case Item::NetplayCode:
++    // A code on the clipboard is taken as is; without one, Space starts a digit
++    // edit (Space again ends it). Inert unless joining online.
++    if (state.netplay_mode == 4 && !ParseHostCode(clipboard, &state.netplay_code))
++      state.netplay_code_digit = 0;
++    return Action::None;
+   case Item::NetplayStart:
+     // Patched game data desyncs against an unmodified peer, so the session is
+     // refused HERE rather than at connect: starting it costs a restart of the
+@@ -2380,6 +2458,7 @@ void Toggle()
+     s_state.netplay_addr_octet = -1;
+     s_state.netplay_addr_run = 0;
+     s_state.netplay_addr_run_dir = 0;
++    s_state.netplay_code_digit = -1;
+   }
+ 
+   // Escape pauses. The pause itself is handed to the worker thread -- doing it
+@@ -2418,6 +2497,7 @@ void OnKey(Key key)
+   int netplay_mode_snapshot = 0;
+   int netplay_port_snapshot = 2626;
+   std::string netplay_addr_snapshot = "127.0.0.1";
++  std::string netplay_code_snapshot;
+   std::string replay_file_snapshot;
+   int resolution_to_persist = -1;
+ 
+@@ -2458,6 +2538,17 @@ void OnKey(Key key)
+   // outlives the lock and callbacks defer until the mutex is long released.
+   const Config::ConfigChangeCallbackGuard config_callback_guard;
+ 
++  // Read before taking the mutex, like any other I/O here: Space on the host code
++  // row pastes a code from the system clipboard. ImGui reaches the Windows
++  // clipboard; elsewhere it only holds what ImGui itself copied, and the row
++  // falls back to its digit editor.
++  std::string clipboard;
++  if (key == Key::Activate)
++  {
++    if (const char* text = ImGui::GetCurrentContext() ? ImGui::GetClipboardText() : nullptr)
++      clipboard.assign(text, strnlen(text, 64));
++  }
++
+   {
+     std::lock_guard<std::mutex> guard(s_state.mutex);
+     if (!s_state.open)
+@@ -2569,6 +2660,44 @@ void OnKey(Key key)
+         }
+       }
+ 
++      // The host code edit takes over the arrows the same way.
++      if (s_state.netplay_code_digit >= 0)
++      {
++        const auto& items = TabItems(s_state.tab);
++        const bool on_code_row =
++            index < static_cast<int>(items.size()) && items[index] == Item::NetplayCode;
++        if (on_code_row)
++        {
++          address_edit_consumed_key = true;
++          const int digits = static_cast<int>(s_state.netplay_code.size());
++          switch (key)
++          {
++          case Key::Left:
++            s_state.netplay_code_digit = (s_state.netplay_code_digit + digits - 1) % digits;
++            break;
++          case Key::Right:
++            s_state.netplay_code_digit = (s_state.netplay_code_digit + 1) % digits;
++            break;
++          case Key::Up:
++          case Key::Down:
++          {
++            int& digit = s_state.netplay_code[s_state.netplay_code_digit];
++            digit = (digit + (key == Key::Up ? 1 : 15)) % 16;
++            break;
++          }
++          case Key::Activate:
++            s_state.netplay_code_digit = -1;
++            break;
++          case Key::Delete:
++            break;
++          }
++        }
++        else
++        {
++          s_state.netplay_code_digit = -1;
++        }
++      }
++
+       // The address lives in the request file and is persisted by the runner,
+       // not in Dolphin's Config, so editing it never sets needs_config_save.
+       // Any movement disarms a pending delete: an arm that survived being
+@@ -2818,7 +2947,7 @@ void OnKey(Key key)
+         {
+           const auto& items = TabItems(s_state.tab);
+           if (index < static_cast<int>(items.size()))
+-            action = DecideAction(items[index], s_state, &needs_config_save);
++            action = DecideAction(items[index], s_state, clipboard, &needs_config_save);
+         }
+         break;
+       }
+@@ -2830,6 +2959,7 @@ void OnKey(Key key)
+     netplay_mode_snapshot = s_state.netplay_mode;
+     netplay_port_snapshot = s_state.netplay_port;
+     netplay_addr_snapshot = s_state.netplay_addr_text;
++    netplay_code_snapshot = FormatHostCode(s_state.netplay_code, -1);
+     resolution_to_persist = s_state.pending_resolution_scale;
+     s_state.pending_resolution_scale = -1;
+   }
+@@ -3043,7 +3173,7 @@ void OnKey(Key key)
+     if (!quit_callback)
+       break;
+     if (!WriteNetplayRequest(netplay_mode_snapshot, netplay_port_snapshot,
+-                             netplay_addr_snapshot))
++                             netplay_addr_snapshot, netplay_code_snapshot))
+     {
+       std::fprintf(stderr, "[netplay] could not write the request file\n");
+       break;
+@@ -3200,6 +3330,11 @@ void OnEscape()
+         s_state.netplay_addr_run_dir = 0;
+         return;
+       }
++      if (s_state.netplay_code_digit >= 0)
++      {
++        s_state.netplay_code_digit = -1;
++        return;
++      }
+       // Tabs are switched in place, so Escape always just closes the menu.
+     }
+   }
+@@ -3522,6 +3657,8 @@ void Draw()
+   int state_slot;
+   bool detecting;
+   bool editing_address = false;
++  bool editing_code = false;
++  bool on_join_code_row = false;
+   bool cheats_enabled = false;
+   // What the selected row is a picture of, if anything. Chosen here so the
+   // draw side never reaches back into the state to ask.
+@@ -3548,6 +3685,13 @@ void Draw()
+         s_state.delete_armed >= 0 && s_state.delete_armed_tab == s_state.tab &&
+         s_state.delete_armed == s_state.selected - 1;
+     editing_address = s_state.netplay_addr_octet >= 0;
++    editing_code = s_state.netplay_code_digit >= 0;
++    if (tab == Tab::System && selected >= 1 && s_state.netplay_mode == 4)
++    {
++      const auto& items = TabItems(tab);
++      on_join_code_row = selected - 1 < static_cast<int>(items.size()) &&
++                         items[selected - 1] == Item::NetplayCode;
++    }
+     applied_now = std::chrono::steady_clock::now() < s_state.applied_until;
+ 
+     switch (tab)
+@@ -3702,7 +3846,9 @@ void Draw()
+                                     s_state.netplay_hosts,
+                                     s_state.netplay_host_index,
+                                     s_state.netplay_scanning,
+-                                    s_state.netplay_scanned),
++                                    s_state.netplay_scanned,
++                                    s_state.netplay_code,
++                                    s_state.netplay_code_digit),
+                           false);
+       break;
+     }
+@@ -3959,6 +4105,10 @@ void Draw()
+       hint = "Press a key or button...   Esc cancel";
+     else if (editing_address)
+       hint = "Left/Right octet   Up/Down value   Space done";
++    else if (editing_code)
++      hint = "Left/Right digit   Up/Down value   Space done";
++    else if (on_join_code_row)
++      hint = "Space paste the code (or edit it if none is copied)   Esc close";
+     else if (tab_focused)
+       hint = "Left/Right switch tab   Down enter list   Enter select   Esc close";
+     else if (tab == Tab::Controls && selected == kPortRow + 1)

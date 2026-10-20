@@ -5,7 +5,19 @@ Keep this file up to date whenever something new is installed or written elsewhe
 
 ## Outside the repository
 
-None so far.
+Nothing written by the project itself. One thing can appear through Windows:
+
+- **Windows Firewall rules for `moderngekko-run.exe`**, created only if someone clicks
+  *Allow* on the firewall prompt that netplay raises (it listens on UDP 2626 by default).
+  Each build folder is its own program to the firewall (`build\runtime\`,
+  `build\runtime-prof\`, an install folder), so each asks once. Remove them under Windows
+  Security > Firewall & network protection > Allow an app through firewall, or with
+  `Get-NetFirewallApplicationFilter -Program '*moderngekko-run.exe' | Get-NetFirewallRule`
+  (deleting needs administrator rights). Clicking *Cancel* creates block rules for the
+  same program, removed the same way.
+
+Online netplay (HOST ONLINE / JOIN ONLINE) contacts Dolphin's traversal server,
+`stun.dolphin-emu.org` (UDP 6262/6226); it stores nothing on the PC.
 
 Tools already present on the machine and reused (not installed by this project):
 

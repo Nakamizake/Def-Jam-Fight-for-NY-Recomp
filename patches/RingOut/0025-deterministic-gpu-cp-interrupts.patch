@@ -1,0 +1,19 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
+index 6c852d88..af2ab73c 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CommandProcessor.cpp
+@@ -524,7 +524,13 @@ void CommandProcessorManager::SetCPStatusFromGPU()
+   if (interrupt != m_interrupt_set.IsSet() && !m_interrupt_waiting.IsSet())
+   {
+     const u64 userdata = interrupt ? 1 : 0;
+-    if (IsOnThread(m_system))
++    // With a deterministic GPU thread the FIFO is read on the CPU thread (RunGpuOnCpu), so this
++    // runs there and raises the interrupt directly, as in single-core. The asynchronous path
++    // would not work: UpdateInterruptsFromVideoBackend schedules nothing in that mode, so
++    // m_interrupt_waiting stayed set and this and every later CP interrupt was dropped. A game
++    // that waits on a FIFO breakpoint at the end of each frame (Def Jam: Fight for NY) then never
++    // drew its first frame in netplay.
++    if (IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
+     {
+       if (!interrupt || bpInt || undfInt || ovfInt)
+       {
