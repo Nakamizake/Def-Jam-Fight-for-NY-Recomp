@@ -61,6 +61,10 @@ param(
     # the waits the emulator's threads were in around it (RINGOUT_HITCH_TRACE), to
     # build/bench/<Label>/hitch-*.txt. 0 = off.
     [int] $HitchTraceMs = 0,
+    # Logs every video field (host and emulated time, plus these guest words) and every
+    # presented frame to build/bench/<Label>/frame-probe-*.csv (RINGOUT_FRAME_PROBE), e.g.
+    # -FrameProbe 'f32:80440B94' to see how evenly a game clock advances; 'on' for no words.
+    [string] $FrameProbe = '',
     # Extracted game directory override, passed to run.ps1.
     [string] $GameRoot = '',
     # Directory for the files the run writes while the game plays (automation commands and
@@ -76,6 +80,8 @@ param(
     # Extra Dolphin.ini values for this run only, as 'Section.Key=Value', e.g.
     # -Setting 'DSP.DumpAudio=True','Core.DSPHLE=False'. Only the bench copy is changed.
     [string[]] $Setting = @(),
+    # The same for GFX.ini, e.g. -GfxSetting 'Settings.InternalResolution=1'.
+    [string[]] $GfxSetting = @(),
     # Starts with an empty shader cache, so every new shader stalls the GPU thread the way
     # a player's first visit to a scene does.
     [switch] $ColdShaderCache
@@ -182,9 +188,12 @@ if (-not $Sound) {
     $text = if (Test-Path $benchIni) { [IO.File]::ReadAllText($benchIni) } else { $null }
     [IO.File]::WriteAllText($benchIni, (Set-IniValue $text 'DSP' 'Volume' '0'), [Text.UTF8Encoding]::new($false))
 }
-foreach ($entry in $Setting) {
+$iniEntries = @($Setting | ForEach-Object { @{ File = 'Dolphin.ini'; Entry = $_ } }) +
+    @($GfxSetting | ForEach-Object { @{ File = 'GFX.ini'; Entry = $_ } })
+foreach ($item in $iniEntries) {
+    $entry = $item.Entry
     if ($entry -notmatch '^([^.=]+)\.([^=]+)=(.*)$') { throw "-Setting '$entry' is not Section.Key=Value" }
-    $benchIni = Join-Path $userDir 'Config\Dolphin.ini'
+    $benchIni = Join-Path $userDir "Config\$($item.File)"
     $text = if (Test-Path $benchIni) { [IO.File]::ReadAllText($benchIni) } else { $null }
     [IO.File]::WriteAllText($benchIni, (Set-IniValue $text $Matches[1] $Matches[2] $Matches[3]),
         [Text.UTF8Encoding]::new($false))
@@ -219,9 +228,16 @@ $logFile = Join-Path $benchDir "$Label.log"
 # A game the player already has open is not ours to close at the end.
 $preexistingGames = @(Get-Process moderngekko-run -ErrorAction SilentlyContinue | ForEach-Object Id)
 if ($HitchTraceMs -gt 0) { $env:RINGOUT_HITCH_TRACE = $HitchTraceMs }  # inherited by the runtime
+if ($FrameProbe) {
+    # Only this run's log gets copied out at the end.
+    Get-ChildItem (Join-Path $userDir 'Diagnostics') -Filter 'frame-probe-*.csv' -ErrorAction SilentlyContinue |
+        Remove-Item
+    $env:RINGOUT_FRAME_PROBE = $FrameProbe
+}
 $runner = Start-Process powershell -ArgumentList $runArgs -PassThru -WindowStyle Hidden `
     -RedirectStandardError $logFile -RedirectStandardOutput "$logFile.out"
 Remove-Item Env:RINGOUT_HITCH_TRACE -ErrorAction SilentlyContinue
+Remove-Item Env:RINGOUT_FRAME_PROBE -ErrorAction SilentlyContinue
 
 $script:commandCounter = 0
 $samples = [System.Collections.Generic.List[object]]::new()
@@ -345,6 +361,14 @@ if ($HitchTraceMs -gt 0) {
     }
     Write-Host ("[{0}] hitch reports (over {1} ms): {2}{3}" -f $Label, $HitchTraceMs, $hitchReports.Count,
         $(if ($hitchReports) { " in $hitchDir" } else { '' }))
+}
+if ($FrameProbe) {
+    $probeLogs = @(Get-ChildItem (Join-Path $userDir 'Diagnostics') -Filter 'frame-probe-*.csv' -ErrorAction SilentlyContinue)
+    $probeDir = Join-Path $benchDir $Label
+    New-Item -ItemType Directory -Force $probeDir | Out-Null
+    $probeLogs | Copy-Item -Destination $probeDir -Force
+    Write-Host ("[{0}] frame probe: {1}" -f $Label,
+        $(if ($probeLogs) { ($probeLogs | ForEach-Object { Join-Path $probeDir $_.Name }) -join ', ' } else { 'no log written' }))
 }
 Get-Content $logFile | Select-String 'shutdown' | ForEach-Object { Write-Host $_ }
 Write-Host "CSV: $csv"

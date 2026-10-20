@@ -1,0 +1,576 @@
+diff --git a/ModernGekko/CMakeLists.txt b/ModernGekko/CMakeLists.txt
+index 5decb23b..e47b4669 100644
+--- a/ModernGekko/CMakeLists.txt
++++ b/ModernGekko/CMakeLists.txt
+@@ -310,10 +310,12 @@ if(MODERNGEKKO_ENABLE_DOLPHIN_RUNTIME)
+     target_sources(moderngekko PRIVATE
+         src/runtime/dolphin_runtime.cpp
+         src/runtime/diagnostic_reporter.cpp
++        src/runtime/frame_probe.cpp
+         src/runtime/game_data_prefetcher.cpp
+         src/runtime/hitch_recorder.cpp
+         src/runtime/native_stacks.cpp
+         src/runtime/thread_names.cpp
++        src/runtime/vi_locked_alarm.cpp
+         tools/automation_protocol.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/Platform.cpp
+         vendor/dolphin/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 6966b918..05ebd1e4 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -43,7 +43,9 @@
+ #include "VideoCommon/VideoConfig.h"
+ #include "dolphin_runtime_internal.hpp"
+ #include "game_data_prefetcher.hpp"
++#include "frame_probe.hpp"
+ #include "hitch_recorder.hpp"
++#include "vi_locked_alarm.hpp"
+ #include "moderngekko/cpu_state.h"
+ #include "moderngekko/module_loader.hpp"
+ 
+@@ -560,6 +562,8 @@ struct Runtime::Impl {
+   std::jthread automation_thread;
+   std::unique_ptr<DiagnosticReporter> diagnostics;
+   std::unique_ptr<HitchRecorder> hitch_recorder;
++  std::unique_ptr<FrameProbe> frame_probe;
++  std::unique_ptr<ViLockedAlarm> vi_locked_alarm;
+ };
+ 
+ namespace {
+@@ -1483,6 +1487,8 @@ RuntimeRunResult Runtime::Run() {
+           : std::nullopt);
+   const std::optional<HitchRecorder::Options> hitch_options =
+       HitchRecorder::EnableFromEnvironment(m_impl->config.user_directory / "Diagnostics");
++  const std::optional<FrameProbe::Options> frame_probe_options =
++      FrameProbe::EnableFromEnvironment(m_impl->config.user_directory / "Diagnostics");
+   std::unique_ptr<BootParameters> boot =
+       TakeBootParameters(m_impl->metadata.main_dol.string(), m_impl->config.load_state_path);
+   if (!boot) {
+@@ -1627,6 +1633,11 @@ RuntimeRunResult Runtime::Run() {
+       DiagnosticReporter::Options{m_impl->config.user_directory / "Diagnostics"});
+   if (hitch_options)
+     m_impl->hitch_recorder = std::make_unique<HitchRecorder>(*hitch_options);
++  if (frame_probe_options)
++    m_impl->frame_probe = std::make_unique<FrameProbe>(*frame_probe_options);
++  // After boot: the game's ini, which names the alarm, is loaded by then.
++  if (const std::optional<ViLockedAlarm::Options> alarm = ViLockedAlarm::FromConfig())
++    m_impl->vi_locked_alarm = std::make_unique<ViLockedAlarm>(*alarm);
+   // Continue-where-you-left-off (menu System > Auto-Resume). Headless runs are
+   // benchmarks/verification; loading a state there would corrupt them, and so
+   // would it for an explicit --load-state or an automated run.
+@@ -1655,6 +1666,8 @@ RuntimeRunResult Runtime::Run() {
+   m_impl->platform->SaveWindowGeometry();
+   StopAutomation(*m_impl);
+   m_impl->hitch_recorder.reset();
++  m_impl->frame_probe.reset();
++  m_impl->vi_locked_alarm.reset();
+   m_impl->diagnostics.reset();
+   Core::Stop(Core::System::GetInstance());
+   Core::Shutdown(Core::System::GetInstance());
+diff --git a/ModernGekko/src/runtime/frame_probe.cpp b/ModernGekko/src/runtime/frame_probe.cpp
+new file mode 100644
+index 00000000..68bbb99e
+--- /dev/null
++++ b/ModernGekko/src/runtime/frame_probe.cpp
+@@ -0,0 +1,191 @@
++#include "frame_probe.hpp"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <string_view>
++#include <condition_variable>
++#include <mutex>
++#include <system_error>
++
++#include <fmt/format.h>
++
++#include "Core/CoreTiming.h"
++#include "Core/HW/Memmap.h"
++#include "Core/HW/SystemTimers.h"
++#include "Core/HW/VideoInterface.h"
++#include "Core/System.h"
++#include "VideoCommon/VideoEvents.h"
++
++namespace moderngekko {
++namespace {
++// An hour of fields at 60 Hz, allocated up front so recording never allocates mid-game.
++constexpr std::size_t kMaxFields = 60 * 60 * 60;
++
++std::int64_t SteadyNs(Clock::time_point time) {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
++}
++
++std::int64_t NowNs() { return SteadyNs(Clock::now()); }
++
++std::string LocalTimestamp() {
++  const std::time_t now = std::time(nullptr);
++  std::tm local{};
++#ifdef _WIN32
++  localtime_s(&local, &now);
++#else
++  localtime_r(&now, &local);
++#endif
++  char text[32];
++  std::strftime(text, sizeof(text), "%Y%m%d-%H%M%S", &local);
++  return text;
++}
++
++std::optional<FrameProbe::Word> ParseWord(std::string_view item) {
++  const std::size_t colon = item.find(':');
++  if (colon == std::string_view::npos)
++    return std::nullopt;
++  const std::string_view type = item.substr(0, colon);
++  const std::string address(item.substr(colon + 1));
++  char *end = nullptr;
++  const unsigned long value = std::strtoul(address.c_str(), &end, 16);
++  if (address.empty() || *end != '\0')
++    return std::nullopt;
++  if (type == "f32")
++    return FrameProbe::Word{FrameProbe::WordType::F32, static_cast<std::uint32_t>(value)};
++  if (type == "u32")
++    return FrameProbe::Word{FrameProbe::WordType::U32, static_cast<std::uint32_t>(value)};
++  return std::nullopt;
++}
++} // namespace
++
++std::optional<FrameProbe::Options>
++FrameProbe::EnableFromEnvironment(std::filesystem::path directory) {
++  const char *value = std::getenv("RINGOUT_FRAME_PROBE");
++  if (!value || !*value)
++    return std::nullopt;
++
++  Options options;
++  options.directory = std::move(directory);
++  const std::string_view list(value);
++  if (list != "on") {
++    std::size_t start = 0;
++    while (start <= list.size()) {
++      const std::size_t comma = std::min(list.find(',', start), list.size());
++      const std::string_view item = list.substr(start, comma - start);
++      const std::optional<Word> word = ParseWord(item);
++      if (!word || options.words.size() == kMaxWords) {
++        std::fprintf(stderr, "[frame-probe] ignored '%.*s' (expected up to %zu f32:/u32:<hex>)\n",
++                     static_cast<int>(item.size()), item.data(), kMaxWords);
++      } else {
++        options.words.push_back(*word);
++      }
++      start = comma + 1;
++    }
++  }
++  std::fprintf(stderr, "[frame-probe] on: %zu guest words, written to %s at exit\n",
++               options.words.size(), options.directory.string().c_str());
++  return options;
++}
++
++FrameProbe::FrameProbe(Options options)
++    : m_options(std::move(options)), m_start_ns(NowNs()),
++      m_path(m_options.directory / fmt::format("frame-probe-{}.csv", LocalTimestamp())),
++      m_ticks_per_us(Core::System::GetInstance().GetSystemTimers().GetTicksPerSecond() / 1e6),
++      m_fields(kMaxFields), m_presents(kMaxFields) {
++  VideoEvents &events = GetVideoEvents();
++  m_field_hook = events.vi_end_field_event.Register([this] { OnFieldEnd(); });
++  m_present_hook = events.after_present_event.Register([this](const PresentInfo &info) {
++    const std::int64_t actual =
++        info.actual_present_time == TimePoint{} ? 0 : SteadyNs(info.actual_present_time);
++    m_presents.Append(PresentRow{NowNs(), actual, info.frame_count, info.emulated_timestamp,
++                                 static_cast<int>(info.reason)});
++  });
++  m_writer = std::jthread([this](std::stop_token stop) { WriterLoop(std::move(stop)); });
++}
++
++FrameProbe::~FrameProbe() {
++  // Unhook first: once both are gone no thread appends any more.
++  m_field_hook = {};
++  m_present_hook = {};
++  m_writer = {}; // requests a stop and joins
++  Write();
++}
++
++void FrameProbe::WriterLoop(std::stop_token stop) {
++  std::mutex mutex;
++  std::condition_variable_any wake;
++  std::unique_lock lock(mutex);
++  while (!wake.wait_for(lock, stop, std::chrono::seconds(5), [] { return false; }))
++    Write();
++}
++
++void FrameProbe::OnFieldEnd() {
++  Core::System &system = Core::System::GetInstance();
++  FieldRow row{};
++  row.host_ns = NowNs();
++  row.ticks = system.GetCoreTiming().GetTicks();
++  row.xfb = system.GetVideoInterface().GetXFBAddressTop();
++  const Memory::MemoryManager &memory = system.GetMemory();
++  for (std::size_t i = 0; i < m_options.words.size(); ++i) {
++    // Runs on the CPU thread, between guest instructions: reading guest RAM is safe here.
++    const std::uint32_t address = m_options.words[i].address;
++    if (memory.GetPointerForRange(address, sizeof(std::uint32_t)))
++      row.words[i] = memory.Read_U32(address);
++  }
++  m_fields.Append(row);
++}
++
++void FrameProbe::Write() const {
++  const std::size_t field_count = m_fields.count.load(std::memory_order_acquire);
++  const std::size_t present_count = m_presents.count.load(std::memory_order_acquire);
++  std::error_code ec;
++  std::filesystem::create_directories(m_options.directory, ec);
++  // Written beside the log and renamed over it, so a reader never sees half a file.
++  std::filesystem::path partial = m_path;
++  partial += ".partial";
++  std::FILE *file = std::fopen(partial.string().c_str(), "w");
++  if (!file) {
++    std::fprintf(stderr, "[frame-probe] cannot write %s\n", partial.string().c_str());
++    return;
++  }
++
++  // Field rows: F, host time, emulated time (both us), XFB, then the guest words.
++  // Present rows: P, host time, actual present time (0 when unknown), unique frame number,
++  // emulated time the console would have shown it, PresentInfo::PresentReason.
++  std::fprintf(file, "kind,host_us,emu_us,xfb");
++  for (const Word &word : m_options.words)
++    std::fprintf(file, ",%s_%08X", word.type == WordType::F32 ? "f32" : "u32", word.address);
++  std::fprintf(file, "\n");
++  for (std::size_t n = 0; n < field_count; ++n) {
++    const FieldRow &row = m_fields.rows[n];
++    std::fprintf(file, "F,%.1f,%.1f,%08X", (row.host_ns - m_start_ns) / 1e3,
++                 row.ticks / m_ticks_per_us, row.xfb);
++    for (std::size_t i = 0; i < m_options.words.size(); ++i) {
++      if (m_options.words[i].type == WordType::F32) {
++        float value;
++        std::memcpy(&value, &row.words[i], sizeof(value));
++        std::fprintf(file, ",%.6f", value);
++      } else {
++        std::fprintf(file, ",%u", row.words[i]);
++      }
++    }
++    std::fprintf(file, "\n");
++  }
++  for (std::size_t n = 0; n < present_count; ++n) {
++    const PresentRow &row = m_presents.rows[n];
++    std::fprintf(file, "P,%.1f,%.1f,%llu,%.1f,%d\n", (row.host_ns - m_start_ns) / 1e3,
++                 row.actual_ns ? (row.actual_ns - m_start_ns) / 1e3 : 0.0,
++                 static_cast<unsigned long long>(row.frame_count),
++                 row.emulated_timestamp / m_ticks_per_us, row.reason);
++  }
++  std::fclose(file);
++  std::filesystem::rename(partial, m_path, ec);
++  if (ec)
++    std::fprintf(stderr, "[frame-probe] cannot write %s: %s\n", m_path.string().c_str(),
++                 ec.message().c_str());
++}
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/frame_probe.hpp b/ModernGekko/src/runtime/frame_probe.hpp
+new file mode 100644
+index 00000000..25962104
+--- /dev/null
++++ b/ModernGekko/src/runtime/frame_probe.hpp
+@@ -0,0 +1,96 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <filesystem>
++#include <memory>
++#include <optional>
++#include <stop_token>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "Common/HookableEvent.h"
++
++namespace moderngekko {
++// Logs one row per emulated video field (host time, emulated time, the XFB the VI scans out,
++// and a few guest words the caller names) and one row per presented frame, to a CSV in a log
++// directory. It tells apart what the counters cannot: a game that keeps
++// presenting 60 frames a second can still look choppy when the game time those frames show
++// advances unevenly, e.g. a game clock read from the guest every field against the host time
++// the field ended at.
++//
++// Off unless RINGOUT_FRAME_PROBE is set: a comma-separated list of guest words to sample,
++// each 'f32:<hex address>' or 'u32:<hex address>' (e.g. 'f32:80440B94,u32:802F4650'), or
++// 'on' for no guest words. Rows are kept in memory (an hour of fields at most); a writer
++// thread rewrites the CSV every few seconds and at the end, so the emulator threads do no file
++// I/O and a run that is killed still leaves its log.
++class FrameProbe {
++public:
++  enum class WordType { F32, U32 };
++  struct Word {
++    WordType type;
++    std::uint32_t address;
++  };
++  struct Options {
++    std::filesystem::path directory;
++    std::vector<Word> words;
++  };
++
++  // Reads RINGOUT_FRAME_PROBE; returns the options to build the probe with when it is set.
++  static std::optional<Options> EnableFromEnvironment(std::filesystem::path directory);
++
++  explicit FrameProbe(Options options);
++  ~FrameProbe();
++
++  FrameProbe(const FrameProbe &) = delete;
++  FrameProbe &operator=(const FrameProbe &) = delete;
++
++private:
++  static constexpr std::size_t kMaxWords = 4;
++
++  struct FieldRow {
++    std::int64_t host_ns;
++    std::uint64_t ticks;
++    std::uint32_t xfb;
++    std::uint32_t words[kMaxWords];
++  };
++  struct PresentRow {
++    std::int64_t host_ns;
++    std::int64_t actual_ns;
++    std::uint64_t frame_count;
++    std::uint64_t emulated_timestamp;
++    int reason;
++  };
++
++  // Fixed-size rows appended by one thread only; the writer reads the first `count` rows,
++  // which the release store of `count` publishes.
++  template <typename Row> struct RowLog {
++    explicit RowLog(std::size_t capacity) : rows(new Row[capacity]), capacity(capacity) {}
++    void Append(const Row &row) {
++      const std::size_t n = count.load(std::memory_order_relaxed);
++      if (n == capacity)
++        return;
++      rows[n] = row;
++      count.store(n + 1, std::memory_order_release);
++    }
++    std::unique_ptr<Row[]> rows;
++    std::size_t capacity;
++    std::atomic<std::size_t> count{0};
++  };
++
++  void OnFieldEnd();
++  void WriterLoop(std::stop_token stop);
++  void Write() const;
++
++  Options m_options;
++  std::int64_t m_start_ns;
++  std::filesystem::path m_path;
++  double m_ticks_per_us;
++  RowLog<FieldRow> m_fields;     // CPU thread
++  RowLog<PresentRow> m_presents; // GPU thread
++  Common::EventHook m_field_hook;
++  Common::EventHook m_present_hook;
++  std::jthread m_writer;
++};
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.cpp b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+new file mode 100644
+index 00000000..5065eceb
+--- /dev/null
++++ b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+@@ -0,0 +1,87 @@
++#include "vi_locked_alarm.hpp"
++
++#include <cstdio>
++#include <cstring>
++
++#include "Common/Config/Config.h"
++#include "Core/Config/MainSettings.h"
++#include "Core/HW/Memmap.h"
++#include "Core/HW/SystemTimers.h"
++#include "Core/HW/VideoInterface.h"
++#include "Core/PowerPC/PowerPC.h"
++#include "Core/System.h"
++#include "VideoCommon/VideoEvents.h"
++
++namespace moderngekko {
++namespace {
++// The fields of the SDK's OSAlarm this needs (big-endian u64s).
++constexpr std::uint32_t kAlarmPeriodOffset = 24;
++constexpr std::uint32_t kAlarmStartOffset = 32;
++constexpr std::uint32_t kAlarmSize = 40;
++} // namespace
++
++std::optional<ViLockedAlarm::Options> ViLockedAlarm::FromConfig() {
++  Options options{Config::Get(Config::MAIN_VI_LOCKED_ALARM),
++                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_PER_FIELD),
++                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_PHASE_US),
++                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_DIVIDER_POINTER),
++                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_DIVIDER_OFFSET),
++                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_DIVIDER_VALUE)};
++  if (options.address == 0)
++    return std::nullopt;
++  if (options.per_field == 0)
++    options.per_field = 1;
++  std::fprintf(stderr, "[vi-locked-alarm] alarm %08X: %u per field, first %u us after a field\n",
++               options.address, options.per_field, options.phase_us);
++  if (options.divider_pointer != 0) {
++    std::fprintf(stderr, "[vi-locked-alarm] divider *%08X+%u set to %g every field\n",
++                 options.divider_pointer, options.divider_offset, options.divider_value);
++  }
++  return options;
++}
++
++ViLockedAlarm::ViLockedAlarm(Options options) : m_options(options) {
++  m_field_hook = GetVideoEvents().vi_end_field_event.Register([this] { OnFieldEnd(); });
++}
++
++ViLockedAlarm::~ViLockedAlarm() = default;
++
++void ViLockedAlarm::OnFieldEnd() {
++  // Runs on the CPU thread between guest instructions, at the end of every field.
++  Core::System &system = Core::System::GetInstance();
++  Memory::MemoryManager &memory = system.GetMemory();
++  const std::uint32_t alarm = m_options.address;
++  if (!memory.GetPointerForRange(alarm, kAlarmSize))
++    return;
++  // Leave it alone until the game has set it up as a periodic alarm.
++  if (memory.Read_U64(alarm + kAlarmPeriodOffset) == 0)
++    return;
++
++  const std::uint64_t field = system.GetVideoInterface().GetTicksPerField() /
++                              static_cast<std::uint64_t>(SystemTimers::TIMER_RATIO);
++  const std::uint64_t ticks_per_second =
++      system.GetSystemTimers().GetTicksPerSecond() / SystemTimers::TIMER_RATIO;
++  const std::uint64_t phase = (m_options.phase_us * ticks_per_second / 1000000) % field;
++  const std::uint64_t now = system.GetPowerPC().ReadFullTimeBaseValue();
++  // The field rarely divides evenly (NTSC: 675675 ticks); restarting the alarm every field
++  // keeps the remainder from adding up. Any start in the past works, as long as it is
++  // congruent to the wanted phase: the SDK fires at the first start + k * period after now.
++  memory.Write_U64(field / m_options.per_field, alarm + kAlarmPeriodOffset);
++  memory.Write_U64(now + phase - field, alarm + kAlarmStartOffset);
++  ResetDivider(memory);
++}
++
++void ViLockedAlarm::ResetDivider(Memory::MemoryManager &memory) const {
++  if (m_options.divider_pointer == 0 ||
++      !memory.GetPointerForRange(m_options.divider_pointer, sizeof(std::uint32_t))) {
++    return;
++  }
++  const std::uint32_t object = memory.Read_U32(m_options.divider_pointer);
++  const std::uint32_t address = object + m_options.divider_offset;
++  if (object == 0 || !memory.GetPointerForRange(address, sizeof(float)))
++    return;
++  std::uint32_t bits;
++  std::memcpy(&bits, &m_options.divider_value, sizeof(bits));
++  memory.Write_U32(bits, address);
++}
++} // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.hpp b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+new file mode 100644
+index 00000000..fe840720
+--- /dev/null
++++ b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <cstdint>
++#include <optional>
++
++#include "Common/HookableEvent.h"
++
++namespace Memory {
++class MemoryManager;
++}
++
++namespace moderngekko {
++// Runs one periodic OSAlarm of the game in step with the emulated video fields.
++//
++// Some games pace their logic with an SDK alarm at a round rate (Def Jam: Fight for NY reads
++// the pads at 120 Hz and queues a logic step every second time), while the frames they draw
++// follow the 59.94 Hz fields. The two drift past each other by a frame every ~17 s. On the
++// console that costs one doubled step; in emulation the guest's frame loop reaches its "is a
++// step due?" check several ms earlier or later from frame to frame (the overclocked CPU fills
++// the GX FIFO while the GPU waits at the frame's end-of-frame breakpoint, so the CPU stalls
++// until the retrace by varying amounts), and the steps arriving around that check land
++// 1, 2, 0, 1, 2, 0... per frame for seconds at a time. The game still presents 60 frames a
++// second, but motion judders as if it ran at 30-40.
++//
++// Every field, this rewrites the alarm's period to an exact fraction of the field and its start
++// time so that it fires at a fixed point in each field (the SDK schedules the next firing at
++// start + k * period), and optionally resets the game's divider so the same firing of each
++// field queues the step. The logic steps then arrive at the same point of every frame and never
++// drift into the frame loop's check; the game runs 0.1% slower (59.94 steps a second instead
++// of 60), which nobody can see.
++//
++// Off unless Core.ViLockedAlarm names the alarm (MainSettings.h), normally in the game's ini.
++class ViLockedAlarm {
++public:
++  struct Options {
++    std::uint32_t address;   // the OSAlarm struct in guest RAM
++    std::uint32_t per_field; // firings per field
++    std::uint32_t phase_us;  // first firing, after the field ends
++    // Optional: a float the game divides the alarm by (a counter it adds a fraction to on
++    // every firing and acts on when it reaches 1), found at *divider_pointer + divider_offset
++    // and set to divider_value at every field end, so the game acts on the same firing of
++    // each field instead of on either of them depending on where the counter happened to be.
++    std::uint32_t divider_pointer;
++    std::uint32_t divider_offset;
++    float divider_value;
++  };
++
++  // Reads the Core.ViLockedAlarm* settings; returns the options when the lock is on.
++  static std::optional<Options> FromConfig();
++
++  explicit ViLockedAlarm(Options options);
++  ~ViLockedAlarm();
++
++  ViLockedAlarm(const ViLockedAlarm &) = delete;
++  ViLockedAlarm &operator=(const ViLockedAlarm &) = delete;
++
++private:
++  void OnFieldEnd();
++  void ResetDivider(Memory::MemoryManager &memory) const;
++
++  Options m_options;
++  Common::EventHook m_field_hook;
++};
++} // namespace moderngekko
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+index fecd817d..c310948a 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+@@ -60,6 +60,22 @@ const Info<bool> MAIN_SMOOTH_EARLY_PRESENTATION{{System::Main, "Core", "SmoothEa
+ // lateness varying from frame to frame does not reach the display as uneven frame times.
+ const Info<bool> MAIN_SMOOTH_LATE_PRESENTATION{{System::Main, "Core", "SmoothLatePresentation"},
+                                                false};
++// Guest address of a periodic OSAlarm to run in step with the video fields (0 = off), how many
++// times it fires per field, and when the first of them fires, in microseconds after a field
++// ends. For games that pace their logic with a timer at a round rate (say 120 Hz) against
++// 59.94 Hz fields: the two drift past each other, and around the crossing the logic steps
++// twice in one frame and not at all in the next. Set per game, in its GameSettings ini.
++const Info<u32> MAIN_VI_LOCKED_ALARM{{System::Main, "Core", "ViLockedAlarm"}, 0};
++const Info<u32> MAIN_VI_LOCKED_ALARM_PER_FIELD{{System::Main, "Core", "ViLockedAlarmPerField"}, 1};
++const Info<u32> MAIN_VI_LOCKED_ALARM_PHASE_US{{System::Main, "Core", "ViLockedAlarmPhaseUs"}, 0};
++// Optional float the game counts the alarm with, reset every field so it acts on the same
++// firing each time: the address of a pointer to it (0 = none), its offset there, and the value.
++const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_POINTER{
++    {System::Main, "Core", "ViLockedAlarmDividerPointer"}, 0};
++const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_OFFSET{
++    {System::Main, "Core", "ViLockedAlarmDividerOffset"}, 0};
++const Info<float> MAIN_VI_LOCKED_ALARM_DIVIDER_VALUE{
++    {System::Main, "Core", "ViLockedAlarmDividerValue"}, 0.0f};
+ #if defined(ANDROID)
+ // Currently enabled by default on Android because the performance boost is really needed.
+ constexpr bool DEFAULT_CPU_THREAD = true;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+index 1edb461c..e5211bd1 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+@@ -69,6 +69,12 @@ extern const Info<bool> MAIN_CORRECT_TIME_DRIFT;
+ extern const Info<bool> MAIN_RUSH_FRAME_PRESENTATION;
+ extern const Info<bool> MAIN_SMOOTH_EARLY_PRESENTATION;
+ extern const Info<bool> MAIN_SMOOTH_LATE_PRESENTATION;
++extern const Info<u32> MAIN_VI_LOCKED_ALARM;
++extern const Info<u32> MAIN_VI_LOCKED_ALARM_PER_FIELD;
++extern const Info<u32> MAIN_VI_LOCKED_ALARM_PHASE_US;
++extern const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_POINTER;
++extern const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_OFFSET;
++extern const Info<float> MAIN_VI_LOCKED_ALARM_DIVIDER_VALUE;
+ extern const Info<bool> MAIN_CPU_THREAD;
+ extern const Info<bool> MAIN_LOAD_GAME_INTO_MEMORY;
+ extern const Info<bool> MAIN_SYNC_ON_SKIP_IDLE;
