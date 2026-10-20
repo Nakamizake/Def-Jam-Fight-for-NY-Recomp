@@ -195,7 +195,10 @@ def main() -> None:
     p.add_argument("--original", help="the archive it was extracted from, if it has moved")
     p.set_defaults(run=cmd_pack)
     args = parser.parse_args()
-    args.run(args)
+    try:
+        args.run(args)
+    except (OSError, ValueError) as error:
+        sys.exit(f"viv: {error}")
 
 
 if __name__ == "__main__":
