@@ -22,9 +22,9 @@ What happens
 3. Start the game from the Start menu or the desktop shortcut. The first start prepares
    the graphics shaders for about a minute; later starts are quick. The game opens
    fullscreen: Alt+Enter switches to a window, Esc opens the settings menu.
-4. Optional: "Optimize for this PC" in the Start menu makes the game run faster (about 20
-   minutes). A game window opens and plays fights on its own while it measures; your saves
-   and settings are not touched.
+4. Optional: "Def Jam - Optimize for this PC" in the Start menu (or "Optimize for this PC"
+   in the game folder) makes the game run faster (about 20 minutes). A game window opens
+   and plays fights on its own while it measures; your saves and settings are not touched.
 
 Everything the game writes (saves, settings, shader cache) stays in the install folder.
 Uninstalling removes the game and asks whether to keep your saves and settings.

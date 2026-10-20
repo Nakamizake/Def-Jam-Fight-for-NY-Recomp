@@ -79,9 +79,10 @@ their own disc image (`installer/build-game.ps1`, about 5 minutes on 8 cores).
   (saves, settings, shader cache, logs) stays in it.
 - The disc page is filled in automatically when the `.iso` sits next to the installer or in
   a folder next to it, or from `/ISO="path"` on the command line.
-- Start menu: the game, *Rebuild game files* (`DefJam.exe --rebuild`), *Optimize for this
-  PC* (`DefJam.exe --optimize`), the game folder and the uninstaller. Uninstalling removes
-  the built game and asks whether to keep the saves.
+- Start menu: the game, *Def Jam - Rebuild game files* (`DefJam.exe --rebuild`), *Def Jam -
+  Optimize for this PC* (`DefJam.exe --optimize`), the game folder and the uninstaller; the
+  install folder also gets an *Optimize for this PC* shortcut. Uninstalling removes the built
+  game and asks whether to keep the saves.
 - The module is first built without a PGO profile or twin chunks (profiles are game-derived,
   so none can ship): about 79 fps unthrottled in a 2v2 fight, well above 60 on the
   development PC.

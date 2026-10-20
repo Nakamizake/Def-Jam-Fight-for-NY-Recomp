@@ -46,7 +46,7 @@ UninstallDisplayIcon={app}\DefJam.exe
 ExtraDiskSpaceRequired=4000000000
 #ifdef TestInstall
 ; Developer test builds (package.ps1 -TestInstall): no uninstall entry in the registry and no
-; shortcuts, so a test install writes nothing outside its folder.
+; shortcuts outside the install folder, so a test install writes nothing outside it.
 CreateUninstallRegKey=no
 #endif
 
@@ -57,14 +57,25 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-; Test installs (see TestInstall above) create no shortcuts.
+; Test installs (see TestInstall above) create no shortcuts outside the install folder.
 #ifndef TestInstall
+; Start menu search lists entries by their own names, so each one says which game it is for.
 Name: "{group}\{#ShortName}"; Filename: "{app}\DefJam.exe"
-Name: "{group}\Rebuild game files"; Filename: "{app}\DefJam.exe"; Parameters: "--rebuild"
-Name: "{group}\Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "--optimize"
-Name: "{group}\Game folder"; Filename: "{app}"
+Name: "{group}\Def Jam - Rebuild game files"; Filename: "{app}\DefJam.exe"; Parameters: "--rebuild"
+Name: "{group}\Def Jam - Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "--optimize"
+Name: "{group}\Def Jam - Game folder"; Filename: "{app}"
 Name: "{group}\Uninstall {#ShortName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#ShortName}"; Filename: "{app}\DefJam.exe"; Tasks: desktopicon
+#endif
+; Also next to the game, for players who start it from its folder.
+Name: "{app}\Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "--optimize"; WorkingDir: "{app}"
+
+#ifndef TestInstall
+[InstallDelete]
+; Start menu entries of earlier versions, renamed since.
+Type: files; Name: "{group}\Rebuild game files.lnk"
+Type: files; Name: "{group}\Optimize for this PC.lnk"
+Type: files; Name: "{group}\Game folder.lnk"
 #endif
 
 [Run]
@@ -249,7 +260,7 @@ begin
   if not Exec('powershell.exe', Parameters, ExpandConstant('{app}'), SW_SHOW,
               ewWaitUntilTerminated, ResultCode) or (ResultCode <> 0) then
     MsgBox('The game could not be built. The files are installed, so you can try again ' +
-      'from the Start menu (' + '{#ShortName}' + ' > Rebuild game files) or by starting the ' +
+      'from the Start menu (' + '{#ShortName}' + ' > Def Jam - Rebuild game files) or by starting the ' +
       'game.' + #13#10#13#10 + 'Details: ' + ExpandConstant('{app}\logs\build-game.log'),
       mbError, MB_OK);
 end;
