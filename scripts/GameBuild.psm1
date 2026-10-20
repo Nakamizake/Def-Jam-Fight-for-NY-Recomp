@@ -168,6 +168,8 @@ function Get-ModuleBuildJobs {
 #   picked in the in-game menu is kept;
 # - Controllers\GCPadNew.defaults.ini is copied whole, once (a profile is one coherent set of
 #   bindings, so merging keys into a rebound one would scramble it).
+# - Controllers\Layouts\*.ini (the control layouts the in-game menu offers) are copied to
+#   Config\Profiles\GCPad every time, like GameSettings: they are the port's, not the player's.
 function Initialize-UserDirectory {
     param(
         [Parameter(Mandatory)] [string] $UserDir,
@@ -193,6 +195,13 @@ function Initialize-UserDirectory {
     if ((Test-Path -LiteralPath $defaultPad) -and -not (Test-Path -LiteralPath $userPad)) {
         New-Item -ItemType Directory -Force (Split-Path -Parent $userPad) | Out-Null
         Copy-Item -LiteralPath $defaultPad $userPad
+    }
+
+    $layouts = Join-Path $ConfigDir 'Controllers\Layouts'
+    if (Test-Path -LiteralPath $layouts) {
+        $userLayouts = Join-Path $UserDir 'Config\Profiles\GCPad'
+        New-Item -ItemType Directory -Force $userLayouts | Out-Null
+        Copy-Item -Path (Join-Path $layouts '*.ini') $userLayouts -Force
     }
 }
 

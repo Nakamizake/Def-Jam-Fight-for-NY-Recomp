@@ -38,7 +38,7 @@ controller layout, fixes to the stack (as patches), and the build, run and bench
 lib/RingOut/        submodule: RingOut's DolRecomp + ModernGekko, and the game-module CMake project
 patches/RingOut/    local changes to lib/RingOut, applied by build-tools.ps1
 config/             recompiler flags and native regions (recomp/), game settings, default
-                    Dolphin settings and controller layout
+                    Dolphin settings and the controller layouts
 scripts/            build, run, benchmark, training and packaging scripts (PowerShell)
 installer/          Windows installer: Inno Setup script, launcher (DefJam.exe) and the
                     script that builds the game on the player's machine
@@ -193,21 +193,28 @@ frames) and `--headless` for scripted sessions (`moderngekko-run.exe --help`).
 
 ## Controls
 
-Any SDL gamepad works; the default layout is the PlayStation 2 release's:
+Any SDL gamepad works. Each console release of the game is a layout (Esc > CONTROLS >
+Layout): PlayStation, Xbox or GameCube. On Auto (the default) the layout follows the pad:
+a DualSense plays the PlayStation 2 release's layout, an Xbox pad the Xbox release's, a
+GameCube or Switch pad the GameCube release's. The face buttons sit in the same place on
+all three; the shoulders differ:
 
-| Action | PS2 / DualSense | GameCube |
-| --- | --- | --- |
-| Punch | Triangle | Y |
-| Kick | Square | B |
-| Grapple / throw / pick up | Cross | A |
-| Run | Circle | X |
-| Block | R1 | R |
-| Strong attack modifier | L1 | L |
-| Target (multi-fighter) | R2 / L2 | Z |
-| Taunt / Blazin' | right stick | C-stick |
+| Action | PlayStation | Xbox | GameCube |
+| --- | --- | --- | --- |
+| Punch | Triangle | Y | Y |
+| Kick (and Back in menus) | Square | X | B |
+| Grapple / throw / pick up (and Select) | Cross | A | A |
+| Run | Circle | B | X |
+| Block | R1 | right trigger | R (right trigger) |
+| Strong attack modifier | L1 | left trigger | L (left trigger) |
+| Target (multi-fighter) | R2 / L2 | either bumper | Z (right bumper) |
+| Taunt / Blazin' | right stick | right stick | C-stick |
 
-The layout is copied to `userdata/Config/GCPadNew.ini` on the first run; rebind in the
-menu, or delete that file to get the default back.
+The layouts are Dolphin pad profiles in `config/Controllers/Layouts/`, copied to
+`userdata/Config/Profiles/GCPad/` each time the game is set up (a profile of your own in
+that folder shows up in the list too). Rebinding a button in the menu switches the layout
+to Custom, which Auto then leaves alone. The bindings in use are in
+`userdata/Config/GCPadNew.ini`.
 
 ## Performance
 

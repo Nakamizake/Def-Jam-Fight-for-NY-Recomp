@@ -26,6 +26,13 @@ What happens
    in the game folder) makes the game run faster (about 20 minutes). A game window opens
    and plays fights on its own while it measures; your saves and settings are not touched.
 
+Controllers
+-----------
+Any gamepad works. Esc > CONTROLS > Layout picks how it plays: like the PlayStation 2, Xbox
+or GameCube release. On Auto (the default) it follows the pad you use - a DualSense plays
+like the PlayStation 2 release, an Xbox pad like the Xbox one. Menus use the game's own
+buttons: the kick button goes back.
+
 Playing online
 --------------
 Esc > System > Netplay. One player picks HOST ONLINE and Start Netplay; the game restarts

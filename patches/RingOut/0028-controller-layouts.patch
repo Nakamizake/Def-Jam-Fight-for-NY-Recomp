@@ -1,0 +1,614 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 0cbe5ae3..2522f853 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -43,6 +43,7 @@
+ #include "VideoCommon/RecompGameData.h"
+ #include "VideoCommon/RecompMenu.h"
+ #include "VideoCommon/RecompMods.h"
++#include "VideoCommon/RecompPadLayout.h"
+ #include "VideoCommon/VideoConfig.h"
+ #include "dolphin_runtime_internal.hpp"
+ #include "game_data_prefetcher.hpp"
+@@ -1461,6 +1462,8 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   UICommon::InitControllers(impl->platform->GetWindowSystemInfo());
+   impl->controllers_initialized = true;
+   RebindPadsToPresentDevices();
++  // After the rebind: Auto picks the layout from the device a port ends up on.
++  RecompPadLayout::ApplyAll();
+   EnsureAutomationDirectories(impl->config.automation.directory);
+   if (!impl->config.automation.directory.empty()) {
+     for (int port = 0; port < 4; ++port) {
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/CoreDevice.h b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/CoreDevice.h
+index c8be0aeb..844f087a 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/CoreDevice.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/CoreDevice.h
+@@ -152,6 +152,18 @@ public:
+   static constexpr int DEFAULT_DEVICE_SORT_PRIORITY = std::numeric_limits<int>::max();
+   virtual int GetSortPriority() const { return 0; }
+ 
++  // Which console's controller the device's buttons are printed like, so a game can pick the
++  // control layout and button icons that match the pad in the player's hands.
++  enum class ButtonLabels
++  {
++    Unknown,
++    Xbox,
++    PlayStation,
++    NintendoSwitch,
++    GameCube,
++  };
++  virtual ButtonLabels GetButtonLabels() const { return ButtonLabels::Unknown; }
++
+   const std::vector<Input*>& Inputs() const { return m_inputs; }
+   const std::vector<Output*>& Outputs() const { return m_outputs; }
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
+index f805976d..22340c0f 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.cpp
+@@ -21,6 +21,33 @@ static bool IsTriggerAxis(int index)
+   return index >= 4;
+ }
+ 
++// A pad SDL cannot place (SDL_GAMEPAD_TYPE_STANDARD, most third-party pads) is mapped onto the
++// Xbox layout by SDL itself, so it reads as one.
++static Core::Device::ButtonLabels ButtonLabelsOf(SDL_Gamepad* gamepad)
++{
++  using Labels = Core::Device::ButtonLabels;
++  if (gamepad == nullptr)
++    return Labels::Unknown;
++  switch (SDL_GetGamepadType(gamepad))
++  {
++  case SDL_GAMEPAD_TYPE_PS3:
++  case SDL_GAMEPAD_TYPE_PS4:
++  case SDL_GAMEPAD_TYPE_PS5:
++    return Labels::PlayStation;
++  case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
++  case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
++  case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
++  case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
++    return Labels::NintendoSwitch;
++  case SDL_GAMEPAD_TYPE_GAMECUBE:
++    return Labels::GameCube;
++  case SDL_GAMEPAD_TYPE_UNKNOWN:
++    return Labels::Unknown;
++  default:
++    return Labels::Xbox;
++  }
++}
++
+ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick,
+                  Uint32 wake_event_type)
+     : m_gamepad(gamepad), m_joystick(joystick), m_wake_event_type(wake_event_type)
+@@ -28,6 +55,7 @@ Gamepad::Gamepad(SDL_Gamepad* const gamepad, SDL_Joystick* const joystick,
+   const char* const sdl_name =
+       (gamepad != nullptr) ? SDL_GetGamepadName(gamepad) : SDL_GetJoystickName(joystick);
+   m_name = (sdl_name != nullptr) ? sdl_name : "Unknown";
++  m_button_labels = ButtonLabelsOf(gamepad);
+ 
+   // If a Joystick input has a Gamepad equivalent button/hat we don't add it.
+   // "Equivalent" axes are still added as hidden/undetectable inputs to handle
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h
+index e4238d06..f8d71ec7 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/SDL/SDLGamepad.h
+@@ -354,6 +354,7 @@ public:
+ 
+   std::string GetName() const override;
+   std::string GetSource() const override;
++  ButtonLabels GetButtonLabels() const override { return m_button_labels; }
+   SDL_JoystickID GetSDLInstanceID() const;
+ 
+   // Takes the latest state read on the SDL thread. Never waits for SDL.
+@@ -380,6 +381,8 @@ private:
+ 
+   SDL_Gamepad* const m_gamepad;
+   std::string m_name;
++  // Read once here: asking SDL later would take the lock its thread holds while enumerating.
++  ButtonLabels m_button_labels = ButtonLabels::Unknown;
+   SDL_Joystick* const m_joystick;
+   SDL_Haptic* m_haptic = nullptr;
+   Uint32 const m_wake_event_type;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/XInput/XInput.h b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/XInput/XInput.h
+index 95fe6a3c..e992b22e 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/XInput/XInput.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/InputCommon/ControllerInterface/XInput/XInput.h
+@@ -32,6 +32,7 @@ public:
+   std::string GetSource() const override;
+   std::optional<int> GetPreferredId() const override;
+   int GetSortPriority() const override { return -2; }
++  ButtonLabels GetButtonLabels() const override { return ButtonLabels::Xbox; }
+ 
+   Core::DeviceRemoval UpdateInput() override;
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
+index b063aeab..70873fd9 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
+@@ -154,6 +154,8 @@ add_library(videocommon
+   RecompOlk.h
+   RecompMods.cpp
+   RecompMods.h
++  RecompPadLayout.cpp
++  RecompPadLayout.h
+   RenderState.cpp
+   RenderState.h
+   Resources/CustomResourceManager.cpp
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+index cd9668e6..2132cf23 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "VideoCommon/RecompGameData.h"
+ #include "VideoCommon/RecompMods.h"
++#include "VideoCommon/RecompPadLayout.h"
+ 
+ #include <cctype>
+ #include <cstring>
+@@ -154,17 +155,16 @@ enum class Tab
+ 
+ constexpr int kTabCount = static_cast<int>(Tab::Count);
+ 
+-// The Controls tab lists two fixed rows above the rebindable inputs -- which
+-// backend to take input from, and which device on it -- in the same way the
+-// Cheats tab puts its master switch above the codes. Rebind rows are therefore
+-// offset by this much when indexing control_rows.
+ // The CONTROLS tab's non-binding rows, in on-screen order: which port is being
+-// configured, its backend and device, and whether port 2 is plugged in at all.
++// configured, its backend and device, its control layout, and whether port 2 is
++// plugged in at all. Rebind rows follow, so they are offset by
++// kControlsHeaderRows when indexing control_rows.
+ constexpr int kPortRow = 0;
+ constexpr int kBackendRow = 1;
+ constexpr int kDeviceRow = 2;
+-constexpr int kPort2Row = 3;
+-constexpr int kControlsHeaderRows = 4;
++constexpr int kLayoutRow = 3;
++constexpr int kPort2Row = 4;
++constexpr int kControlsHeaderRows = 5;
+ 
+ // SHOTS is a GRID, not a list: a gallery you have to walk one row at a time to
+ // see anything is not a gallery. Left/Right step one image, Up/Down step a whole
+@@ -430,6 +430,15 @@ struct ControlRow
+   ControllerEmu::Control* control = nullptr;
+ };
+ 
++// The configured port's control layout as the Layout row shows it: the layouts
++// on offer, the port's choice, and what Auto picks for its device right now.
++struct LayoutSnapshot
++{
++  std::vector<std::string> available;
++  std::string choice;
++  std::string auto_layout;
++};
++
+ struct State
+ {
+   std::mutex mutex;
+@@ -528,6 +537,7 @@ struct State
+   // separate list of backends has to be kept in step with this one.
+   std::vector<std::string> devices;
+   std::string device_current;
++  LayoutSnapshot layout;
+ 
+   // Input detection is asynchronous: Start() then Update() until IsComplete(),
+   // driven from PumpFrame so the overlay keeps redrawing while we wait.
+@@ -1871,6 +1881,58 @@ void BuildDeviceListData(std::vector<std::string>* devices, std::string* current
+   *current = pad != nullptr ? pad->GetDefaultDevice().ToString() : std::string();
+ }
+ 
++// Reads the configured port's layout state. Touches InputConfig and the device
++// list, so like BuildDeviceListData it must run with the menu mutex released.
++LayoutSnapshot BuildLayoutData()
++{
++  LayoutSnapshot layout;
++  const int port = s_config_port.load(std::memory_order_relaxed);
++  layout.available = RecompPadLayout::Available();
++  layout.choice = RecompPadLayout::GetChoice(port);
++  if (auto* const pad = GetConfiguredPad())
++    layout.auto_layout = RecompPadLayout::AutoLayoutFor(pad->GetDefaultDevice().ToString());
++  return layout;
++}
++
++// Auto, each layout, then Custom -- which loads nothing, it only stops Auto
++// from replacing bindings the player is about to change.
++std::string CycleLayout(const LayoutSnapshot& layout, int direction)
++{
++  std::vector<std::string> options{std::string(RecompPadLayout::kAuto)};
++  options.insert(options.end(), layout.available.begin(), layout.available.end());
++  options.emplace_back(RecompPadLayout::kCustom);
++  const auto iter = std::ranges::find(options, layout.choice);
++  const int index = iter == options.end() ? 0 : static_cast<int>(iter - options.begin());
++  const int count = static_cast<int>(options.size());
++  return options[(index + direction + count) % count];
++}
++
++std::string LayoutLabel(const LayoutSnapshot& layout)
++{
++  std::string label;
++  if (layout.choice == RecompPadLayout::kAuto)
++    label = "AUTO: " + (layout.auto_layout.empty() ? std::string("NONE") :
++                                                     layout.auto_layout);
++  else
++    label = layout.choice;
++  std::ranges::transform(label, label.begin(),
++                         [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++  return label;
++}
++
++// A binding changed by hand: the port's bindings are the player's own now, so
++// Auto must not replace them at the next boot or device change.
++void MarkLayoutCustom()
++{
++  const int port = s_config_port.load(std::memory_order_relaxed);
++  if (RecompPadLayout::GetChoice(port) == RecompPadLayout::kCustom)
++    return;
++  RecompPadLayout::SetChoice(port, std::string(RecompPadLayout::kCustom));
++  Config::Save();
++  std::lock_guard<std::mutex> guard(s_state.mutex);
++  s_state.layout.choice = std::string(RecompPadLayout::kCustom);
++}
++
+ // Flattens the pad's group/control tree into the page's row list. Only inputs
+ // are remappable; outputs (rumble) are skipped.
+ // Touches InputConfig, so likewise runs with the menu mutex released.
+@@ -2528,6 +2590,7 @@ void OnKey(Key key)
+   bool toggle_port2 = false;
+   bool port2_enabled = false;
+   std::string new_device;
++  std::string new_layout_choice;
+   // Set under the lock, acted on after it: removing a file is I/O, and the
+   // video thread blocks on this mutex inside Draw. A save state and a recording
+   // each have a preview beside them, so this is a list rather than one path.
+@@ -2830,6 +2893,11 @@ void OnKey(Key key)
+           {
+             new_device = CycleDevice(s_state, dir);
+           }
++          else if (index == kLayoutRow)
++          {
++            new_layout_choice = CycleLayout(s_state.layout, dir);
++            s_state.layout.choice = new_layout_choice;
++          }
+           else if (index == kPort2Row)
+           {
+             toggle_port2 = true;
+@@ -2909,6 +2977,11 @@ void OnKey(Key key)
+           }
+           else if (index == kBackendRow || index == kDeviceRow)
+             needs_refresh_devices = true;
++          else if (index == kLayoutRow)
++          {
++            new_layout_choice = CycleLayout(s_state.layout, 1);
++            s_state.layout.choice = new_layout_choice;
++          }
+           else if (index == kPort2Row)
+           {
+             toggle_port2 = true;
+@@ -3006,10 +3079,12 @@ void OnKey(Key key)
+     std::vector<std::string> devices;
+     std::string current;
+     BuildDeviceListData(&devices, &current);
++    LayoutSnapshot layout = BuildLayoutData();
+     std::lock_guard<std::mutex> guard(s_state.mutex);
+     s_state.control_rows = std::move(built);
+     s_state.devices = std::move(devices);
+     s_state.device_current = std::move(current);
++    s_state.layout = std::move(layout);
+   }
+ 
+   if (needs_load_cheats)
+@@ -3088,9 +3163,11 @@ void OnKey(Key key)
+     std::vector<std::string> devices;
+     std::string current;
+     BuildDeviceListData(&devices, &current);
++    LayoutSnapshot layout = BuildLayoutData();
+     std::lock_guard<std::mutex> guard(s_state.mutex);
+     s_state.devices = std::move(devices);
+     s_state.device_current = std::move(current);
++    s_state.layout = std::move(layout);
+   }
+ 
+   // Every binding is resolved against the pad's default device, so switching
+@@ -3104,9 +3181,21 @@ void OnKey(Key key)
+       pad->UpdateReferences(g_controller_interface);
+       if (auto* const config = Pad::GetConfig())
+         config->SaveConfig();
++      // Auto follows the pad: a DualSense picked here gets the PlayStation layout.
++      RecompPadLayout::Apply(s_config_port.load(std::memory_order_relaxed));
++      LayoutSnapshot layout = BuildLayoutData();
++      std::lock_guard<std::mutex> guard(s_state.mutex);
++      s_state.layout = std::move(layout);
+     }
+   }
+ 
++  if (!new_layout_choice.empty())
++  {
++    RecompPadLayout::SetChoice(s_config_port.load(std::memory_order_relaxed), new_layout_choice);
++    RecompPadLayout::Apply(s_config_port.load(std::memory_order_relaxed));
++    needs_config_save = true;
++  }
++
+   if (changed_pad_control != nullptr)
+   {
+     if (auto* const pad = GetConfiguredPad())
+@@ -3115,6 +3204,7 @@ void OnKey(Key key)
+                                         changed_pad_control->control_ref.get());
+       if (auto* const config = Pad::GetConfig())
+         config->SaveConfig();
++      MarkLayoutCustom();
+     }
+   }
+ 
+@@ -3718,6 +3808,7 @@ void Draw()
+                         false);
+       rows.emplace_back("Device", has_device ? DeviceName(s_state.device_current) : "none found",
+                         false);
++      rows.emplace_back("Layout", LayoutLabel(s_state.layout), false);
+       const bool port2 = Port2Attached();
+       rows.emplace_back("Player 2 pad", port2 ? "ON" : "OFF", port2);
+       for (const auto& row : s_state.control_rows)
+@@ -4007,8 +4098,19 @@ void Draw()
+     // from the setting it belongs to, and the pairing stops being readable at
+     // 1920 even though it looks fine at 1024. Values sit a fixed measure in
+     // from the labels instead, and only follow the edge on a narrow window.
+-    const float value_column =
+-        std::min(ImGui::GetContentRegionAvail().x - 110.0f * scale, 560.0f * scale);
++    // The column moves left for a long value (a device name, "AUTO: PLAYSTATION")
++    // rather than cutting it off, but never into the labels.
++    float widest_label = 0.0f;
++    float widest_value = 0.0f;
++    for (const auto& row : rows)
++    {
++      widest_label = std::max(widest_label, ImGui::CalcTextSize(("> " + std::get<0>(row)).c_str()).x);
++      widest_value = std::max(widest_value, ImGui::CalcTextSize(std::get<1>(row).c_str()).x);
++    }
++    const float value_column = std::max(
++        std::min(ImGui::GetContentRegionAvail().x - std::max(110.0f * scale, widest_value),
++                 560.0f * scale),
++        widest_label + 16.0f * scale);
+     const float row_height = ImGui::GetTextLineHeightWithSpacing();
+     // SHOTS draws a grid of pictures instead of a list of filenames -- the
+     // point of a gallery is seeing several at once, and a one-at-a-time preview
+@@ -4144,6 +4246,8 @@ void Draw()
+       hint = "Left/Right switch tab   Down enter list   Enter select   Esc close";
+     else if (tab == Tab::Controls && selected == kPortRow + 1)
+       hint = "Left/Right switch player   the rows below bind that pad   Esc close";
++    else if (tab == Tab::Controls && selected == kLayoutRow + 1)
++      hint = "Left/Right change   Auto follows the pad   rebinding makes it Custom";
+     else if (tab == Tab::Controls && selected == kPort2Row + 1)
+       hint = "Space toggle   off means one-player only   Esc close";
+     else if (tab == Tab::Controls && selected >= kBackendRow + 1 &&
+@@ -4282,6 +4386,7 @@ void UpdateDetection()
+   pad->UpdateSingleControlReference(g_controller_interface, control->control_ref.get());
+   if (auto* const config = Pad::GetConfig())
+     config->SaveConfig();
++  MarkLayoutCustom();
+ }
+ 
+ // Whether the CONTROLS tab is waiting for a button to bind -- armed or already
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompPadLayout.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompPadLayout.cpp
+new file mode 100644
+index 00000000..699a8cb5
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompPadLayout.cpp
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "VideoCommon/RecompPadLayout.h"
++
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <filesystem>
++#include <memory>
++#include <system_error>
++
++#include "Common/Config/Config.h"
++#include "Common/IniFile.h"
++#include "Common/StringUtil.h"
++#include "Core/HW/GCPad.h"
++#include "InputCommon/ControllerEmu/ControllerEmu.h"
++#include "InputCommon/ControllerInterface/ControllerInterface.h"
++#include "InputCommon/ControllerInterface/CoreDevice.h"
++#include "InputCommon/InputConfig.h"
++
++namespace RecompPadLayout
++{
++namespace
++{
++using ButtonLabels = ciface::Core::Device::ButtonLabels;
++
++const std::array<Config::Info<std::string>, 2> CHOICE{{
++    {{Config::System::Main, "RecompMenu", "PadLayout1"}, std::string(kAuto)},
++    {{Config::System::Main, "RecompMenu", "PadLayout2"}, std::string(kAuto)},
++}};
++
++bool IsValidPort(int port)
++{
++  return port >= 0 && port < static_cast<int>(CHOICE.size());
++}
++
++std::filesystem::path LayoutDirectory()
++{
++  InputConfig* const config = Pad::GetConfig();
++  return config != nullptr ? StringToPath(config->GetUserProfileDirectoryPath()) :
++                             std::filesystem::path();
++}
++
++std::filesystem::path LayoutPath(const std::string& name)
++{
++  return LayoutDirectory() / StringToPath(name + ".ini");
++}
++
++// A Switch pad has its face buttons where a GameCube pad has its own (the big button at the
++// bottom, the narrow ones beside it), so it plays the GameCube layout.
++const char* LayoutNameFor(ButtonLabels labels)
++{
++  switch (labels)
++  {
++  case ButtonLabels::PlayStation:
++    return "PlayStation";
++  case ButtonLabels::Xbox:
++    return "Xbox";
++  case ButtonLabels::NintendoSwitch:
++  case ButtonLabels::GameCube:
++    return "GameCube";
++  default:
++    return nullptr;
++  }
++}
++}  // namespace
++
++std::vector<std::string> Available()
++{
++  std::vector<std::string> names;
++  std::error_code ec;
++  const std::filesystem::path directory = LayoutDirectory();
++  if (directory.empty())
++    return names;
++  for (const auto& entry : std::filesystem::directory_iterator(directory, ec))
++  {
++    std::error_code type_ec;
++    if (entry.is_regular_file(type_ec) && entry.path().extension() == ".ini")
++      names.push_back(PathToString(entry.path().stem()));
++  }
++  std::ranges::sort(names);
++  return names;
++}
++
++std::string GetChoice(int port)
++{
++  if (!IsValidPort(port))
++    return std::string(kCustom);
++  std::string choice = Config::Get(CHOICE[port]);
++  return choice.empty() ? std::string(kAuto) : choice;
++}
++
++void SetChoice(int port, const std::string& choice)
++{
++  if (IsValidPort(port))
++    Config::SetBase(CHOICE[port], choice);
++}
++
++std::string AutoLayoutFor(const std::string& device)
++{
++  ciface::Core::DeviceQualifier qualifier;
++  qualifier.FromString(device);
++  const std::shared_ptr<ciface::Core::Device> found = g_controller_interface.FindDevice(qualifier);
++  if (found == nullptr)
++    return {};
++  const char* const name = LayoutNameFor(found->GetButtonLabels());
++  if (name == nullptr)
++    return {};
++  std::error_code ec;
++  return std::filesystem::is_regular_file(LayoutPath(name), ec) ? name : std::string();
++}
++
++std::string Resolve(int port)
++{
++  InputConfig* const config = Pad::GetConfig();
++  if (config == nullptr || port >= config->GetControllerCount())
++    return {};
++  const std::string choice = GetChoice(port);
++  if (choice == kCustom)
++    return {};
++  if (choice == kAuto)
++    return AutoLayoutFor(config->GetController(port)->GetDefaultDevice().ToString());
++  return choice;
++}
++
++std::string Apply(int port)
++{
++  const std::string name = Resolve(port);
++  if (name.empty())
++    return {};
++
++  Common::IniFile ini;
++  if (!ini.Load(PathToString(LayoutPath(name))))
++  {
++    std::fprintf(stderr, "[input] pad %d: layout '%s' not found\n", port + 1, name.c_str());
++    return {};
++  }
++
++  InputConfig* const config = Pad::GetConfig();
++  ControllerEmu::EmulatedController* const pad = config->GetController(port);
++  // A layout names no device (LoadConfig keeps the current one when the key is absent), but one
++  // saved from Dolphin would: put the pad back on the device it is actually using.
++  const std::string device = pad->GetDefaultDevice().ToString();
++  pad->LoadConfig(ini.GetOrCreateSection("Profile"));
++  pad->SetDefaultDevice(device);
++  pad->UpdateReferences(g_controller_interface);
++  config->SaveConfig();
++  std::fprintf(stderr, "[input] pad %d: %s layout\n", port + 1, name.c_str());
++  return name;
++}
++
++void ApplyAll()
++{
++  InputConfig* const config = Pad::GetConfig();
++  if (config == nullptr)
++    return;
++  const int count = std::min(config->GetControllerCount(), static_cast<int>(CHOICE.size()));
++  for (int port = 0; port < count; ++port)
++  {
++    // A port nobody configured (port 2 starts blank) has no device to pick a layout for.
++    if (!config->GetController(port)->GetDefaultDevice().ToString().empty())
++      Apply(port);
++  }
++}
++}  // namespace RecompPadLayout
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompPadLayout.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompPadLayout.h
+new file mode 100644
+index 00000000..ec835037
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompPadLayout.h
+@@ -0,0 +1,48 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++//
++// RingOut: control layouts for the emulated GameCube pads.
++//
++// A layout is an ordinary Dolphin GCPad profile (Config/Profiles/GCPad/<name>.ini) that a game
++// port ships to reproduce how one console release of the game was played -- the PlayStation 2
++// release's buttons on a DualSense, the Xbox release's on an Xbox pad. Each port remembers a
++// CHOICE: a layout by name, "Auto" (the layout named after the console whose pad is plugged in),
++// or "Custom" (the bindings as the player left them; set by rebinding a button by hand).
++//
++// Loading a layout replaces the pad's bindings but keeps its device. Bindings are host-side, so
++// layouts never affect netplay or determinism.
++
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace RecompPadLayout
++{
++inline constexpr std::string_view kAuto = "Auto";
++inline constexpr std::string_view kCustom = "Custom";
++
++// The layouts on offer, by name, sorted.
++std::vector<std::string> Available();
++
++// What a port (0-based) is set to: kAuto, kCustom or a layout name.
++std::string GetChoice(int port);
++// Records the choice in the base config layer; the caller saves the config.
++void SetChoice(int port, const std::string& choice);
++
++// The layout Auto picks for a device ("SDL/0/DualSense Wireless Controller"): the one named
++// after the console its buttons are printed like, or empty when there is none for it (a
++// keyboard, or a pad whose console has no layout).
++std::string AutoLayoutFor(const std::string& device);
++
++// The layout a port's choice resolves to on its current device; empty for "leave it alone".
++std::string Resolve(int port);
++
++// Loads the resolved layout onto a port's pad, keeping its device, and saves the pad config.
++// Returns the layout loaded, or empty when the choice resolved to nothing or the file is gone.
++// Touches InputConfig: never call it with a lock the CPU or video thread may wait on.
++std::string Apply(int port);
++
++// Apply for every port; called once the controllers are up at boot.
++void ApplyAll();
++}  // namespace RecompPadLayout
