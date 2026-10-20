@@ -1,0 +1,20 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 05ebd1e4..7801d1d5 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -861,7 +861,14 @@ std::unique_ptr<Platform> CreateHostPlatform(const RuntimeConfig &config) {
+ }
+ 
+ void ApplyCoreSettings(const GameMetadata &metadata) {
+-  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
++  // RINGOUT_CPU_CORE=jit runs the game on Dolphin's JIT instead of the recompiled module: a
++  // reference for telling a recompiler bug from an emulator one (same build, same settings).
++  const char *cpu_core = std::getenv("RINGOUT_CPU_CORE");
++  const bool use_jit = cpu_core != nullptr && std::string_view(cpu_core) == "jit";
++  if (use_jit)
++    std::fprintf(stderr, "[cpu-core] RINGOUT_CPU_CORE=jit: Dolphin's JIT, recompiled module unused\n");
++  Config::SetBase(Config::MAIN_CPU_CORE,
++                  use_jit ? PowerPC::CPUCore::JIT64 : PowerPC::CPUCore::StaticRecomp);
+   // Dolphin defaults CPUThread=false (single-core) on desktop, which runs the
+   // GPU synchronously on the CPU thread — every full-screen XFB blit / texture
+   // upload (heavy during FMV) then stalls the recompiled core. Dual-core moves
