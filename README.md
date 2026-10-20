@@ -42,8 +42,8 @@ config/             recompiler flags and native regions (recomp/), game settings
 scripts/            build, run, benchmark, training and packaging scripts (PowerShell)
 installer/          Windows installer: Inno Setup script, launcher (DefJam.exe) and the
                     script that builds the game on the player's machine
-tools-src/          profiling and diagnostics helpers (Python)
-docs/               notes and the external-footprint log
+tools-src/          profiling and diagnostics helpers, and the .viv modding tool (Python)
+docs/               notes, the modding guide and the external-footprint log
 lib/DolRecomp/, lib/ModernGekko/, patches/ModernGekko/, patches/RecompCore/, scripts/run-legacy.ps1
                     the earlier upstream stack, kept for reference only
 disc/, extracted/   your disc image and its extracted files (git-ignored)
@@ -152,11 +152,19 @@ the list says what the selected setting does.
   size, gap filling and pitch preservation. The GameCube mixes at 32 kHz, so the game
   never has anything above 16 kHz; Treble Boost brightens it to taste.
 - **System:** emulation speed, CPU overclock, fast disc loading, netplay, reset, quit.
-- **Controls, Cheats, Mods, States, Replays, Shots:** rebinding, cheat codes, texture mods,
+- **Controls, Cheats, Mods, States, Replays, Shots:** rebinding, cheat codes, mods,
   save states, input recordings and screenshots.
 
 A few settings (renderer, audio output, compile shaders at boot) apply at the next launch;
 the menu says so.
+
+## Mods
+
+A mod is a folder in `userdata/Load/Mods/<name>/`, switched on and off in **Esc > MODS**. It can
+replace textures (Dolphin custom textures, live) and game files (a `files/` folder that mirrors
+the disc, applied at the next boot through Dolphin's Riivolution file patching; the extracted
+game is never changed). `tools-src/modding/viv.py` extracts and rebuilds the game's `.viv`
+archives (EA BIG, RefPack-compressed). See [docs/modding.md](docs/modding.md).
 
 ## Netplay
 

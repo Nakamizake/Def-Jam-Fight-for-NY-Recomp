@@ -38,6 +38,13 @@ networks are enough), above all on the PC that hosts. The players are introduced
 Dolphin's public netplay server (stun.dolphin-emu.org), with thanks to the Dolphin team;
 the match itself runs directly between the PCs.
 
+Mods
+----
+Put each mod in its own folder in userdata\Load\Mods\ (a .zip, .rar or .7z can be dropped
+there as it is) and switch it on in Esc > MODS. Mods can replace textures and game files;
+the game's own files are never changed. How to make one: modding\README.md. Online, both
+players need the same mods that replace game files.
+
 Everything the game writes (saves, settings, shader cache) stays in the install folder.
 Uninstalling removes the game and asks whether to keep your saves and settings.
 

@@ -12,6 +12,7 @@
       module-src\    RingOut's module CMake project
       config\        recompiler flags and regions, game settings, first-run defaults
       setup\         build-game.ps1, GameBuild.psm1 and AutoPlay.psm1 (for -Optimize)
+      modding\       viv.py / refpack.py (the .viv archive tool) and the modding guide
       licenses\      licences of everything bundled
 
     Nothing derived from the disc is staged: no extracted files, generated code, module,
@@ -145,6 +146,11 @@ foreach ($needed in 'bin\llvm-profdata.exe', 'lib\clang\*\lib\windows\libclang_r
     if (-not (Test-Path (Join-Path $toolchain $needed))) { throw "The trimmed toolchain lacks $needed." }
 }
 Copy-Item (Join-Path $repoRoot 'installer\before-you-install.txt') (Join-Path $stage 'README.txt')
+# modding: the .viv archive tool and the guide, run with the staged Python.
+$modding = Join-Path $stage 'modding'
+New-Item -ItemType Directory -Force $modding | Out-Null
+Copy-Item (Join-Path $repoRoot 'tools-src\modding\viv.py'), (Join-Path $repoRoot 'tools-src\modding\refpack.py') $modding
+Copy-Item (Join-Path $repoRoot 'docs\modding.md') (Join-Path $modding 'README.md')
 
 # licenses
 $licenses = Join-Path $stage 'licenses'
