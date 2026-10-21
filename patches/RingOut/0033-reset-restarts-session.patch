@@ -1,0 +1,104 @@
+diff --git a/ModernGekko/tools/moderngekko_run.cpp b/ModernGekko/tools/moderngekko_run.cpp
+index 1885c82f..02ee8c13 100644
+--- a/ModernGekko/tools/moderngekko_run.cpp
++++ b/ModernGekko/tools/moderngekko_run.cpp
+@@ -201,6 +201,18 @@ bool ApplyReplayRequest(moderngekko::RuntimeConfig *config) {
+   return true;
+ }
+ 
++// Consume <userdir>/restart-request.ini, which the in-game menu's Reset Game
++// leaves: true when the session should be booted again. Deleted first, like the
++// replay request, so it can never fire twice.
++bool ConsumeRestartRequest(const std::filesystem::path &user_directory) {
++  const std::filesystem::path request_path =
++      user_directory / "restart-request.ini";
++  std::error_code ec;
++  if (!std::filesystem::is_regular_file(request_path, ec))
++    return false;
++  return std::filesystem::remove(request_path, ec);
++}
++
+ int RunExtract(const std::string &image, const std::string &out_dir) {
+   const std::unique_ptr<DiscIO::VolumeDisc> volume = DiscIO::CreateDisc(image);
+   if (!volume) {
+@@ -566,6 +578,8 @@ int RunMain(int argc, char **argv) {
+   // for a request left by a session that has already exited, and again after
+   // this session ends, which is the path a menu press actually takes.
+   ApplyReplayRequest(&config);
++  // A launch boots anyway; a restart request left by a crashed session is moot.
++  ConsumeRestartRequest(config.user_directory);
+ 
+   if (config.automation.unattended && config.automation.directory.empty()) {
+     std::cerr << "--unattended needs --automation-dir: nothing else could play\n";
+@@ -626,6 +640,14 @@ int RunMain(int argc, char **argv) {
+     }
+   }
+ 
++  // Reset Game from the menu: the same settings, from boot.
++  if (ConsumeRestartRequest(session_config.user_directory)) {
++    created.runtime.reset();
++    std::cerr << "[menu] booting the game again\n";
++    config = session_config;
++    continue;
++  }
++
+   // The in-game menu cannot join a session in place -- the lobby runs before
+   // the core boots and NetPlay_Enable happens inside NetPlayClient::StartGame.
+   // So "Start Netplay" writes a request and quits, and the session is rebuilt
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+index 0eb0e2b8..7b0510f7 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMenu.cpp
+@@ -415,6 +415,23 @@ bool WriteReplayRequest(int mode, const std::string& file)
+   return static_cast<bool>(out);
+ }
+ 
++// Reset Game's request: its presence alone asks the runner to boot the game
++// again once this session has ended.
++bool WriteRestartRequest()
++{
++  const std::string path = File::GetUserPath(D_USER_IDX) + "restart-request.ini";
++  std::ofstream out(path, std::ios::trunc);
++  if (!out)
++    return false;
++  out << "[Restart]\n";
++  out.close();
++  return static_cast<bool>(out);
++}
++
++// Set by Reset Game for the session it starts: a reset means from boot, so the
++// Quit row's continue-where-you-left-off snapshot is not loaded into it.
++std::atomic<bool> s_skip_auto_resume{false};
++
+ // One cheat code flattened for the list: either an Action Replay or a Gecko
+ // entry, identified by index into the matching vector.
+ struct CheatRow
+@@ -3251,6 +3268,19 @@ void OnKey(Key key)
+       fullscreen_callback();
+     break;
+   case Action::Reset:
++    // A restart of the session, not the console's reset button: a game answers
++    // the button by rebooting through the IPL (Def Jam jumps to 0x81300000),
++    // and a static recompilation has no IPL to run -- the game froze. The
++    // runner rebuilds the session from boot instead, the way Start Netplay and
++    // the replays do. The button remains the fallback without a runner.
++    if (quit_callback && WriteRestartRequest())
++    {
++      std::fprintf(stderr, "[menu] restarting the game\n");
++      s_skip_auto_resume = true;
++      CloseAndResume();
++      QuitOnceResumed(quit_callback);
++      break;
++    }
+     // Close (and resume) first: ResetButton_Tap only schedules the reset, so it
+     // lands once the CPU thread is running again rather than against a paused
+     // core.
+@@ -3508,7 +3538,7 @@ void SetActiveReplay(std::string name)
+ 
+ void ScheduleAutoResumeLoad()
+ {
+-  if (IsUnattended() || !Config::Get(RECOMP_AUTO_RESUME))
++  if (s_skip_auto_resume.exchange(false) || IsUnattended() || !Config::Get(RECOMP_AUTO_RESUME))
+     return;
+   const std::string path = AutoResumePath();
+   if (!File::Exists(path))
