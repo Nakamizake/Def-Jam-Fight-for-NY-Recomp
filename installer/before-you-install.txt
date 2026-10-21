@@ -67,3 +67,5 @@ Uninstalling removes the game and asks whether to keep your saves and settings.
 
 This port is not affiliated with or endorsed by EA, Nintendo or any rights holder. The
 bundled programs are free software; their licences are in the licenses folder.
+
+Source code, guides and updates: https://github.com/Nakamizake/Def-Jam-Fight-for-NY-Recomp

@@ -1,9 +1,3 @@
-[submodule "lib/DolRecomp"]
-	path = lib/DolRecomp
-	url = https://github.com/ExpansionPak/DolRecomp.git
-[submodule "lib/ModernGekko"]
-	path = lib/ModernGekko
-	url = https://github.com/ExpansionPak/ModernGekko.git
 [submodule "lib/RingOut"]
 	path = lib/RingOut
 	url = https://github.com/jackpoison-prog/RingOut.git

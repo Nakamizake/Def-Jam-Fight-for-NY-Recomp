@@ -157,6 +157,7 @@ Copy-Item (Join-Path $repoRoot 'docs\modding.md') (Join-Path $modding 'README.md
 # licenses
 $licenses = Join-Path $stage 'licenses'
 New-Item -ItemType Directory -Force $licenses | Out-Null
+Copy-Item (Join-Path $repoRoot 'LICENSE') (Join-Path $licenses 'DefJamFFNY-Recomp-GPL-3.0.txt')
 Copy-Item (Join-Path $repoRoot 'lib\RingOut\LICENSE') (Join-Path $licenses 'RingOut-GPL-2.0.txt')
 Copy-Item (Join-Path $repoRoot 'lib\RingOut\ModernGekko\vendor\dolphin\COPYING') (Join-Path $licenses 'Dolphin-COPYING.txt')
 Copy-Tree (Join-Path $repoRoot 'lib\RingOut\ModernGekko\vendor\dolphin\LICENSES') (Join-Path $licenses 'Dolphin-LICENSES')
@@ -166,6 +167,9 @@ Copy-Item (Join-Path $cmakeRoot 'doc\cmake\LICENSE.rst') (Join-Path $licenses 'C
 @'
 Bundled components and their licences
 
+- This port (DefJam.exe, the scripts, settings, controller layouts and button icons, and the
+  patches built into the runtime): GPL-3.0-or-later. DefJamFFNY-Recomp-GPL-3.0.txt.
+  Source: https://github.com/Nakamizake/Def-Jam-Fight-for-NY-Recomp
 - moderngekko-run.exe, dolrecomp.exe, module-src\: RingOut (DolRecomp + ModernGekko, built
   on Dolphin), GPL-2.0-or-later. RingOut-GPL-2.0.txt, Dolphin-COPYING.txt, Dolphin-LICENSES\.
   Source: https://github.com/jackpoison-prog/RingOut, plus this port's patches.

@@ -37,7 +37,7 @@ $env:RINGOUT_DUMP_TEXTURES = '1'; .\DefJam.exe
 appears. The dumps land in `userdata/Dump/Textures/GNWE69/`; copy the one you want into your mod
 and edit it (a larger image of the same aspect ratio is fine).
 
-The button icons are drawn by the port itself (see *Button icons* in the README), above the HD
+The button icons are drawn by the port itself (see *Button icons* in the player guide, `docs/playing.md` in the repository), above the HD
 texture pack and below the mods: a mod that replaces one of them wins.
 
 A loose HD texture pack also works in `userdata/Load/Textures/GNWE69/` (the *HD texture pack*
