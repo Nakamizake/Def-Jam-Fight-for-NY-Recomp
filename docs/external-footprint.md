@@ -55,5 +55,4 @@ These are local only and are removed by deleting the folder:
 | `tools/dolphin/` | Dolphin 2609a x64, portable (`portable.txt`), used only for `DolphinTool convert` | https://dl.dolphin-emu.org/releases/2609a/dolphin-2609a-x64.7z (SHA-256 `bbfd13bf9e6d2a4164a15c392b1f32a9b18150e5136746b388704608fbb60f76`) |
 | `tools/llvm-mingw/` | llvm-mingw 20260616 (Clang 22.1.8, UCRT x86_64), portable; builds the game module only (RingOut's generated code needs Clang) | https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-x86_64.zip (SHA-256 `b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35`) |
 | `tools/downloads/` | the Dolphin and llvm-mingw archives above | same |
-| `references/RingOut/` | old read-only clone of RingOut (broken index); superseded by the `lib/RingOut` submodule and safe to delete | https://github.com/jackpoison-prog/RingOut |
 | `lib/*/build/` | submodule build output | generated |
