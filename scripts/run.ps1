@@ -54,6 +54,17 @@ $moduleFile = Get-Item $modulePath
 Import-Module (Join-Path $PSScriptRoot 'GameBuild.psm1') -Force
 Initialize-UserDirectory -UserDir $userDir -ConfigDir (Join-Path $repoRoot 'config') -GameId $GameId
 
+# The port's fixes (<game>/fixes, see tools-src/modding/port_fixes.py), rebuilt when missing or
+# older than the tools that make them.
+$fixes = Join-Path $gameRoot 'fixes'
+$fixTools = Get-ChildItem (Join-Path $repoRoot 'tools-src\modding') -Filter *.py
+if (-not (Test-Path $fixes) -or
+    ($fixTools | Where-Object LastWriteTime -gt (Get-Item $fixes).LastWriteTime)) {
+    & (Join-Path $repoRoot 'tools\llvm-mingw\python\bin\python.exe') -I `
+        (Join-Path $repoRoot 'tools-src\modding\port_fixes.py') --game $gameRoot
+    if ($LASTEXITCODE -ne 0) { Write-Warning "The port's fixes could not be built; running without them." }
+}
+
 $arguments = @('--game', $gameRoot, '--module', $moduleFile.FullName, '--user-dir', $userDir,
     '--title', 'Def Jam: Fight for NY')
 if ($Graphics) { $arguments += @('--graphics', $Graphics) }

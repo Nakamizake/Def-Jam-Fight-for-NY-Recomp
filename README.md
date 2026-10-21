@@ -40,6 +40,8 @@ console hardware.
   PlayStation, Xbox, Switch, GameCube or keyboard icons, and follow whatever you last pressed.
 - **Online play.** Netplay over the internet with a host code (no port forwarding), or over a
   LAN or VPN.
+- **What the GameCube release left out.** The Sketch Artist's voice page is back: pick your
+  created fighter's voice out of six, with a preview of each, as on the other consoles.
 - **Mods.** Drop-in texture replacements and game-file mods, switched on and off in game,
   without ever touching the game's own files. Includes a tool for the game's `.viv` archives.
 - **Optimize for this PC.** An optional, unattended profile-guided build that plays the game

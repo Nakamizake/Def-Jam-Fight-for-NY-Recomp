@@ -13,8 +13,9 @@
       config\        recompiler flags and regions, game settings, first-run defaults, layouts
                      and the button icon art
       setup\         build-game.ps1, GameBuild.psm1 and AutoPlay.psm1 (for -Optimize)
-      modding\       viv.py / refpack.py (the .viv archive tool), the PS2 extras builder
-                     (tools-src/ps2: HD textures, music) and the modding guide
+      modding\       viv.py / refpack.py (the .viv archive tool), port_fixes.py (the port's
+                     fixes, built by build-game.ps1), the PS2 extras builder (tools-src/ps2:
+                     HD textures, music) and the modding guide
       licenses\      licences of everything bundled
 
     Nothing derived from the disc is staged: no extracted files, generated code, module,
@@ -149,11 +150,11 @@ foreach ($needed in 'bin\llvm-profdata.exe', 'lib\clang\*\lib\windows\libclang_r
     if (-not (Test-Path (Join-Path $toolchain $needed))) { throw "The trimmed toolchain lacks $needed." }
 }
 Copy-Item (Join-Path $repoRoot 'installer\before-you-install.txt') (Join-Path $stage 'README.txt')
-# modding: the .viv archive tool, the PS2 extras builder and the guide, run with the staged
-# Python. The PS2 tools find viv.py and refpack.py next to them.
+# modding: the .viv archive tool, the port's fixes, the PS2 extras builder and the guide, run
+# with the staged Python. The other tools find viv.py and refpack.py next to them.
 $modding = Join-Path $stage 'modding'
 New-Item -ItemType Directory -Force $modding | Out-Null
-Copy-Item (Join-Path $repoRoot 'tools-src\modding\viv.py'), (Join-Path $repoRoot 'tools-src\modding\refpack.py') $modding
+Copy-Item (Join-Path $repoRoot 'tools-src\modding\*.py') $modding
 Copy-Item (Join-Path $repoRoot 'tools-src\ps2\*.py') $modding
 Copy-Item (Join-Path $repoRoot 'docs\modding.md') (Join-Path $modding 'README.md')
 

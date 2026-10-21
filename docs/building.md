@@ -36,7 +36,7 @@ git submodule update --init --depth 1 lib/RingOut
 # 3. Recompile the game and build the module (about 20-30 minutes)
 .\scripts\build-module.ps1 -Jobs 4
 
-# 4. Play
+# 4. Play (the first run also builds the port's fixes into extracted/GNWE69/fixes)
 .\scripts\run.ps1
 ```
 

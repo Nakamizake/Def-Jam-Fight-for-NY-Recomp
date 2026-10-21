@@ -163,6 +163,34 @@ each file). `pack` keeps the original bytes of every unchanged file, compresses 
 again the way they were stored, and appends files that were not in the archive. Always write the
 result into a mod, never over the game's own archive.
 
+## Port fixes
+
+Some of what the GameCube release left out is still on its disc, only switched off. The port
+switches it back on with its own fixes: game files (and, when needed, memory patches) laid out
+like a mod in the game's `fixes` folder (`extracted/GNWE69/fixes/`; in an installed game,
+`game\fixes\`). The runtime applies them on every boot, below every mod: a mod that replaces
+the same file wins over the fix. They are not listed in MODS, and they count for netplay like
+any game file.
+
+Being made from the game's files, the fixes cannot ship with the port either: the game build
+makes them (`build-game.ps1` on every install and update; `scripts/run.ps1` when they are
+missing or older than the tools), with `tools-src/modding/port_fixes.py`:
+
+```powershell
+python -I tools-src\modding\port_fixes.py --game extracted\GNWE69
+```
+
+**Voice page.** On the other consoles, the story mode's Sketch Artist ends with one more page
+after *Positive ID?*: what your fighter sounds like, out of six voices (Rough, Street, Clean
+Cut, Cocky, Smooth, Gruff), each with a preview on X. The GameCube release still has that page,
+with its art and its preview lines, but the screen's script skips it on the GameCube only and
+always gives the first voice. The script is `Sketch.apt`, the compiled ActionScript of
+`screens/story/Sketch.big` in `screens/screens.viv`; `voice_select.py` makes its two tests of
+`_root.g_console == "gc"` around the voice page compare with a string the console name never
+equals (one byte each) and rebuilds the archive. The voice is chosen when the fighter is
+created, so it shows in a new story. `voice_select.py --out <mod folder>` also builds it as an
+ordinary mod.
+
 ## Netplay
 
 Textures are only drawn on your PC, so they never matter to netplay. Game files do: they change

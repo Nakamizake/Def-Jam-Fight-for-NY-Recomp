@@ -1,0 +1,101 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index 62e0da7f..c3f7a429 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -1469,6 +1469,7 @@ RuntimeCreateResult Runtime::Create(RuntimeConfig config) {
+   // expensive the first time and after an actual patch.
+   RecompGameData::Initialize(impl->config.game_root.string(),
+                              impl->config.user_directory.string());
++  RecompMods::SetPortFixesRoot(impl->config.game_root.string());
+ 
+   impl->platform = CreateHostPlatform(impl->config);
+   if (!impl->platform || !impl->platform->Init()) {
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp
+index 3d15023b..1e993845 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp
+@@ -45,6 +45,8 @@ std::mutex s_mutex;
+ std::atomic<std::uint32_t> s_generation{0};
+ // Game-file mods this session booted with; see SetAppliedGameFiles.
+ std::vector<std::string> s_applied_game_files;
++// The game's port-fixes folder (<game root>/fixes); see SetPortFixesRoot.
++std::filesystem::path s_port_fixes;
+ 
+ std::string ModsRoot()
+ {
+@@ -497,22 +499,43 @@ std::vector<std::string> EnabledDirectories()
+ std::vector<GameFilesMod> EnabledGameFiles()
+ {
+   std::vector<GameFilesMod> result;
++  // UTF-8 with forward slashes, the form Dolphin's file functions take.
++  auto dolphin_path = [](const std::filesystem::path& path) {
++    std::string text = PathToString(path);
++    std::ranges::replace(text, '\\', '/');
++    return text;
++  };
+   for (const auto& mod : Scan())
+   {
+     if (!mod.enabled || mod.kind != Kind::GameFiles)
+       continue;
+-    // UTF-8 with forward slashes, the form Dolphin's file functions take.
+-    auto dolphin_path = [](const std::filesystem::path& path) {
+-      std::string text = PathToString(path);
+-      std::ranges::replace(text, '\\', '/');
+-      return text;
+-    };
+     result.push_back({mod.name, dolphin_path(mod.path), dolphin_path(FindFilesRoot(mod.path)),
+                       dolphin_path(FindPatchesFile(mod.path))});
+   }
++  // The port's own fixes come last, so any mod that replaces the same file wins.
++  std::filesystem::path fixes;
++  {
++    std::lock_guard lock(s_mutex);
++    fixes = s_port_fixes;
++  }
++  std::error_code ec;
++  if (!fixes.empty() && std::filesystem::is_directory(fixes, ec))
++  {
++    const std::filesystem::path files = FindFilesRoot(fixes);
++    const std::filesystem::path patches = FindPatchesFile(fixes);
++    if (!files.empty() || !patches.empty())
++      result.push_back({kPortFixesName, dolphin_path(fixes), dolphin_path(files), dolphin_path(patches)});
++  }
+   return result;
+ }
+ 
++void SetPortFixesRoot(const std::string& game_root)
++{
++  std::lock_guard lock(s_mutex);
++  s_port_fixes = game_root.empty() ? std::filesystem::path() :
++                                     StringToPath(game_root) / "fixes";
++}
++
+ std::vector<MemoryPatch> ReadMemoryPatches(const std::string& path,
+                                            std::vector<std::string>* errors)
+ {
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h
+index 4a76831b..ac4a1f51 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h
+@@ -106,9 +106,20 @@ std::vector<MemoryPatch> ReadMemoryPatches(const std::string& path,
+                                            std::vector<std::string>* errors);
+ 
+ // Enabled mods that carry game files, highest precedence first (the same order
+-// as textures: where two replace the same file, the earlier name wins).
++// as textures: where two replace the same file, the earlier name wins). The
++// port's fixes, when the game has any, come last under kPortFixesName.
+ std::vector<GameFilesMod> EnabledGameFiles();
+ 
++// Port fixes: game files (and memory patches) the port applies on every boot,
++// laid out like a mod in <game root>/fixes/ -- a `files/` tree and/or a
++// patches.txt. They are made from the player's own disc when the game is
++// built, so nothing disc-derived ships, and they restore or repair what the
++// GameCube release left out (the Sketch Artist's voice page, for one). Never
++// listed in MODS or switched off there; a mod replacing the same file wins.
++// They count for netplay like any game-file mod.
++inline constexpr char kPortFixesName[] = "<port fixes>";
++void SetPortFixesRoot(const std::string& game_root);
++
+ // The booting session records which game-file mods it applied, so the menu can
+ // tell a toggle that is waiting for a restart from one that is in effect.
+ void SetAppliedGameFiles(std::vector<std::string> names);

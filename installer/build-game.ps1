@@ -8,7 +8,8 @@
     1. Checks the disc image: a plain GameCube .iso of Def Jam: Fight for NY (USA, GNWE69).
     2. Extracts it to game\ with dolrecomp.
     3. Recompiles main.dol to C and builds module\gGNWE69_recomp.dll with the bundled Clang.
-    4. Prepares userdata\ (game settings, first-run defaults, controller layout).
+    4. Prepares userdata\ (game settings, first-run defaults, controller layout) and builds
+       game\fixes\ (what the port restores in the game, from the extracted files).
 
     With -Optimize, step 3 becomes profile-guided optimisation (PGO): a measuring build of
     the module, a few minutes of the game playing fights on its own (AutoPlay.psm1, with the
@@ -313,8 +314,15 @@ flagged by mistake). Restore it from quarantine, or reinstall the game.
         Get-ModuleStamp $stamp $pgoProfile | Set-Content -Encoding ascii -LiteralPath $profilePaths.ModuleStamp
     }
 
-    Write-Host "==> $(Get-StepLabel)  Preparing settings"
+    Write-Host "==> $(Get-StepLabel)  Preparing settings and the port's fixes"
     Initialize-UserDirectory -UserDir $paths.UserData -ConfigDir $paths.Config -GameId $GameId
+    # game\fixes: what the port restores in the game on every boot (port_fixes.py), made from
+    # the extracted files each time so an update brings its new fixes along. The game plays
+    # without them, so a failure here is a warning and not the end of the build.
+    & $toolchain.Python -I (Join-Path $app 'modding\port_fixes.py') --game $paths.Game | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "    The port's fixes could not be built (exit $LASTEXITCODE); the game runs without them." -ForegroundColor Yellow
+    }
     Remove-Item -Recurse -Force -LiteralPath $paths.Work -ErrorAction SilentlyContinue
 
     Write-Host ''
