@@ -14,8 +14,10 @@ The installer, `DefJamFFNY-Setup-<version>.exe`, is per-user and needs no admini
 - Right after installing, a console window builds the game from your disc (about 5–8 minutes,
   using every CPU core) and closes by itself.
 - The first start prepares the graphics shaders for about a minute; later starts are quick.
-- Start menu: the game, *Def Jam - Rebuild game files*, *Def Jam - Optimize for this PC*, the
-  game folder and the uninstaller.
+- Shortcuts: the game folder always has *Rebuild game files*, *Optimize for this PC* and
+  *Build PS2 HD textures*. Two optional tasks add Start menu entries (the game, those three
+  tools as *Def Jam - ...*, the game folder and the uninstaller) and a desktop shortcut;
+  untick them when updating and the old ones are removed.
 
 ### Optimize for this PC
 
@@ -37,9 +39,18 @@ Run the installer of the new version and pick the same folder. The disc is not n
 (leave the disc field empty); saves, settings and the optimisation are kept. When the game's
 code did not change, the build step finishes in seconds.
 
+### PS2 HD textures
+
+Optional (also offered, unticked, at the end of the install). The PlayStation 2 release has
+most of the game's textures at twice the resolution. *Build PS2 HD textures* asks for your own
+disc image of Def Jam: Fight for NY for PlayStation 2 (`.iso`), copies those textures into a mod
+named **PS2Textures** in about a minute and switches it on; Esc > MODS switches it off again.
+It needs about 250 MB, only reads the disc image, and writes its log to
+`logs\ps2-textures.log`. How it works: *PS2 texture pack* in the [modding guide](modding.md).
+
 ### Uninstalling
 
-Settings > Apps, or the uninstaller in the Start menu. It removes the game and the built files,
+Settings > Apps, or the uninstaller in the Start menu (or `unins000.exe` in the game folder). It removes the game and the built files,
 and asks whether to keep your saves and settings.
 
 ## Settings menu

@@ -6,7 +6,7 @@
 ; (setup\build-game.ps1), right after the files are installed.
 ;
 ; Per-user install: no administrator rights, nothing outside the chosen folder except the
-; Start menu entries, the optional desktop shortcut and the uninstall entry (HKCU).
+; optional Start menu entries and desktop shortcut and the uninstall entry (HKCU).
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -51,6 +51,8 @@ CreateUninstallRegKey=no
 #endif
 
 [Tasks]
+; Both optional. The tools (rebuild, optimize, PS2 textures) are always in the game folder too.
+Name: "startmenu"; Description: "Create Start menu entries (the game, its tools and the uninstaller)"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
@@ -60,15 +62,18 @@ Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdir
 ; Test installs (see TestInstall above) create no shortcuts outside the install folder.
 #ifndef TestInstall
 ; Start menu search lists entries by their own names, so each one says which game it is for.
-Name: "{group}\{#ShortName}"; Filename: "{app}\DefJam.exe"
-Name: "{group}\Def Jam - Rebuild game files"; Filename: "{app}\DefJam.exe"; Parameters: "--rebuild"
-Name: "{group}\Def Jam - Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "--optimize"
-Name: "{group}\Def Jam - Game folder"; Filename: "{app}"
-Name: "{group}\Uninstall {#ShortName}"; Filename: "{uninstallexe}"
+Name: "{group}\{#ShortName}"; Filename: "{app}\DefJam.exe"; Tasks: startmenu
+Name: "{group}\Def Jam - Rebuild game files"; Filename: "{app}\DefJam.exe"; Parameters: "--rebuild"; Tasks: startmenu
+Name: "{group}\Def Jam - Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "--optimize"; Tasks: startmenu
+Name: "{group}\Def Jam - Build PS2 HD textures"; Filename: "{app}\DefJam.exe"; Parameters: "--ps2-textures"; Tasks: startmenu
+Name: "{group}\Def Jam - Game folder"; Filename: "{app}"; Tasks: startmenu
+Name: "{group}\Uninstall {#ShortName}"; Filename: "{uninstallexe}"; Tasks: startmenu
 Name: "{autodesktop}\{#ShortName}"; Filename: "{app}\DefJam.exe"; Tasks: desktopicon
 #endif
-; Also next to the game, for players who start it from its folder.
+; Always next to the game, for players who start it from its folder.
+Name: "{app}\Rebuild game files"; Filename: "{app}\DefJam.exe"; Parameters: "--rebuild"; WorkingDir: "{app}"
 Name: "{app}\Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "--optimize"; WorkingDir: "{app}"
+Name: "{app}\Build PS2 HD textures"; Filename: "{app}\DefJam.exe"; Parameters: "--ps2-textures"; WorkingDir: "{app}"
 
 #ifndef TestInstall
 [InstallDelete]
@@ -76,12 +81,17 @@ Name: "{app}\Optimize for this PC"; Filename: "{app}\DefJam.exe"; Parameters: "-
 Type: files; Name: "{group}\Rebuild game files.lnk"
 Type: files; Name: "{group}\Optimize for this PC.lnk"
 Type: files; Name: "{group}\Game folder.lnk"
+; An update that unticks the Start menu entries removes the ones an earlier install made.
+Type: filesandordirs; Name: "{group}"; Tasks: not startmenu
+; Same for the desktop shortcut.
+Type: files; Name: "{autodesktop}\{#ShortName}.lnk"; Tasks: not desktopicon
 #endif
 
 [Run]
-; Optional and off by default. It runs first and is waited for, so with both ticked the game
-; starts once the optimization is done instead of alongside it.
-Filename: "{app}\DefJam.exe"; Parameters: "--optimize"; Description: "Optimize the game for this PC now (optional, about 20 minutes; also in the Start menu)"; Flags: postinstall unchecked skipifsilent; Check: GameIsBuilt
+; Optional and off by default. They run first and are waited for, so with "Play now" also
+; ticked the game starts once they are done instead of alongside them.
+Filename: "{app}\DefJam.exe"; Parameters: "--ps2-textures"; Description: "Build HD textures from your PlayStation 2 disc image now (optional, a minute or two; also in the game folder)"; Flags: postinstall unchecked skipifsilent; Check: GameIsBuilt
+Filename: "{app}\DefJam.exe"; Parameters: "--optimize"; Description: "Optimize the game for this PC now (optional, about 20 minutes; also in the game folder)"; Flags: postinstall unchecked skipifsilent; Check: GameIsBuilt
 Filename: "{app}\DefJam.exe"; Description: "Play now"; Flags: postinstall nowait skipifsilent; Check: GameIsBuilt
 
 [UninstallDelete]

@@ -44,6 +44,36 @@ A loose HD texture pack also works in `userdata/Load/Textures/GNWE69/` (the *HD 
 row in MODS). Where a mod and the pack replace the same texture, the mod wins; between two mods,
 the one whose name sorts first wins.
 
+### PS2 texture pack
+
+The PlayStation 2 release of the game has the same textures as the GameCube one, but most of
+them at twice the width and height: every character texture and about half of each venue's.
+`tools-src/textures/ps2_textures.py` builds a texture mod from them, out of your own copy of the
+PS2 disc (an `.iso`, or a folder with its files). It pairs each GameCube texture with its PS2
+counterpart and writes the larger one under the GameCube texture's name. It leaves a texture out
+when the PS2 one is not larger, and also when the two pictures do not match once the larger one
+is scaled down (a few textures were redrawn between the releases). Neither disc is changed.
+
+```powershell
+python -I tools-src\textures\ps2_textures.py --gc-files extracted\GNWE69\files `
+    --ps2 D:\Games\DefJamPS2.iso --out userdata\Load\Mods\PS2Textures
+```
+
+An installed game does all of this in one click: *Build PS2 HD textures* in the game folder
+(or the Start menu) asks for the PS2 disc image, builds the mod and switches it on. By hand, the
+tool is in `modding\`, so from the game folder:
+
+```powershell
+toolchain\python\bin\python.exe -I modding\ps2_textures.py --gc-files game\files `
+    --ps2 D:\Games\DefJamPS2.iso --out userdata\Load\Mods\PS2Textures
+```
+
+It takes a minute or two and writes about 5,800 textures: around 160 MB, or 250 MB with the
+installed game's Python, which lacks zlib and leaves the PNGs uncompressed. Then switch on
+**PS2Textures** in Esc > MODS. Like any texture mod it is drawn only on your PC, so it never
+matters to netplay. The textures are loaded the first time the game uses each one, not all at
+boot, which keeps the game's memory use about the same with the pack on.
+
 ## Game files
 
 A `files` folder in a mod mirrors the disc's file tree, the one extracted to

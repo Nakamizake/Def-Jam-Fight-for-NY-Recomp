@@ -19,12 +19,16 @@ What happens
 1. The files are installed in the folder you choose (no administrator rights needed).
 2. A console window opens and builds the game from your disc. This takes several minutes
    (about 8 on a 6-core PC) and uses all CPU cores; the window closes by itself when done.
-3. Start the game from the Start menu or the desktop shortcut. The first start prepares
+3. Start the game from the Start menu, the desktop shortcut (both optional) or DefJam.exe
+   in the game folder. The first start prepares
    the graphics shaders for about a minute; later starts are quick. The game opens
    fullscreen: Alt+Enter switches to a window, Esc opens the settings menu.
-4. Optional: "Def Jam - Optimize for this PC" in the Start menu (or "Optimize for this PC"
-   in the game folder) makes the game run faster (about 20 minutes). A game window opens
+4. Optional: "Optimize for this PC" in the game folder (or "Def Jam - Optimize for this PC"
+   in the Start menu) makes the game run faster (about 20 minutes). A game window opens
    and plays fights on its own while it measures; your saves and settings are not touched.
+5. Optional: "Build PS2 HD textures" in the game folder (or the Start menu) copies the
+   sharper textures of the PlayStation 2 version from your own PS2 disc image (.iso) into
+   a mod, in a minute or two.
 
 Updating
 --------

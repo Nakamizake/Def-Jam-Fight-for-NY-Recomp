@@ -55,7 +55,11 @@ class Archive:
 
 
 def read_archive(path: pathlib.Path) -> Archive:
-    data = path.read_bytes()
+    return parse_archive(path.read_bytes(), str(path))
+
+
+def parse_archive(data: bytes, path: str = "archive") -> Archive:
+    """An archive already in memory (`path` only names it in errors)."""
     magic = data[:4]
     if magic not in MAGICS:
         raise ValueError(f"{path}: not a BIG archive (magic {magic!r})")

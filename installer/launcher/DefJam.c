@@ -9,6 +9,12 @@
  *                         cancelled, from the game already extracted
  *   DefJam.exe --optimize build again optimised for this PC: the game plays itself for a
  *                         few minutes to measure where its time goes (PGO); ~20 minutes
+ *   DefJam.exe --ps2-textures
+ *                         build the PS2Textures mod (modding\ps2_textures.py) from the player's
+ *                         PlayStation 2 disc image and switch it on
+ *   DefJam.exe --ps2-textures
+ *                         build the PS2Textures mod (modding\ps2_textures.py) from the player's
+ *                         PlayStation 2 disc image and switch it on
  *
  * A GUI program, so no console window flashes up. The runtime's own console output goes to
  * logs\runtime.log, which is the first thing to look at when the game will not start.
@@ -123,6 +129,61 @@ static BOOL build_game(const wchar_t *disc_image, BOOL optimize)
     return code == 0 && game_is_built();
 }
 
+static BOOL pick_ps2_image(wchar_t *out, DWORD size)
+{
+    OPENFILENAMEW dialog;
+    ZeroMemory(&dialog, sizeof dialog);
+    out[0] = L'\0';
+    dialog.lStructSize = sizeof dialog;
+    dialog.lpstrFilter = L"PlayStation 2 disc image (*.iso)\0*.iso\0All files (*.*)\0*.*\0";
+    dialog.lpstrFile = out;
+    dialog.nMaxFile = size;
+    dialog.lpstrTitle = L"Choose your Def Jam: Fight for NY disc image (PlayStation 2)";
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameW(&dialog);
+}
+
+/* Runs modding\ps2_textures.py with the bundled Python, its output in logs\ps2-textures.log,
+ * and switches the mod on in userdata\Config\Mods.ini (where the MODS tab keeps its choices). */
+static BOOL build_ps2_textures(const wchar_t *ps2_image)
+{
+    wchar_t python[MAX_PATH], tool[MAX_PATH], files[MAX_PATH], mod[MAX_PATH], logs[MAX_PATH],
+        log_file[MAX_PATH], user[MAX_PATH], config[MAX_PATH], mods_ini[MAX_PATH],
+        command_line[CMDLINE_MAX];
+    SECURITY_ATTRIBUTES inheritable = {sizeof inheritable, NULL, TRUE};
+    HANDLE log;
+    int code;
+
+    root_path(python, MAX_PATH, L"toolchain\\python\\bin\\python.exe");
+    root_path(tool, MAX_PATH, L"modding\\ps2_textures.py");
+    root_path(files, MAX_PATH, L"game\\files");
+    root_path(mod, MAX_PATH, L"userdata\\Load\\Mods\\PS2Textures");
+    root_path(logs, MAX_PATH, L"logs");
+    root_path(log_file, MAX_PATH, L"logs\\ps2-textures.log");
+    CreateDirectoryW(logs, NULL);
+
+    _snwprintf(command_line, CMDLINE_MAX,
+               L"\"%ls\" -I \"%ls\" --gc-files \"%ls\" --ps2 \"%ls\" --out \"%ls\"", python, tool,
+               files, ps2_image, mod);
+    command_line[CMDLINE_MAX - 1] = L'\0';
+
+    log = CreateFileW(log_file, GENERIC_WRITE, FILE_SHARE_READ, &inheritable, CREATE_ALWAYS,
+                      FILE_ATTRIBUTE_NORMAL, NULL);
+    code = run(command_line, CREATE_NO_WINDOW, log == INVALID_HANDLE_VALUE ? NULL : log);
+    if (log != INVALID_HANDLE_VALUE)
+        CloseHandle(log);
+    if (code != 0)
+        return FALSE;
+
+    root_path(user, MAX_PATH, L"userdata");
+    root_path(config, MAX_PATH, L"userdata\\Config");
+    root_path(mods_ini, MAX_PATH, L"userdata\\Config\\Mods.ini");
+    CreateDirectoryW(user, NULL);
+    CreateDirectoryW(config, NULL);
+    WritePrivateProfileStringW(L"Mods", L"PS2Textures", L"True", mods_ini);
+    return TRUE;
+}
+
 /* Starts the runtime with its console hidden and its output in logs\runtime.log. */
 static int play(void)
 {
@@ -172,7 +233,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
     wchar_t disc_image[MAX_PATH];
     int argc;
     wchar_t **argv;
-    BOOL rebuild = FALSE, optimize = FALSE;
+    BOOL rebuild = FALSE, optimize = FALSE, ps2_textures = FALSE;
     (void)instance;
     (void)previous;
     (void)arguments;
@@ -192,7 +253,37 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
                 rebuild = TRUE;
             else if (_wcsicmp(argv[i], L"--optimize") == 0)
                 optimize = TRUE;
+            else if (_wcsicmp(argv[i], L"--ps2-textures") == 0)
+                ps2_textures = TRUE;
         LocalFree(argv);
+    }
+
+    if (ps2_textures) {
+        if (!game_is_built()) {
+            show_error(L"Build the game first: start it once from the Def Jam: Fight for NY "
+                       L"shortcut, then build the PS2 textures.");
+            return 1;
+        }
+        if (MessageBoxW(NULL,
+                        L"Build HD textures from the PlayStation 2 version?\n\n"
+                        L"The PS2 release has most of the game's textures at twice the "
+                        L"resolution. This copies them, from your own disc image of Def Jam: "
+                        L"Fight for NY for PlayStation 2 (.iso), into a mod named PS2Textures "
+                        L"and switches it on (Esc > MODS switches it off again).\n\n"
+                        L"It takes a minute or two and about 250 MB of disk space. The disc "
+                        L"image is only read. A message appears when it is done.",
+                        APP_TITLE, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
+            return 1;
+        if (!pick_ps2_image(disc_image, MAX_PATH))
+            return 1;
+        if (!build_ps2_textures(disc_image)) {
+            show_error(L"The PS2 textures could not be built.\n\n"
+                       L"Details are in logs\\ps2-textures.log.");
+            return 1;
+        }
+        MessageBoxW(NULL, L"Done: the PS2 textures are on. Start the game as usual.", APP_TITLE,
+                    MB_OK | MB_ICONINFORMATION);
+        return 0;
     }
 
     if (optimize) {
