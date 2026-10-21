@@ -1,0 +1,108 @@
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.cpp b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+index 43d4dda5..eea3c118 100644
+--- a/ModernGekko/src/runtime/vi_locked_alarm.cpp
++++ b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <cstdio>
+ #include <cstring>
++#include <utility>
+ 
+ #include "Common/Config/Config.h"
+ #include "Core/Config/MainSettings.h"
+@@ -18,13 +19,13 @@ namespace {
+ constexpr std::uint32_t kAlarmPeriodOffset = 24;
+ constexpr std::uint32_t kAlarmStartOffset = 32;
+ constexpr std::uint32_t kAlarmSize = 40;
+-// FollowFrameLoop: a window of half a second of fields. A judder stretch makes 10-20 of them late
+-// (two of every three while it lasts); a handful is noise (a scene change, a long frame), and
+-// 25 or more is a step that always waits a frame, which is even. Each move is 1 ms, so crossing
+-// the check's whole range takes a few seconds.
++// FollowFrameLoop: a window of half a second of fields. A judder stretch makes 10-20 of them
++// uneven (steps 1, 2, 0 per frame); one long frame (a scene change) makes two. Each move is 1 ms,
++// so crossing a judder band takes a few seconds. More queued than kMaxQueued means the frame
++// loop is not running steps at all (loading): nothing to learn there.
+ constexpr std::uint32_t kWindowFields = 30;
+-constexpr std::uint32_t kLateFieldsToMove = 6;
+-constexpr std::uint32_t kLateFieldsSteady = 25;
++constexpr std::uint32_t kUnevenFieldsToMove = 4;
++constexpr std::uint32_t kMaxQueued = 3;
+ constexpr std::uint64_t kPhaseMoveUs = 1000;
+ } // namespace
+ 
+@@ -123,29 +124,27 @@ void ViLockedAlarm::FollowFrameLoop(const Memory::MemoryManager &memory, std::ui
+   const std::uint32_t queue = object + m_options.queue_offset;
+   if (!memory.GetPointerForRange(queue, sizeof(std::uint32_t)))
+     return;
+-  // Queued and not run when the field ends: this frame's check came before the step. More than
+-  // one means the loop is not running steps (loading, a pause): nothing to learn there.
++  // One step is queued per field, so the frame ran 1 + last - queued steps: anything but one
++  // shows as a change in the count.
+   const std::uint32_t queued = memory.Read_U32(queue);
+-  if (queued > 1) {
++  const std::optional<std::uint32_t> last = std::exchange(m_last_queued, queued);
++  if (queued > kMaxQueued || !last || *last > kMaxQueued) {
+     m_window_fields = 0;
+-    m_window_late = 0;
++    m_window_uneven = 0;
+     return;
+   }
+-  m_window_late += queued;
++  m_window_uneven += queued != *last;
+   if (++m_window_fields < kWindowFields)
+     return;
+-  // Late in some fields and not in others: the check moves back and forth across the step,
+-  // which is the judder. Late in (nearly) all of them is a step that always waits one frame,
+-  // which is even; and the game can keep one step in hand for a while, at any phase.
+-  if (m_window_late >= kLateFieldsToMove && m_window_late < kLateFieldsSteady) {
++  if (m_window_uneven >= kUnevenFieldsToMove) {
+     // Earlier, so the step is already waiting when the check comes; around the field if need be.
+     const std::uint64_t move = kPhaseMoveUs * ticks_per_second / 1000000;
+     m_step_phase = (*m_step_phase + field - move) % field;
+-    std::fprintf(stderr, "[vi-locked-alarm] field %llu: step late in %u of %u, phase now %llu us\n",
+-                 static_cast<unsigned long long>(m_fields), m_window_late, m_window_fields,
++    std::fprintf(stderr, "[vi-locked-alarm] field %llu: uneven in %u of %u, phase now %llu us\n",
++                 static_cast<unsigned long long>(m_fields), m_window_uneven, m_window_fields,
+                  static_cast<unsigned long long>(*m_step_phase * 1000000 / ticks_per_second));
+   }
+   m_window_fields = 0;
+-  m_window_late = 0;
++  m_window_uneven = 0;
+ }
+ } // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.hpp b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+index e4e4e8f2..e1f7a65e 100644
+--- a/ModernGekko/src/runtime/vi_locked_alarm.hpp
++++ b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+@@ -32,10 +32,12 @@ namespace moderngekko {
+ // Where in the field the step should come depends on the frame loop: it has to be away from
+ // the check, whose position moves with the scene and the CPU overclock (a phase that was
+ // perfect at 2x in one arena judders at 3x in another). With the game's step queue known, the
+-// lock follows the loop: a step still queued when a field ends means that frame's check came
+-// before it, and when that is so in some fields of a short window but not in others (the check
+-// moving back and forth across the step) the step is moved 1 ms earlier, until the check finds
+-// it waiting in every frame.
++// lock follows the loop. Locked, exactly one step is queued per field, so the count left in the
++// queue at a field's end only changes when that frame ran no step or two: the judder itself.
++// When it changes in several fields of a short window, the step is moved 1 ms earlier, until
++// the frames run one step each again. (Whether a step is waiting at the field's end says
++// nothing by itself: it is in every field both where the frames run one step a frame late,
++// which is smooth, and in the middle of a judder band.)
+ //
+ // Off unless Core.ViLockedAlarm names the alarm (MainSettings.h), normally in the game's ini.
+ class ViLockedAlarm {
+@@ -82,10 +84,11 @@ private:
+   Common::EventHook m_field_hook;
+   // Timebase ticks after a field's end at which the step is queued; set at the first field.
+   std::optional<std::uint64_t> m_step_phase;
+-  // Fields so far (for the log), and FollowFrameLoop's window: fields seen, and fields that
+-  // ended with a step still queued.
++  // Fields so far (for the log); the queue count at the last field's end; FollowFrameLoop's
++  // window: fields seen, and fields whose frame ran no step or two (the count changed).
+   std::uint64_t m_fields = 0;
++  std::optional<std::uint32_t> m_last_queued;
+   std::uint32_t m_window_fields = 0;
+-  std::uint32_t m_window_late = 0;
++  std::uint32_t m_window_uneven = 0;
+ };
+ } // namespace moderngekko
