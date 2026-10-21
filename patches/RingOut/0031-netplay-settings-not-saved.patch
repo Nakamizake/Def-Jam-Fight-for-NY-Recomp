@@ -1,0 +1,63 @@
+diff --git a/ModernGekko/tools/netplay_session.cpp b/ModernGekko/tools/netplay_session.cpp
+index 08a6ae55..1c2507ce 100644
+--- a/ModernGekko/tools/netplay_session.cpp
++++ b/ModernGekko/tools/netplay_session.cpp
+@@ -884,6 +884,13 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+   UICommon::Init();
+   detail::SetExternalUICommon(true);
+ 
++  // Everything this session forces goes on the CurrentRun layer (Config::SetCurrent), never
++  // the base layer: the base layer is the player's Dolphin.ini, and any Config::Save during
++  // or after the session (the in-game menu, UICommon) wrote these into it. After one netplay
++  // match the player's offline game kept running at 1x clock with a deterministic GPU
++  // thread, i.e. without the overclock the game needs. CurrentRun also outranks the game's
++  // settings ini, so a value forced here is the value the session runs with.
++  //
+   // Netplay used to force single-core, reasoning that a dual-core split lets the
+   // CPU and GPU threads interleave differently on each peer. Dolphin's own
+   // answer to that problem is not single-core but a DETERMINISTIC GPU thread
+@@ -914,19 +921,19 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+   // that event. RINGOUT_NETPLAY_SINGLECORE=1 restores the old shape and is the
+   // first thing to try if a peer ever asserts or desyncs.
+   const bool single_core = std::getenv("RINGOUT_NETPLAY_SINGLECORE") != nullptr;
+-  Config::SetBase(Config::MAIN_CPU_THREAD, !single_core);
++  Config::SetCurrent(Config::MAIN_CPU_THREAD, !single_core);
+   if (!single_core)
+-    Config::SetBase(Config::MAIN_GPU_DETERMINISM_MODE, std::string("fake-completion"));
++    Config::SetCurrent(Config::MAIN_GPU_DETERMINISM_MODE, std::string("fake-completion"));
+   Log(single_core ? "netplay: single-core (forced)"
+                   : "netplay: dual-core with a deterministic GPU thread");
+-  Config::SetBase(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
+-  Config::SetBase(Config::NETPLAY_SAVEDATA_LOAD, true);
+-  Config::SetBase(Config::NETPLAY_SAVEDATA_WRITE, true);
+-  Config::SetBase(Config::NETPLAY_SAVEDATA_SYNC_ALL_WII, false);
+-  Config::SetBase(Config::NETPLAY_SYNC_CODES, false);
+-  Config::SetBase(Config::NETPLAY_STRICT_SETTINGS_SYNC, true);
+-  Config::SetBase(Config::NETPLAY_NETWORK_MODE, std::string("fixeddelay"));
+-  Config::SetBase(Config::NETPLAY_USE_INDEX, false);
++  Config::SetCurrent(Config::MAIN_CPU_CORE, PowerPC::CPUCore::StaticRecomp);
++  Config::SetCurrent(Config::NETPLAY_SAVEDATA_LOAD, true);
++  Config::SetCurrent(Config::NETPLAY_SAVEDATA_WRITE, true);
++  Config::SetCurrent(Config::NETPLAY_SAVEDATA_SYNC_ALL_WII, false);
++  Config::SetCurrent(Config::NETPLAY_SYNC_CODES, false);
++  Config::SetCurrent(Config::NETPLAY_STRICT_SETTINGS_SYNC, true);
++  Config::SetCurrent(Config::NETPLAY_NETWORK_MODE, std::string("fixeddelay"));
++  Config::SetCurrent(Config::NETPLAY_USE_INDEX, false);
+ 
+   // Stock clock for netplay, on every peer. Dolphin does sync the host's
+   // overclock through its settings layer, so this is not strictly required for
+@@ -934,10 +941,10 @@ int RunNetplayLobby(RuntimeConfig runtime_config, ConfigResult frontend_config,
+   // recompiler's cycle accounting (downcount charged at block leaders, the
+   // mid-block exception refund) plus every determinism result were established
+   // at 1.0. Forcing it here means the host cannot advertise anything else.
+-  Config::SetBase(Config::MAIN_OVERCLOCK_ENABLE, false);
+-  Config::SetBase(Config::MAIN_OVERCLOCK, 1.0f);
+-  Config::SetBase(Config::MAIN_VI_OVERCLOCK_ENABLE, false);
+-  Config::SetBase(Config::MAIN_VI_OVERCLOCK, 1.0f);
++  Config::SetCurrent(Config::MAIN_OVERCLOCK_ENABLE, false);
++  Config::SetCurrent(Config::MAIN_OVERCLOCK, 1.0f);
++  Config::SetCurrent(Config::MAIN_VI_OVERCLOCK_ENABLE, false);
++  Config::SetCurrent(Config::MAIN_VI_OVERCLOCK, 1.0f);
+ 
+   // Dolphin drops all input, pipe included, whenever the render window lacks
+   // focus, and it defaults to off. That is wrong for netplay in two ways: a
