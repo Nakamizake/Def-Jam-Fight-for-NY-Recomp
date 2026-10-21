@@ -50,11 +50,16 @@ console hardware.
 
 ## Playing
 
+> [!IMPORTANT]
+> The port needs a **plain `.iso`** of **Def Jam: Fight for NY for GameCube, USA release
+> (`GNWE69`)**, dumped from your own copy. Other formats (`.rvz`, `.gcz`, `.wia`, `.ciso`,
+> `.nkit.iso`) are not accepted as they are: convert them first with
+> [Dolphin](https://dolphin-emu.org): right-click the game > *Convert File...* > Format **ISO**,
+> no compression.
+
 1. Get the installer, `DefJamFFNY-Setup-<version>.exe`, from the
    [Releases](https://github.com/Nakamizake/Def-Jam-Fight-for-NY-Recomp/releases) page.
-2. Have a disc image of **Def Jam: Fight for NY for GameCube, USA release (`GNWE69`)**, dumped
-   from your own copy, as a plain `.iso`. `.rvz`, `.gcz` and `.nkit` images can be converted
-   with Dolphin (right-click the game > *Convert File...* > ISO).
+2. Have your `.iso` ready (see above).
 3. Run the installer and point it at the `.iso` (it is found automatically when it sits next
    to the installer). The game is built right after installing: about 5–8 minutes.
 4. Start the game. Alt+Enter toggles fullscreen, Esc opens the settings menu.
@@ -105,7 +110,6 @@ logs when running from a clone).
 - [Player guide](docs/playing.md): controls, settings menu, button icons, netplay, updating.
 - [Modding guide](docs/modding.md): textures, game files, `.viv` archives.
 - [Building from source](docs/building.md): toolchain, build steps, performance, diagnostics.
-- [Contributing](CONTRIBUTING.md): ground rules and how changes to the runtime are made.
 - [External footprint](docs/external-footprint.md): everything the project writes outside its
   own folder, and how to remove it.
 

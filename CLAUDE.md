@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Static-recompilation port of Def Jam: Fight for NY (GameCube `GNWE69`) on RingOut's fork of
-DolRecomp + ModernGekko (chosen for speed). Human-facing docs: README.md, CONTRIBUTING.md and
+DolRecomp + ModernGekko (chosen for speed). Human-facing docs: README.md and
 docs/.
 
 ## Rules

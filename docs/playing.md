@@ -4,6 +4,9 @@
 
 The installer, `DefJamFFNY-Setup-<version>.exe`, is per-user and needs no administrator rights.
 
+- It needs a **plain `.iso`** of the GameCube USA release (`GNWE69`). Convert `.rvz`, `.gcz`,
+  `.wia`, `.ciso` or `.nkit.iso` images with Dolphin first: right-click the game >
+  *Convert File...* > Format **ISO**, no compression.
 - Pick any install folder. Everything the game writes (saves, settings, shader cache, logs)
   stays inside it.
 - The disc page is filled in automatically when the `.iso` sits next to the installer or in a

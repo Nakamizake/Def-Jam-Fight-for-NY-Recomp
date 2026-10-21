@@ -17,6 +17,9 @@
 
 Keep the repository in a path without spaces: DolRecomp's Windows build breaks on them.
 
+Everything derived from the disc (`disc/`, `extracted/`, generated C, game modules, PGO
+profiles, savestates) is git-ignored and must never be committed or shared.
+
 ## Build and run
 
 ```powershell
