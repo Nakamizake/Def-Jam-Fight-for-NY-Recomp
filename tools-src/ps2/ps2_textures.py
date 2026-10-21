@@ -30,8 +30,8 @@ from dataclasses import dataclass, field
 # `python -I` leaves the script's own directory off sys.path; add it and the modding tools.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path[:0] = [_HERE, os.path.join(os.path.dirname(_HERE), "modding")]
-import iso9660  # noqa: E402
 import png  # noqa: E402
+from ps2disc import Ps2Disc  # noqa: E402
 import refpack  # noqa: E402
 import shapes  # noqa: E402
 import viv  # noqa: E402
@@ -48,28 +48,6 @@ class Report:
     not_larger: int = 0
     unsupported: int = 0
     different: list[str] = field(default_factory=list)
-
-
-class Ps2Disc:
-    """The PlayStation 2 files, from the disc image or from a folder they were copied to."""
-
-    def __init__(self, source: str):
-        self._source = source
-        self._iso = iso9660.Iso9660(source) if os.path.isfile(source) else None
-        if self._iso:
-            paths = self._iso.paths()
-        else:
-            root = pathlib.Path(source)
-            paths = ["/" + p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()]
-        self._paths = {p.upper(): p for p in paths}
-
-    def find(self, relative: str) -> str | None:
-        return self._paths.get("/" + relative.upper())
-
-    def read(self, path: str) -> bytes:
-        if self._iso:
-            return self._iso.read(path)
-        return (pathlib.Path(self._source) / path.lstrip("/")).read_bytes()
 
 
 def shape_files(archive: viv.Archive, extension: str) -> dict[str, bytes]:
@@ -150,27 +128,27 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        build(args)
+        build(args.gc_files, args.ps2, args.out, args.jobs)
     except (OSError, ValueError) as error:
         sys.exit(f"ps2_textures: {error}")
 
 
-def build(args: argparse.Namespace) -> None:
+def build(gc_files: str, ps2_source: str, out: str, jobs: int) -> None:
     started = time.monotonic()
-    gc_root = pathlib.Path(args.gc_files)
-    disc = Ps2Disc(args.ps2)
+    gc_root = pathlib.Path(gc_files)
+    disc = Ps2Disc(ps2_source)
     pairs = []
     for gc_path in sorted(gc_root.rglob("*.viv")):
         relative = gc_path.relative_to(gc_root).as_posix()
         ps2_path = disc.find(relative)
         if ps2_path:
-            pairs.append((str(gc_path), args.ps2, ps2_path, relative))
+            pairs.append((str(gc_path), ps2_source, ps2_path, relative))
     print(f"{len(pairs)} archives on both discs")
     if not pairs:
-        raise ValueError(f"{args.ps2} does not look like Def Jam: Fight for NY for PlayStation 2 "
+        raise ValueError(f"{ps2_source} does not look like Def Jam: Fight for NY for PlayStation 2 "
                          f"(none of the game's archives are on it)")
 
-    textures = pathlib.Path(args.out) / "textures"
+    textures = pathlib.Path(out) / "textures"
     if textures.exists():
         for old in textures.rglob("*.png"):
             old.unlink()
@@ -178,7 +156,7 @@ def build(args: argparse.Namespace) -> None:
     different: list[str] = []
     totals = {"not larger": 0, "unsupported": 0}
     size = 0
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.jobs) as pool:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
         for report in pool.map(pair_archive, *zip(*pairs)):
             folder = textures / pathlib.PurePosixPath(report.archive).with_suffix("")
             new = {n: data for n, data in report.written.items() if n not in written}

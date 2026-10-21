@@ -9,12 +9,10 @@
  *                         cancelled, from the game already extracted
  *   DefJam.exe --optimize build again optimised for this PC: the game plays itself for a
  *                         few minutes to measure where its time goes (PGO); ~20 minutes
- *   DefJam.exe --ps2-textures
- *                         build the PS2Textures mod (modding\ps2_textures.py) from the player's
- *                         PlayStation 2 disc image and switch it on
- *   DefJam.exe --ps2-textures
- *                         build the PS2Textures mod (modding\ps2_textures.py) from the player's
- *                         PlayStation 2 disc image and switch it on
+ *   DefJam.exe --ps2-extras
+ *                         let the player pick what to take from their PlayStation 2 disc image
+ *                         (HD textures, music, ...), build each pick as a mod
+ *                         (modding\ps2_extras.py) and switch it on
  *
  * A GUI program, so no console window flashes up. The runtime's own console output goes to
  * logs\runtime.log, which is the first thing to look at when the game will not start.
@@ -143,45 +141,163 @@ static BOOL pick_ps2_image(wchar_t *out, DWORD size)
     return GetOpenFileNameW(&dialog);
 }
 
-/* Runs modding\ps2_textures.py with the bundled Python, its output in logs\ps2-textures.log,
- * and switches the mod on in userdata\Config\Mods.ini (where the MODS tab keeps its choices). */
-static BOOL build_ps2_textures(const wchar_t *ps2_image)
+/* What modding\ps2_extras.py can take from the PS2 disc, each built as a mod of its own. */
+static const struct ps2_extra {
+    const wchar_t *option; /* ps2_extras.py switch */
+    const wchar_t *mod;    /* the mod folder it builds, userdata\Load\Mods\<mod> */
+    const wchar_t *label;  /* its checkbox */
+} PS2_EXTRAS[] = {
+    {L"--textures", L"PS2Textures",
+     L"HD textures: most of the game's textures at twice the resolution (about 250 MB, a "
+     L"minute or two)"},
+    {L"--music", L"PS2Music",
+     L"Music: the soundtrack in the PS2's higher quality, plus the 13 songs the GameCube "
+     L"release left out (about 700 MB, under a minute)"},
+};
+#define PS2_EXTRA_COUNT (sizeof PS2_EXTRAS / sizeof PS2_EXTRAS[0])
+#define ID_FIRST_EXTRA 100
+
+/* Appends a control to an in-memory dialog template: its class as an atom (0x0080 button,
+ * 0x0082 static), its text, and no creation data. */
+static WORD *add_dialog_item(WORD *at, DWORD style, short x, short y, short cx, short cy, WORD id,
+                             WORD atom, const wchar_t *text)
 {
-    wchar_t python[MAX_PATH], tool[MAX_PATH], files[MAX_PATH], mod[MAX_PATH], logs[MAX_PATH],
+    DLGITEMTEMPLATE *item;
+    at = (WORD *)(((ULONG_PTR)at + 3) & ~(ULONG_PTR)3); /* items are DWORD-aligned */
+    item = (DLGITEMTEMPLATE *)at;
+    item->style = style | WS_CHILD | WS_VISIBLE;
+    item->dwExtendedStyle = 0;
+    item->x = x;
+    item->y = y;
+    item->cx = cx;
+    item->cy = cy;
+    item->id = id;
+    at = (WORD *)(item + 1);
+    *at++ = 0xFFFF;
+    *at++ = atom;
+    wcscpy((wchar_t *)at, text);
+    at += wcslen(text) + 1;
+    *at++ = 0;
+    return at;
+}
+
+static INT_PTR CALLBACK ps2_extras_proc(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    static BOOL *chosen;
+    switch (message) {
+    case WM_INITDIALOG:
+        chosen = (BOOL *)lparam;
+        for (size_t i = 0; i < PS2_EXTRA_COUNT; ++i)
+            CheckDlgButton(dialog, ID_FIRST_EXTRA + (int)i, BST_CHECKED);
+        return TRUE;
+    case WM_COMMAND:
+        if (LOWORD(wparam) == IDOK) {
+            BOOL any = FALSE;
+            for (size_t i = 0; i < PS2_EXTRA_COUNT; ++i) {
+                chosen[i] = IsDlgButtonChecked(dialog, ID_FIRST_EXTRA + (int)i) == BST_CHECKED;
+                any |= chosen[i];
+            }
+            if (!any) {
+                MessageBoxW(dialog, L"Tick at least one of the extras.", APP_TITLE,
+                            MB_OK | MB_ICONINFORMATION);
+                return TRUE;
+            }
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(wparam) == IDCANCEL) {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+/* Asks which extras to build, all ticked to begin with. FALSE if the player cancels. */
+static BOOL choose_ps2_extras(BOOL chosen[PS2_EXTRA_COUNT])
+{
+    static DWORD template_buffer[1024]; /* the template must be DWORD-aligned */
+    const short width = 280, top = 76, row = 30;
+    const short height = top + row * (short)PS2_EXTRA_COUNT + 26;
+    DLGTEMPLATE *dialog = (DLGTEMPLATE *)template_buffer;
+    WORD *at;
+
+    ZeroMemory(template_buffer, sizeof template_buffer);
+    dialog->style = DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    dialog->cx = width;
+    dialog->cy = height;
+    at = (WORD *)(dialog + 1);
+    *at++ = 0; /* no menu */
+    *at++ = 0; /* the standard dialog class */
+    wcscpy((wchar_t *)at, APP_TITLE L" - PS2 extras");
+    at += wcslen((wchar_t *)at) + 1;
+    *at++ = 9; /* font size, then name */
+    wcscpy((wchar_t *)at, L"Segoe UI");
+    at += wcslen((wchar_t *)at) + 1;
+
+    at = add_dialog_item(at, SS_LEFT, 8, 8, width - 16, top - 14, (WORD)-1, 0x0082,
+                         L"Take more from the PlayStation 2 version of the game, out of your "
+                         L"own disc image of it (.iso). Each pick becomes a mod of its own, "
+                         L"switched on when it is built; Esc > MODS switches it off again.\n\n"
+                         L"The disc image is only read. A message appears when it is done.");
+    for (size_t i = 0; i < PS2_EXTRA_COUNT; ++i)
+        at = add_dialog_item(at, BS_AUTOCHECKBOX | BS_MULTILINE | BS_TOP | WS_TABSTOP, 8,
+                             (short)(top + row * (short)i), width - 16, row - 4,
+                             (WORD)(ID_FIRST_EXTRA + i), 0x0080, PS2_EXTRAS[i].label);
+    at = add_dialog_item(at, BS_DEFPUSHBUTTON | WS_TABSTOP, width - 172, height - 22, 104, 15,
+                         IDOK, 0x0080, L"Choose the PS2 disc image...");
+    at = add_dialog_item(at, BS_PUSHBUTTON | WS_TABSTOP, width - 62, height - 22, 54, 15,
+                         IDCANCEL, 0x0080, L"Cancel");
+    dialog->cdit = (WORD)(PS2_EXTRA_COUNT + 3);
+
+    return DialogBoxIndirectParamW(GetModuleHandleW(NULL), dialog, NULL, ps2_extras_proc,
+                                   (LPARAM)chosen) == IDOK;
+}
+
+/* Runs modding\ps2_extras.py with the bundled Python, once per chosen extra so that each one
+ * that builds is switched on even if another fails. The output of all of them goes to
+ * logs\ps2-extras.log; the mods are switched on in userdata\Config\Mods.ini (where the MODS
+ * tab keeps its choices). Returns how many failed. */
+static int build_ps2_extras(const wchar_t *ps2_image, const BOOL chosen[PS2_EXTRA_COUNT])
+{
+    wchar_t python[MAX_PATH], tool[MAX_PATH], files[MAX_PATH], mods[MAX_PATH], logs[MAX_PATH],
         log_file[MAX_PATH], user[MAX_PATH], config[MAX_PATH], mods_ini[MAX_PATH],
         command_line[CMDLINE_MAX];
     SECURITY_ATTRIBUTES inheritable = {sizeof inheritable, NULL, TRUE};
     HANDLE log;
-    int code;
+    int failed = 0;
 
     root_path(python, MAX_PATH, L"toolchain\\python\\bin\\python.exe");
-    root_path(tool, MAX_PATH, L"modding\\ps2_textures.py");
+    root_path(tool, MAX_PATH, L"modding\\ps2_extras.py");
     root_path(files, MAX_PATH, L"game\\files");
-    root_path(mod, MAX_PATH, L"userdata\\Load\\Mods\\PS2Textures");
+    root_path(mods, MAX_PATH, L"userdata\\Load\\Mods");
     root_path(logs, MAX_PATH, L"logs");
-    root_path(log_file, MAX_PATH, L"logs\\ps2-textures.log");
-    CreateDirectoryW(logs, NULL);
-
-    _snwprintf(command_line, CMDLINE_MAX,
-               L"\"%ls\" -I \"%ls\" --gc-files \"%ls\" --ps2 \"%ls\" --out \"%ls\"", python, tool,
-               files, ps2_image, mod);
-    command_line[CMDLINE_MAX - 1] = L'\0';
-
-    log = CreateFileW(log_file, GENERIC_WRITE, FILE_SHARE_READ, &inheritable, CREATE_ALWAYS,
-                      FILE_ATTRIBUTE_NORMAL, NULL);
-    code = run(command_line, CREATE_NO_WINDOW, log == INVALID_HANDLE_VALUE ? NULL : log);
-    if (log != INVALID_HANDLE_VALUE)
-        CloseHandle(log);
-    if (code != 0)
-        return FALSE;
-
+    root_path(log_file, MAX_PATH, L"logs\\ps2-extras.log");
     root_path(user, MAX_PATH, L"userdata");
     root_path(config, MAX_PATH, L"userdata\\Config");
     root_path(mods_ini, MAX_PATH, L"userdata\\Config\\Mods.ini");
+    CreateDirectoryW(logs, NULL);
     CreateDirectoryW(user, NULL);
     CreateDirectoryW(config, NULL);
-    WritePrivateProfileStringW(L"Mods", L"PS2Textures", L"True", mods_ini);
-    return TRUE;
+
+    log = CreateFileW(log_file, GENERIC_WRITE, FILE_SHARE_READ, &inheritable, CREATE_ALWAYS,
+                      FILE_ATTRIBUTE_NORMAL, NULL);
+    for (size_t i = 0; i < PS2_EXTRA_COUNT; ++i) {
+        if (!chosen[i])
+            continue;
+        _snwprintf(command_line, CMDLINE_MAX,
+                   L"\"%ls\" -I \"%ls\" --gc-files \"%ls\" --ps2 \"%ls\" --mods \"%ls\" %ls",
+                   python, tool, files, ps2_image, mods, PS2_EXTRAS[i].option);
+        command_line[CMDLINE_MAX - 1] = L'\0';
+        if (run(command_line, CREATE_NO_WINDOW, log == INVALID_HANDLE_VALUE ? NULL : log) == 0)
+            WritePrivateProfileStringW(L"Mods", PS2_EXTRAS[i].mod, L"True", mods_ini);
+        else
+            ++failed;
+    }
+    if (log != INVALID_HANDLE_VALUE)
+        CloseHandle(log);
+    return failed;
 }
 
 /* Starts the runtime with its console hidden and its output in logs\runtime.log. */
@@ -233,7 +349,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
     wchar_t disc_image[MAX_PATH];
     int argc;
     wchar_t **argv;
-    BOOL rebuild = FALSE, optimize = FALSE, ps2_textures = FALSE;
+    BOOL rebuild = FALSE, optimize = FALSE, ps2_extras = FALSE;
     (void)instance;
     (void)previous;
     (void)arguments;
@@ -253,35 +369,28 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
                 rebuild = TRUE;
             else if (_wcsicmp(argv[i], L"--optimize") == 0)
                 optimize = TRUE;
-            else if (_wcsicmp(argv[i], L"--ps2-textures") == 0)
-                ps2_textures = TRUE;
+            /* --ps2-textures: what shortcuts from before the extras were called */
+            else if (_wcsicmp(argv[i], L"--ps2-extras") == 0 ||
+                     _wcsicmp(argv[i], L"--ps2-textures") == 0)
+                ps2_extras = TRUE;
         LocalFree(argv);
     }
 
-    if (ps2_textures) {
+    if (ps2_extras) {
+        BOOL chosen[PS2_EXTRA_COUNT];
         if (!game_is_built()) {
             show_error(L"Build the game first: start it once from the Def Jam: Fight for NY "
-                       L"shortcut, then build the PS2 textures.");
+                       L"shortcut, then add the PS2 extras.");
             return 1;
         }
-        if (MessageBoxW(NULL,
-                        L"Build HD textures from the PlayStation 2 version?\n\n"
-                        L"The PS2 release has most of the game's textures at twice the "
-                        L"resolution. This copies them, from your own disc image of Def Jam: "
-                        L"Fight for NY for PlayStation 2 (.iso), into a mod named PS2Textures "
-                        L"and switches it on (Esc > MODS switches it off again).\n\n"
-                        L"It takes a minute or two and about 250 MB of disk space. The disc "
-                        L"image is only read. A message appears when it is done.",
-                        APP_TITLE, MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
+        if (!choose_ps2_extras(chosen) || !pick_ps2_image(disc_image, MAX_PATH))
             return 1;
-        if (!pick_ps2_image(disc_image, MAX_PATH))
-            return 1;
-        if (!build_ps2_textures(disc_image)) {
-            show_error(L"The PS2 textures could not be built.\n\n"
-                       L"Details are in logs\\ps2-textures.log.");
+        if (build_ps2_extras(disc_image, chosen) != 0) {
+            show_error(L"Not every extra could be built (the ones that were are on).\n\n"
+                       L"Details are in logs\\ps2-extras.log.");
             return 1;
         }
-        MessageBoxW(NULL, L"Done: the PS2 textures are on. Start the game as usual.", APP_TITLE,
+        MessageBoxW(NULL, L"Done: the PS2 extras are on. Start the game as usual.", APP_TITLE,
                     MB_OK | MB_ICONINFORMATION);
         return 0;
     }

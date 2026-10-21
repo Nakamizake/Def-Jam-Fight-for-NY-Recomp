@@ -2,7 +2,7 @@
 
 A mod is a folder in `userdata/Load/Mods/<mod name>/` (in an installed game,
 `<install folder>\userdata\Load\Mods\<mod name>\`). It can hold replacement textures, replacement
-game files, or both. Nothing in the game's own files is ever changed: switch a mod off and the
+game files and memory patches, in any mix. Nothing in the game's own files is ever changed: switch a mod off and the
 game is exactly as it came off the disc.
 
 Mods are switched on and off in the game: **Esc > MODS**. Each mod is listed by its folder name.
@@ -44,35 +44,63 @@ A loose HD texture pack also works in `userdata/Load/Textures/GNWE69/` (the *HD 
 row in MODS). Where a mod and the pack replace the same texture, the mod wins; between two mods,
 the one whose name sorts first wins.
 
-### PS2 texture pack
+### PS2 extras
 
-The PlayStation 2 release of the game has the same textures as the GameCube one, but most of
-them at twice the width and height: every character texture and about half of each venue's.
-`tools-src/textures/ps2_textures.py` builds a texture mod from them, out of your own copy of the
-PS2 disc (an `.iso`, or a folder with its files). It pairs each GameCube texture with its PS2
-counterpart and writes the larger one under the GameCube texture's name. It leaves a texture out
-when the PS2 one is not larger, and also when the two pictures do not match once the larger one
-is scaled down (a few textures were redrawn between the releases). Neither disc is changed.
+The PlayStation 2 release of the game has a few things the GameCube one lacks. The tools in
+`tools-src/ps2/` build each of them as a mod, out of your own copy of the PS2 disc (an `.iso`,
+or a folder with its files); neither disc is changed. `ps2_extras.py` builds the ones you pick,
+each into a mod folder of its own:
 
-```powershell
-python -I tools-src\textures\ps2_textures.py --gc-files extracted\GNWE69\files `
-    --ps2 D:\Games\DefJamPS2.iso --out userdata\Load\Mods\PS2Textures
-```
-
-An installed game does all of this in one click: *Build PS2 HD textures* in the game folder
-(or the Start menu) asks for the PS2 disc image, builds the mod and switches it on. By hand, the
-tool is in `modding\`, so from the game folder:
+| Switch | Mod | What | Tool |
+| --- | --- | --- | --- |
+| `--textures` | PS2Textures | most textures at twice the resolution | `ps2_textures.py` |
+| `--music` | PS2Music | the soundtrack at the PS2's sample rate, and its 13 extra songs | `ps2_music.py` |
 
 ```powershell
-toolchain\python\bin\python.exe -I modding\ps2_textures.py --gc-files game\files `
-    --ps2 D:\Games\DefJamPS2.iso --out userdata\Load\Mods\PS2Textures
+python -I tools-src\ps2\ps2_extras.py --gc-files extracted\GNWE69\files `
+    --ps2 D:\Games\DefJamPS2.iso --mods userdata\Load\Mods --textures --music
 ```
 
+An installed game does all of this in one click: *Add PS2 extras* in the game folder (or the
+Start menu) asks which extras to build and for the PS2 disc image, builds them and switches them
+on. By hand, the tools are in `modding\`, so from the game folder:
+
+```powershell
+toolchain\python\bin\python.exe -I modding\ps2_extras.py --gc-files game\files `
+    --ps2 D:\Games\DefJamPS2.iso --mods userdata\Load\Mods --textures --music
+```
+
+Each tool also runs on its own (`ps2_textures.py` / `ps2_music.py` with `--out <mod folder>`
+in place of `--mods` and the switches).
+
+**Textures.** The PS2 disc has the same textures, but most of them at twice the width and
+height: every character texture and about half of each venue's. `ps2_textures.py` pairs each
+GameCube texture with its PS2 counterpart and writes the larger one under the GameCube texture's
+name. It leaves a texture out when the PS2 one is not larger, and also when the two pictures do
+not match once the larger one is scaled down (a few textures were redrawn between the releases).
 It takes a minute or two and writes about 5,800 textures: around 160 MB, or 250 MB with the
-installed game's Python, which lacks zlib and leaves the PNGs uncompressed. Then switch on
-**PS2Textures** in Esc > MODS. Like any texture mod it is drawn only on your PC, so it never
-matters to netplay. The textures are loaded the first time the game uses each one, not all at
-boot, which keeps the game's memory use about the same with the pack on.
+installed game's Python, which lacks zlib and leaves the PNGs uncompressed. Like any texture mod
+it is drawn only on your PC, so it never matters to netplay. The textures are loaded the first
+time the game uses each one, not all at boot, which keeps the game's memory use about the same.
+
+**Music.** Both releases store the soundtrack as EA-XA ADPCM, the PS2 one at 36,000 Hz against
+the GameCube's 22,050, and the PS2 disc has 33 songs against 20. `ps2_music.py` rebuilds the
+five music archives (`audio/music0-4.viv`) with:
+
+- the PS2 recording of each of the 20 songs (`main.mus`) and its interactive-music script
+  (`tune.mpf`), converted to the GameCube's byte order (`ea_audio.py`, `mpf.py`). The audio
+  frames themselves are the same bytes on both consoles;
+- the 13 PS2-only songs (`arewecuttin`, `getintoit`, `getitnow`, `hitem`, `holler`,
+  `mamasaid`, `minitrack2`, `nuffrespect`, `nwa`, `poppalarge`, `pump`, `ricache`,
+  `seizetheday`), whose loading-screen and overlay sound banks are resampled to the GameCube's
+  rate (24,000 to 16,000 Hz) and encoded again: the game keeps those banks in buffers sized for
+  the GameCube's own;
+- a `patches.txt` (see *Memory patches* below) that clears the names of 12 of those songs from
+  a list the GameCube executable skips in its song selection.
+
+The 20 shared songs keep the GameCube's loading-screen and overlay banks (the same sounds). It
+takes under a minute and writes about 700 MB. It is a game-file mod, so for netplay both
+players need it switched on (or both off).
 
 ## Game files
 
@@ -95,9 +123,26 @@ What is where on the disc:
 | `assets/entity.xml` | venue objects, including where the instanced crowd stands |
 | `assets/*.viv` | venues (`v2bg`), characters (`v2cp_*`), crowd (`icrowd`, `cincrowd`), props, shops |
 | `fonts/*.viv`, `screens/screens.viv` | fonts; the menus and HUD (EA's Flash-based UI) |
-| `audio/*.viv`, `movies/` | music, sound effects, speech; videos |
+| `audio/*.viv`, `movies/` | music (`music0-4.viv`: per song a stream, a script and two sound banks), sound effects, speech; videos |
 
 Some XML files start with a `<?x...x?>` line; leave it in place.
+
+### Memory patches
+
+A `patches.txt` in a mod (next to `files`, or one folder down like it) changes bytes of the
+game's memory after the executable is loaded, for what no disc file holds: a table or a
+string inside the executable itself. One patch per line, in hex, `#` starting a comment:
+
+```
+# <address> <new bytes> <bytes expected there>
+80297D54 007265776563757474696E 617265776563757474696E  # arewecuttin
+```
+
+A patch applies only if the bytes at the address are the expected ones, so it never lands in
+the wrong place in another version of the game; addresses must be in main memory
+(`80000000`-`817FFFFF`), and the new and expected bytes the same length. The log
+(`logs\runtime.log` in an installed game) says how many patches each mod applied, and why a
+line was rejected. Like game files, patches apply from the next start and count for netplay.
 
 ### .viv archives
 

@@ -97,7 +97,7 @@ config/             recompiler flags and native regions, game settings, default 
                     controller layouts and the button icon art
 scripts/            build, run, benchmark, training and packaging scripts (PowerShell)
 installer/          Inno Setup script, the DefJam.exe launcher and the on-PC build script
-tools-src/          the .viv modding tool, the PS2 texture pack builder, profiling and diagnostics
+tools-src/          the .viv modding tool, the PS2 extras builder, profiling and diagnostics
                     helpers, the glyph generator
 docs/               guides and screenshots
 ```

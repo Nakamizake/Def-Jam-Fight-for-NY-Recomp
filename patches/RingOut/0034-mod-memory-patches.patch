@@ -1,0 +1,246 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index fd6559d2..62e0da7f 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -1144,6 +1144,8 @@ void ApplyModuleSourceToJit(const ModuleSource &module) {
+ // sizes the FST is rebuilt around. The extracted game is never written to.
+ // Riivolution applies patches in order and a later one overwrites an earlier
+ // one, so they go in lowest precedence first and the first-named mod wins.
++// A mod's patches.txt becomes Riivolution memory patches, which Dolphin writes
++// once the executable is loaded, each only over the bytes it expects.
+ void ApplyGameFileMods(BootParameters *boot) {
+   const std::vector<RecompMods::GameFilesMod> mods = RecompMods::EnabledGameFiles();
+   std::vector<std::string> applied;
+@@ -1153,17 +1155,34 @@ void ApplyGameFileMods(BootParameters *boot) {
+     patch.m_id = it->name;
+     // Relative external paths resolve against the folder of the "XML file",
+     // which is the files/ folder itself; no XML exists or is read.
++    const std::string &base = it->files_root.empty() ? it->folder : it->files_root;
+     patch.m_file_data_loader = std::make_shared<DiscIO::Riivolution::FileDataLoaderHostFS>(
+-        it->files_root, it->files_root + "/mod.xml", std::string_view{});
+-    DiscIO::Riivolution::Folder folder;
+-    folder.m_disc = "/";
+-    folder.m_external = "";
+-    folder.m_create = true;
+-    folder.m_recursive = true;
+-    patch.m_folder_patches.push_back(std::move(folder));
++        base, base + "/mod.xml", std::string_view{});
++    if (!it->files_root.empty()) {
++      DiscIO::Riivolution::Folder folder;
++      folder.m_disc = "/";
++      folder.m_external = "";
++      folder.m_create = true;
++      folder.m_recursive = true;
++      patch.m_folder_patches.push_back(std::move(folder));
++      std::fprintf(stderr, "[mods] game files from '%s'\n", it->name.c_str());
++    }
++    if (!it->patches_file.empty()) {
++      std::vector<std::string> errors;
++      for (RecompMods::MemoryPatch &line : RecompMods::ReadMemoryPatches(it->patches_file, &errors)) {
++        DiscIO::Riivolution::Memory memory;
++        memory.m_offset = line.address;
++        memory.m_value = std::move(line.value);
++        memory.m_original = std::move(line.original);
++        patch.m_memory_patches.push_back(std::move(memory));
++      }
++      for (const std::string &error : errors)
++        std::fprintf(stderr, "[mods] '%s' patches.txt %s\n", it->name.c_str(), error.c_str());
++      std::fprintf(stderr, "[mods] %zu memory patches from '%s'\n", patch.m_memory_patches.size(),
++                   it->name.c_str());
++    }
+     patches.push_back(std::move(patch));
+     applied.push_back(it->name);
+-    std::fprintf(stderr, "[mods] game files from '%s'\n", it->name.c_str());
+   }
+   RecompMods::SetAppliedGameFiles(applied);
+   AddRiivolutionPatches(boot, std::move(patches));
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp
+index af0b2217..3d15023b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "VideoCommon/RecompMods.h"
+ 
++#include <fmt/format.h>
++
+ #include "Common/CommonPaths.h"
+ #include "Common/Crypto/SHA1.h"
+ #include "Common/FileUtil.h"
+@@ -18,6 +20,9 @@
+ #include <filesystem>
+ #include <map>
+ #include <mutex>
++#include <optional>
++#include <sstream>
++#include <string_view>
+ #include <system_error>
+ 
+ #ifdef _WIN32
+@@ -328,13 +333,52 @@ std::filesystem::path FindFilesRoot(const std::filesystem::path& folder)
+   return {};
+ }
+ 
++// The mod's patches.txt: at its top, or one level down like files/.
++std::filesystem::path FindPatchesFile(const std::filesystem::path& folder)
++{
++  std::error_code ec;
++  std::vector<std::filesystem::path> subfolders;
++  for (const auto& entry : std::filesystem::directory_iterator(folder, ec))
++  {
++    std::string name = entry.path().filename().string();
++    for (char& c : name)
++      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    if (entry.is_regular_file(ec) && name == "patches.txt")
++      return entry.path();
++    if (entry.is_directory(ec))
++      subfolders.push_back(entry.path());
++  }
++  if (subfolders.size() == 1)
++  {
++    const std::filesystem::path inner = subfolders.front() / "patches.txt";
++    if (std::filesystem::is_regular_file(inner, ec))
++      return inner;
++  }
++  return {};
++}
++
++std::optional<std::vector<std::uint8_t>> ParseHexBytes(std::string_view text)
++{
++  if (text.empty() || text.size() % 2 != 0)
++    return std::nullopt;
++  std::vector<std::uint8_t> bytes;
++  for (size_t i = 0; i < text.size(); i += 2)
++  {
++    u32 byte = 0;
++    if (!TryParse(std::string("0x") + std::string(text.substr(i, 2)), &byte))
++      return std::nullopt;
++    bytes.push_back(static_cast<std::uint8_t>(byte));
++  }
++  return bytes;
++}
++
+ // What did the archive actually contain? Decided by extension, one level deep,
+ // because mods are commonly packed with a folder inside the archive.
+ Kind ClassifyFolder(const std::filesystem::path& folder, std::string* note,
+                     std::string* payload)
+ {
+   std::error_code ec;
+-  if (!FindFilesRoot(folder).empty())
++  if (!FindFilesRoot(folder).empty() || !FindPatchesFile(folder).empty())
+     return Kind::GameFiles;
+   bool textures = false, game_data = false, empty = true;
+   for (const auto& entry : std::filesystem::recursive_directory_iterator(folder, ec))
+@@ -458,13 +502,52 @@ std::vector<GameFilesMod> EnabledGameFiles()
+     if (!mod.enabled || mod.kind != Kind::GameFiles)
+       continue;
+     // UTF-8 with forward slashes, the form Dolphin's file functions take.
+-    std::string root = PathToString(FindFilesRoot(mod.path));
+-    std::ranges::replace(root, '\\', '/');
+-    result.push_back({mod.name, std::move(root)});
++    auto dolphin_path = [](const std::filesystem::path& path) {
++      std::string text = PathToString(path);
++      std::ranges::replace(text, '\\', '/');
++      return text;
++    };
++    result.push_back({mod.name, dolphin_path(mod.path), dolphin_path(FindFilesRoot(mod.path)),
++                      dolphin_path(FindPatchesFile(mod.path))});
+   }
+   return result;
+ }
+ 
++std::vector<MemoryPatch> ReadMemoryPatches(const std::string& path,
++                                           std::vector<std::string>* errors)
++{
++  std::vector<MemoryPatch> patches;
++  std::ifstream file(std::filesystem::path(StringToPath(path)));
++  std::string line;
++  for (int number = 1; std::getline(file, line); ++number)
++  {
++    line = line.substr(0, line.find('#'));
++    std::istringstream fields(line);
++    std::string address, value, original, extra;
++    if (!(fields >> address))
++      continue;
++    MemoryPatch patch;
++    const auto new_bytes = (fields >> value) ? ParseHexBytes(value) : std::nullopt;
++    const auto old_bytes = (fields >> original) ? ParseHexBytes(original) : std::nullopt;
++    const bool parsed = TryParse(address.starts_with("0x") ? address : "0x" + address,
++                                 &patch.address) &&
++                        new_bytes && old_bytes && !(fields >> extra);
++    // MEM1 only: the game's code and data are there, and nothing else may be written.
++    if (!parsed || new_bytes->size() != old_bytes->size() || patch.address < 0x80000000 ||
++        patch.address + new_bytes->size() > 0x81800000)
++    {
++      errors->push_back(fmt::format("line {}: expected '<address> <new bytes> <old bytes>' "
++                                    "(hex, same length, in 80000000-817FFFFF)",
++                                    number));
++      continue;
++    }
++    patch.value = *new_bytes;
++    patch.original = *old_bytes;
++    patches.push_back(std::move(patch));
++  }
++  return patches;
++}
++
+ void SetAppliedGameFiles(std::vector<std::string> names)
+ {
+   std::lock_guard lock(s_mutex);
+@@ -478,6 +561,12 @@ std::string GameFilesFingerprint()
+   std::map<std::string, std::filesystem::path> winners;
+   for (const auto& mod : EnabledGameFiles())
+   {
++    // Every mod's memory patches apply, so each patches.txt counts, under a key
++    // no disc path can take.
++    if (!mod.patches_file.empty())
++      winners.try_emplace("|patches|" + mod.name, StringToPath(mod.patches_file));
++    if (mod.files_root.empty())
++      continue;
+     std::error_code ec;
+     const std::filesystem::path root(mod.files_root);
+     for (const auto& entry : std::filesystem::recursive_directory_iterator(root, ec))
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h
+index e48733ac..4a76831b 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RecompMods.h
+@@ -13,6 +13,10 @@
+ // at boot through Dolphin's Riivolution file patching. The extracted game is
+ // never touched. Those do reach guest RAM, so they apply from the next boot and
+ // are part of the netplay compatibility fingerprint (GameFilesFingerprint).
++// A `patches.txt` beside `files/` (or on its own) carries memory patches: bytes
++// written over the loaded executable at boot, each only where the bytes there
++// still match what the line expects, so a patch never lands on a different
++// build. They count as game files for the menu and for netplay.
+ // Character skins that patch root.olk are a different tier entirely and are
+ // NOT handled here -- see RecompGameData.h.
+ 
+@@ -80,9 +84,27 @@ std::vector<std::string> EnabledDirectories();
+ struct GameFilesMod
+ {
+   std::string name;
+-  std::string files_root;  // absolute path of the mod's files/ folder
++  std::string folder;        // absolute path of the mod's folder
++  std::string files_root;    // absolute path of the mod's files/ folder; empty without one
++  std::string patches_file;  // absolute path of the mod's patches.txt; empty without one
+ };
+ 
++// One line of a patches.txt: `<address> <new bytes> <bytes expected there>`, the
++// address and both byte strings in hex, the two strings the same length, e.g.
++//   80297D54 00 61   # first letter of "arewecuttin"
++// Blank lines and anything after '#' are ignored.
++struct MemoryPatch
++{
++  std::uint32_t address = 0;
++  std::vector<std::uint8_t> value;
++  std::vector<std::uint8_t> original;
++};
++
++// The patches in a patches.txt; each line that cannot be read is skipped and
++// described in *errors.
++std::vector<MemoryPatch> ReadMemoryPatches(const std::string& path,
++                                           std::vector<std::string>* errors);
++
+ // Enabled mods that carry game files, highest precedence first (the same order
+ // as textures: where two replace the same file, the earlier name wins).
+ std::vector<GameFilesMod> EnabledGameFiles();

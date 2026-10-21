@@ -15,7 +15,7 @@ The installer, `DefJamFFNY-Setup-<version>.exe`, is per-user and needs no admini
   using every CPU core) and closes by itself.
 - The first start prepares the graphics shaders for about a minute; later starts are quick.
 - Shortcuts: the game folder always has *Rebuild game files*, *Optimize for this PC* and
-  *Build PS2 HD textures*. Two optional tasks add Start menu entries (the game, those three
+  *Add PS2 extras*. Two optional tasks add Start menu entries (the game, those three
   tools as *Def Jam - ...*, the game folder and the uninstaller) and a desktop shortcut;
   untick them when updating and the old ones are removed.
 
@@ -39,14 +39,21 @@ Run the installer of the new version and pick the same folder. The disc is not n
 (leave the disc field empty); saves, settings and the optimisation are kept. When the game's
 code did not change, the build step finishes in seconds.
 
-### PS2 HD textures
+### PS2 extras
 
 Optional (also offered, unticked, at the end of the install). The PlayStation 2 release has
-most of the game's textures at twice the resolution. *Build PS2 HD textures* asks for your own
-disc image of Def Jam: Fight for NY for PlayStation 2 (`.iso`), copies those textures into a mod
-named **PS2Textures** in about a minute and switches it on; Esc > MODS switches it off again.
-It needs about 250 MB, only reads the disc image, and writes its log to
-`logs\ps2-textures.log`. How it works: *PS2 texture pack* in the [modding guide](modding.md).
+a few things the GameCube one lacks, and *Add PS2 extras* takes the ones you tick from your own
+disc image of Def Jam: Fight for NY for PlayStation 2 (`.iso`):
+
+- **HD textures** (mod **PS2Textures**, about 250 MB, a minute or two): most of the game's
+  textures at twice the resolution.
+- **Music** (mod **PS2Music**, about 700 MB, under a minute): the soundtrack at the PS2's
+  higher sample rate, plus the 13 songs the GameCube release left out. Netplay needs it on
+  for both players or for neither.
+
+Each one is built into a mod of its own and switched on; Esc > MODS switches it off again
+(music from the next start). The disc image is only read; the log is `logs\ps2-extras.log`.
+How it works: *PS2 extras* in the [modding guide](modding.md).
 
 ### Uninstalling
 
