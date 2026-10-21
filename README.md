@@ -98,6 +98,10 @@ their own disc image (`installer/build-game.ps1`, about 5 minutes on 8 cores).
   About 14 minutes on the development PC, for 78 → 97 fps in a 2v2 fight (table below).
   The profile is kept in `module\`, so *Rebuild game files* stays optimised while the
   recompiler, its settings and Clang are unchanged.
+- Updating is installing the new version over the old one: same folder, no disc needed
+  (the extracted game is reused), saves, settings and the optimization kept. When the
+  game's code and everything the module is built from are unchanged (`module\GNWE69.module.stamp`),
+  the build step keeps the installed module and finishes in seconds.
 
 Needs Inno Setup 6, besides the development requirements below. `-TestInstall` builds a
 variant with no shortcuts and no uninstall registry entry, for test installs into

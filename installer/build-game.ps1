@@ -56,6 +56,8 @@ $profilePaths = @{
     Profile = Join-Path $paths.Module "$GameId.profdata"
     # What the profile was trained against; see Get-ProfileStamp.
     Stamp   = Join-Path $paths.Module "$GameId.profdata.stamp"
+    # What the module was built from; see Get-ModuleStamp.
+    ModuleStamp = Join-Path $paths.Module "$GameId.module.stamp"
 }
 Import-Module (Join-Path $PSScriptRoot 'GameBuild.psm1') -Force
 
@@ -135,6 +137,31 @@ function Test-Compiler([string] $Clang) {
 # settings and the compiler, so their hashes identify it (the disc is always GNWE69).
 function Get-ProfileStamp([string[]] $Inputs) {
     return ($Inputs | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash }) -join "`n"
+}
+
+# Everything the compiled module is made from: the tools and recompiler settings (the profile
+# stamp), the game's code, the module's sources and the PGO profile it was built with.
+function Get-ModuleStamp([string] $ProfileStamp, [string] $PgoProfile) {
+    $root = (Resolve-Path -LiteralPath $paths.ModuleSource).Path
+    $sources = Get-ChildItem -LiteralPath $root -Recurse -File | Sort-Object FullName | ForEach-Object {
+        '{0} {1}' -f $_.FullName.Substring($root.Length), (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    }
+    $dol = (Get-FileHash -LiteralPath (Join-Path $paths.Game 'sys\main.dol') -Algorithm SHA256).Hash
+    $pgo = if ($PgoProfile) { (Get-FileHash -LiteralPath $PgoProfile -Algorithm SHA256).Hash } else { 'no profile' }
+    return (@($ProfileStamp, $dol, $pgo) + $sources) -join "`n"
+}
+
+# True when the installed module was built from exactly what is installed now.
+function Test-ModuleUpToDate {
+    $module = Join-Path $paths.Module "g${GameId}_recomp.dll"
+    if (-not (Test-Path -LiteralPath $module) -or -not (Test-Path -LiteralPath $profilePaths.ModuleStamp) -or
+        -not (Test-Path -LiteralPath (Join-Path $paths.Game 'sys\main.dol'))) {
+        return $false
+    }
+    $stamp = Get-ProfileStamp @((Join-Path $paths.Bin 'dolrecomp.exe'), (Join-Path $paths.Toolchain 'bin\clang.exe'),
+        (Join-Path $paths.Config "recomp\$GameId.flags"), (Join-Path $paths.Config "recomp\$GameId.regions"))
+    $current = Get-ModuleStamp $stamp (Get-SavedProfile $stamp)
+    return (Get-Content -LiteralPath $profilePaths.ModuleStamp -Raw).Trim() -eq $current.Trim()
 }
 
 # The profile from an earlier -Optimize run, when it still fits this build; '' otherwise.
@@ -233,45 +260,57 @@ flagged by mistake). Restore it from quarantine, or reinstall the game.
     }
     if ($Jobs -le 0) { $Jobs = Get-ModuleBuildJobs }
 
-    if ($Iso) {
-        Write-Host "==> $(Get-StepLabel)  Extracting the disc"
-        if (Test-Path -LiteralPath $paths.Game) { Remove-Item -Recurse -Force -LiteralPath $paths.Game }
-        & $dolrecomp extract $Iso $paths.Game 2>&1 | Out-Host
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $paths.Game 'sys\main.dol'))) {
-            Stop-Build "Extracting the disc failed (dolrecomp exit $LASTEXITCODE). See the messages above."
-        }
-    }
-    else {
-        Write-Host "==> $(Get-StepLabel)  Using the game already extracted"
-    }
-
-    Write-Host "==> $(Get-StepLabel)  Recompiling the game's code"
-    $flags = Get-RecompilerFlags -FlagsFile (Join-Path $paths.Config "recomp\$GameId.flags") `
-        -RegionsFile (Join-Path $paths.Config "recomp\$GameId.regions")
-    $generated = Invoke-Recompiler -DolRecomp $dolrecomp -Dol (Join-Path $paths.Game 'sys\main.dol') `
-        -Flags $flags -WorkDir $paths.Work -Jobs $Jobs
+    # A reinstall over a built game (an update of the runtime, launcher or settings) keeps the
+    # compiled game when nothing it is made from has changed, instead of spending minutes
+    # building the same one again.
+    $keepModule = -not $Iso -and -not $Optimize -and (Test-ModuleUpToDate)
+    if ($keepModule) { $script:stepCount = 2 }
 
     $stamp = Get-ProfileStamp @($dolrecomp, $toolchain.Clang,
         (Join-Path $paths.Config "recomp\$GameId.flags"), (Join-Path $paths.Config "recomp\$GameId.regions"))
-    if ($Optimize) {
-        Write-Host "==> $(Get-StepLabel)  Compiling a measuring version of the game (several minutes, $Jobs jobs)"
-        $pgoProfile = Invoke-ProfileTraining -Toolchain $toolchain -Generated $generated
-        Write-Host "==> $(Get-StepLabel)  Compiling the optimized game (several minutes, $Jobs jobs)"
+    if ($keepModule) {
+        Write-Host "==> $(Get-StepLabel)  The game's code has not changed: keeping the compiled game"
     }
     else {
-        $pgoProfile = Get-SavedProfile $stamp
-        $how = if ($pgoProfile) { ', optimized with the profile from an earlier run' } else { '' }
-        Write-Host "==> $(Get-StepLabel)  Compiling (the long part: several minutes, $Jobs jobs$how)"
-    }
-    $dll = Invoke-ModuleBuild -Toolchain $toolchain -ModuleSource $paths.ModuleSource `
-        -GeneratedDir $generated -BuildDir (Join-Path $paths.Work 'build') -GameId $GameId -Jobs $Jobs `
-        -PgoProfile $pgoProfile
-    # Only a finished build replaces the module, so a failure leaves the game playable.
-    New-Item -ItemType Directory -Force $paths.Module | Out-Null
-    Copy-Item -LiteralPath $dll $paths.Module -Force
-    if ($Optimize) {
-        Copy-Item -LiteralPath $pgoProfile $profilePaths.Profile -Force
-        $stamp | Set-Content -Encoding ascii -LiteralPath $profilePaths.Stamp
+        if ($Iso) {
+            Write-Host "==> $(Get-StepLabel)  Extracting the disc"
+            if (Test-Path -LiteralPath $paths.Game) { Remove-Item -Recurse -Force -LiteralPath $paths.Game }
+            & $dolrecomp extract $Iso $paths.Game 2>&1 | Out-Host
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $paths.Game 'sys\main.dol'))) {
+                Stop-Build "Extracting the disc failed (dolrecomp exit $LASTEXITCODE). See the messages above."
+            }
+        }
+        else {
+            Write-Host "==> $(Get-StepLabel)  Using the game already extracted"
+        }
+
+        Write-Host "==> $(Get-StepLabel)  Recompiling the game's code"
+        $flags = Get-RecompilerFlags -FlagsFile (Join-Path $paths.Config "recomp\$GameId.flags") `
+            -RegionsFile (Join-Path $paths.Config "recomp\$GameId.regions")
+        $generated = Invoke-Recompiler -DolRecomp $dolrecomp -Dol (Join-Path $paths.Game 'sys\main.dol') `
+            -Flags $flags -WorkDir $paths.Work -Jobs $Jobs
+
+        if ($Optimize) {
+            Write-Host "==> $(Get-StepLabel)  Compiling a measuring version of the game (several minutes, $Jobs jobs)"
+            $pgoProfile = Invoke-ProfileTraining -Toolchain $toolchain -Generated $generated
+            Write-Host "==> $(Get-StepLabel)  Compiling the optimized game (several minutes, $Jobs jobs)"
+        }
+        else {
+            $pgoProfile = Get-SavedProfile $stamp
+            $how = if ($pgoProfile) { ', optimized with the profile from an earlier run' } else { '' }
+            Write-Host "==> $(Get-StepLabel)  Compiling (the long part: several minutes, $Jobs jobs$how)"
+        }
+        $dll = Invoke-ModuleBuild -Toolchain $toolchain -ModuleSource $paths.ModuleSource `
+            -GeneratedDir $generated -BuildDir (Join-Path $paths.Work 'build') -GameId $GameId -Jobs $Jobs `
+            -PgoProfile $pgoProfile
+        # Only a finished build replaces the module, so a failure leaves the game playable.
+        New-Item -ItemType Directory -Force $paths.Module | Out-Null
+        Copy-Item -LiteralPath $dll $paths.Module -Force
+        if ($Optimize) {
+            Copy-Item -LiteralPath $pgoProfile $profilePaths.Profile -Force
+            $stamp | Set-Content -Encoding ascii -LiteralPath $profilePaths.Stamp
+        }
+        Get-ModuleStamp $stamp $pgoProfile | Set-Content -Encoding ascii -LiteralPath $profilePaths.ModuleStamp
     }
 
     Write-Host "==> $(Get-StepLabel)  Preparing settings"

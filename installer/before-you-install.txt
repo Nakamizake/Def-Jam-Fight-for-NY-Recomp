@@ -26,6 +26,12 @@ What happens
    in the game folder) makes the game run faster (about 20 minutes). A game window opens
    and plays fights on its own while it measures; your saves and settings are not touched.
 
+Updating
+--------
+Run the installer of the new version and pick the same folder. The disc is not needed again
+(leave the disc field empty), and saves, settings and the optimization are kept. When the
+game's code did not change, the build step finishes in seconds.
+
 Controllers
 -----------
 Any gamepad works. Esc > CONTROLS > Layout picks how it plays: like the PlayStation 2, Xbox
