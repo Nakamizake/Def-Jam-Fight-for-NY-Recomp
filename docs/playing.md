@@ -100,6 +100,10 @@ same place on all three; the shoulders differ:
 | Taunt / Blazin' | right stick | right stick | C-stick | arrow keys |
 | Pause | Start | Start | Start | Enter |
 
+While another window is in front (Alt+Tab to a chat, say), the game ignores the pad and the
+keyboard, so nothing presses on in your absence; netplay is the exception, where letting go of
+the controls would leave your fighter standing still.
+
 Rebinding a button in the menu switches the layout to *Custom*, which *Auto* then leaves alone.
 The layouts are Dolphin pad profiles (`config/Controllers/Layouts/` in the repository); a profile
 of your own in `userdata/Config/Profiles/GCPad/` shows up in the list too.

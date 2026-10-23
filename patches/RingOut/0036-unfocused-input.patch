@@ -1,0 +1,54 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
+index 5b0729a9..66bac05e 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/Platform.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ #include <string>
+ 
+@@ -65,6 +66,7 @@ protected:
+   Common::Flag m_save_state_requested{false};
+   Common::Flag m_load_state_requested{false};
+ 
+-  bool m_window_focus = true;  // Should be made atomic if actually implemented
++  // Written by the window's thread, read by the CPU thread's input gate.
++  std::atomic<bool> m_window_focus = true;
+   bool m_window_fullscreen = false;
+ };
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+index 13d9e351..367799ca 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/DolphinNoGUI/PlatformWin32.cpp
+@@ -148,6 +148,9 @@ bool PlatformWin32::CreateRenderWindow()
+ 
+   ShowWindow(m_hwnd, SW_SHOW);
+   UpdateWindow(m_hwnd);
++  // WM_SETFOCUS has already arrived if the window came up in front; one that did not
++  // starts unfocused instead of taking input until it is first clicked away from.
++  m_window_focus = GetForegroundWindow() == m_hwnd;
+   return true;
+ }
+ 
+@@ -326,7 +329,18 @@ LRESULT PlatformWin32::WndProc(const HWND hwnd, const UINT msg, const WPARAM wPa
+   // arrives here, which left fast-forward stuck on: the Speed row then read
+   // "Unlimited" whatever was picked (2026-10-03, the Windows laptop). X11 and
+   // Wayland already release it on focus loss.
++  //
++  // The focus flag gates the pads (Core::UpdateInputGate, unless BackgroundInput is on):
++  // without it a gamepad kept driving the game while another app was in front, unpausing
++  // it and moving the fighter. Automation input is an override and passes regardless.
++  case WM_SETFOCUS:
++    if (platform)
++      platform->m_window_focus = true;
++    break;
++
+   case WM_KILLFOCUS:
++    if (platform)
++      platform->m_window_focus = false;
+     RecompMenu::SetFastForward(false);
+     break;
+ 
