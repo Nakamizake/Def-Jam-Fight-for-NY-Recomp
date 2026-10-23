@@ -10,8 +10,6 @@ out things whose art, sounds and video are still on the disc:
   Gruff), each with a preview on X. The GameCube skips the page and always gives the first voice;
   its executable also maps all six voices to the first one's speech banks, so the chosen voice
   needs the PlayStation 2's table back too (a memory patch, VOICE_BANKS).
-- **Venue map.** Choose Venue draws the city from battle/map.swf, a map about four times as
-  detailed as the battle/map_ngc.swf the GameCube loads instead.
 - **Trailer.** Extras has a third poster that plays the game's trailer (movies/attract.mad),
   from the posters the PlayStation 2 release uses; the GameCube wall has only Cheats and Intro.
 - **Spotlight.** Most menus lay a soft light over the screen that darkens its edges (a clip
@@ -21,6 +19,12 @@ Each of those tests reads `if (_root.g_console == "gc")`, which compiles to EA_P
 '_root', EA_GetNamedMember 'g_console', EA_PushConstantByte 'gc', a comparison, BranchIfTrue.
 The mod turns a test off by pointing its 'gc' operand (an index into the function's constant
 pool) at the 'g_console' entry instead, a string the console name never equals: one byte each.
+
+One cut stays: Choose Venue's map. The PlayStation 2 draws it from battle/map.big, about four
+times as detailed as the battle/map_ngc.big the GameCube loads, and 1.3 MB larger once loaded.
+The story mode's city map is the same screen, and stays loaded under the event screens: with the
+larger map, the GameCube's main heap had no block left for story/tournament.big (611 KB), its
+allocation came back null, and the game hung on the first tournament (Babylon).
 
 The port applies this on its own, as one of its fixes (port_fixes.py). On its own, the tool
 writes it as an ordinary mod, to switch on in Esc > MODS:
@@ -74,12 +78,6 @@ VOICE_PAGE = [
     # Skips the page (nMenuFocus = 15; keyX()), then forces voice 1 (aMenuIndexes[15] = 0).
     ConsoleTest("screens/story/Sketch.big", "ae2b af86 a287 49 12 9d", count=2),
 ]
-VENUE_MAP = [
-    # Loads map_ngc.swf instead of map.swf.
-    ConsoleTest("screens/battle/chsVenue.big", "ae60 af88 a289 49 12 9d"),
-    # `!= "gc"`: the map clip's blackScreen animation, which map_ngc.swf does not have.
-    ConsoleTest("screens/battle/chsVenue.big", "ae60 af88 a289 49 12 12 9d", count=2),
-]
 TRAILER = [
     # `=== "gc"` loads ngc_posters.swf; without it the wall falls through to ps2_posters.swf.
     ConsoleTest("screens/extras/extras.big", "ae19 af41 a243 66 9d"),
@@ -98,7 +96,7 @@ SPOTLIGHT = [
     ConsoleTest("screens/story/Sketch.big", "ae2b afb3 a2b4 49 12 9d"),
     ConsoleTest("screens/story/charDec.big", "ae39 af5e a25f 49 12 9d", body="ae90"),
 ]
-TESTS = VOICE_PAGE + VENUE_MAP + TRAILER + SPOTLIGHT
+TESTS = VOICE_PAGE + TRAILER + SPOTLIGHT
 
 # The created fighter's speech banks by voice (speech/*/Def_Jam_IP_Characters/<id>), read by the
 # fight setup at 0x8002F380 for the voice CreatePlayer.SetVoice stored. The GameCube's table gives

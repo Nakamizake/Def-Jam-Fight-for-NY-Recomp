@@ -215,8 +215,6 @@ GameCube, a few of those branches leave out things that are still on its disc:
   its executable gives all six voices the first one's speech in fights; a memory patch
   (`patches.txt` in the fixes) puts back the PlayStation 2's table, one set of speech per voice.
   The voice is chosen when the fighter is created, so it shows in a new story.
-- **Venue map.** *Choose Venue* draws the city from `battle/map.swf`, about four times as
-  detailed as the `map_ngc.swf` the GameCube loads instead.
 - **Trailer.** *Extras* gets a third poster that plays the game's trailer
   (`movies/attract.mad`), from the posters the PlayStation 2 release uses.
 - **Spotlight.** Most menus lay a soft light over the screen that darkens its edges; the
@@ -228,6 +226,12 @@ console test in the scripts was checked too: the rest fit the layout to the TV, 
 GameCube's own button prompts, copyright line and memory card messages, or only concern the
 other consoles.
 `gc_cuts.py --out <mod folder>` also builds the fix as an ordinary mod.
+
+One cut has to stay: *Choose Venue*'s map. The PlayStation 2 loads `battle/map.big`, about four
+times as detailed as the GameCube's `battle/map_ngc.big` and 1.3 MB larger in memory. The story
+mode's city map is the same screen and stays loaded under the event screens; with the larger
+map, the GameCube's 24 MB left no block for the tournament screen (`story/tournament.big`), and
+the game hung at Babylon, the first tournament.
 
 ## Netplay
 

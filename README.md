@@ -42,7 +42,7 @@ console hardware.
   LAN or VPN.
 - **What the GameCube release left out.** Still on its disc, switched back on as on the other
   consoles: the Sketch Artist's voice page (pick your created fighter's voice out of six), the
-  detailed city map of *Choose Venue*, the trailer in *Extras* and the menus' spotlight.
+  trailer in *Extras* and the menus' spotlight.
 - **Mods.** Drop-in texture replacements and game-file mods, switched on and off in game,
   without ever touching the game's own files. Includes a tool for the game's `.viv` archives.
 - **Optimize for this PC.** An optional, unattended profile-guided build that plays the game

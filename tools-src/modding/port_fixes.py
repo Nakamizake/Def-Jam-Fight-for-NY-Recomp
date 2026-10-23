@@ -8,8 +8,8 @@ is built from the game's own files, so the game build (build-game.ps1) runs this
 
 Fixes:
 
-- what the menus switch off on the GameCube: the Sketch Artist's voice page, the detailed
-  venue map, the trailer in Extras and the menus' spotlight (gc_cuts.py).
+- what the menus switch off on the GameCube: the Sketch Artist's voice page, the trailer in
+  Extras and the menus' spotlight (gc_cuts.py).
 
 The folder is rebuilt from scratch each time; the game's files are only read.
 """
