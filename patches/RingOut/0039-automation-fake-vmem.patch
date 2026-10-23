@@ -1,0 +1,57 @@
+diff --git a/ModernGekko/src/runtime/dolphin_runtime.cpp b/ModernGekko/src/runtime/dolphin_runtime.cpp
+index c3f7a429..18581e49 100644
+--- a/ModernGekko/src/runtime/dolphin_runtime.cpp
++++ b/ModernGekko/src/runtime/dolphin_runtime.cpp
+@@ -61,6 +61,7 @@
+ #include <cstddef>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <filesystem>
+ #include <fstream>
+ #include <fmt/format.h>
+@@ -254,12 +255,26 @@ void SaveAutomationScreenshot(const std::filesystem::path& path)
+     g_frame_dumper->SaveScreenshot(path.string());
+ }
+ 
++// Host pointer for a guest range: main RAM (through MemoryManager), or the fake VMEM at
++// 0x7E000000 that games running without the MMU keep heap data in. Null when out of range.
++u8* AutomationGuestRange(Memory::MemoryManager& memory, u32 address, size_t size)
++{
++  constexpr u32 fake_vmem_base = 0x7E000000;
++  u8* fake_vmem = memory.GetFakeVMEM();
++  if (fake_vmem && address >= fake_vmem_base && address - fake_vmem_base < memory.GetFakeVMemSize())
++  {
++    const u32 offset = address - fake_vmem_base;
++    return size <= memory.GetFakeVMemSize() - offset ? fake_vmem + offset : nullptr;
++  }
++  return memory.GetPointerForRange(address, size);
++}
++
+ std::optional<RuntimeError> ReadAutomationMemory(const std::filesystem::path& path, u32 address,
+                                                  u32 size)
+ {
+   auto& system = Core::System::GetInstance();
+   const Core::CPUThreadGuard guard(system);
+-  const u8* source = system.GetMemory().GetPointerForRange(address, size);
++  const u8* source = AutomationGuestRange(system.GetMemory(), address, size);
+   if (!source)
+   {
+     return RuntimeError{RuntimeErrorCode::InvalidState,
+@@ -294,13 +309,14 @@ std::optional<RuntimeError> WriteAutomationMemory(u32 address,
+ {
+   auto& system = Core::System::GetInstance();
+   const Core::CPUThreadGuard guard(system);
+-  if (!system.GetMemory().GetPointerForRange(address, data.size()))
++  u8* target = AutomationGuestRange(system.GetMemory(), address, data.size());
++  if (!target)
+   {
+     return RuntimeError{
+         RuntimeErrorCode::InvalidState,
+         fmt::format("guest range {:#010x}+{} is not writable", address, data.size())};
+   }
+-  system.GetMemory().CopyToEmu(address, data.data(), data.size());
++  std::memcpy(target, data.data(), data.size());
+   return {};
+ }
+ 
