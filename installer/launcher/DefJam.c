@@ -24,6 +24,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <stdlib.h>
+#include <string.h>
 #include <wchar.h>
 
 #define APP_TITLE L"Def Jam: Fight for NY"
@@ -151,8 +152,7 @@ static const struct ps2_extra {
      L"HD textures: most of the game's textures at twice the resolution (about 250 MB, a "
      L"minute or two)"},
     {L"--music", L"PS2Music",
-     L"Music: the soundtrack in the PS2's higher quality, plus the 13 songs the GameCube "
-     L"release left out (about 700 MB, under a minute)"},
+     L"Music: the soundtrack in the PS2's higher quality (about 400 MB, under a minute)"},
 };
 #define PS2_EXTRA_COUNT (sizeof PS2_EXTRAS / sizeof PS2_EXTRAS[0])
 #define ID_FIRST_EXTRA 100
@@ -255,18 +255,172 @@ static BOOL choose_ps2_extras(BOOL chosen[PS2_EXTRA_COUNT])
                                    (LPARAM)chosen) == IDOK;
 }
 
+#define ID_PROGRESS_STEP 200
+#define ID_PROGRESS_LINE 201
+#define PROGRESS_TIMER 1
+
+/* A tool running behind the progress window: the process, the job holding it and every process
+ * it starts (ps2_extras.py converts with a pool of workers), and the log it writes. */
+struct progress_task {
+    HANDLE process;
+    HANDLE job;
+    const wchar_t *log_file;
+    const wchar_t *step;
+};
+
+/* The last non-empty line of a UTF-8 log, for the progress window; empty if there is none. */
+static void last_log_line(const wchar_t *log_file, wchar_t *out, int size)
+{
+    char tail[1024];
+    DWORD got = 0;
+    LARGE_INTEGER length;
+    HANDLE file = CreateFileW(log_file, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    out[0] = L'\0';
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+    if (GetFileSizeEx(file, &length)) {
+        LARGE_INTEGER start;
+        start.QuadPart = length.QuadPart > (LONGLONG)sizeof tail - 1
+                             ? length.QuadPart - ((LONGLONG)sizeof tail - 1)
+                             : 0;
+        if (SetFilePointerEx(file, start, NULL, FILE_BEGIN))
+            ReadFile(file, tail, sizeof tail - 1, &got, NULL);
+    }
+    CloseHandle(file);
+    while (got > 0 && (tail[got - 1] == '\n' || tail[got - 1] == '\r' || tail[got - 1] == ' '))
+        --got;
+    tail[got] = '\0';
+    {
+        const char *line = strrchr(tail, '\n');
+        line = line != NULL ? line + 1 : tail;
+        MultiByteToWideChar(CP_UTF8, 0, line, -1, out, size);
+        out[size - 1] = L'\0';
+    }
+}
+
+static INT_PTR CALLBACK progress_proc(HWND dialog, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    static struct progress_task *task;
+    switch (message) {
+    case WM_INITDIALOG:
+        task = (struct progress_task *)lparam;
+        SetDlgItemTextW(dialog, ID_PROGRESS_STEP, task->step);
+        SetTimer(dialog, PROGRESS_TIMER, 250, NULL);
+        return TRUE;
+    case WM_TIMER: {
+        wchar_t line[256];
+        if (WaitForSingleObject(task->process, 0) == WAIT_OBJECT_0) {
+            KillTimer(dialog, PROGRESS_TIMER);
+            EndDialog(dialog, IDOK);
+            return TRUE;
+        }
+        last_log_line(task->log_file, line, 256);
+        SetDlgItemTextW(dialog, ID_PROGRESS_LINE, line);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wparam) == IDCANCEL &&
+            MessageBoxW(dialog, L"Stop building the PS2 extras?", APP_TITLE,
+                        MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            KillTimer(dialog, PROGRESS_TIMER);
+            TerminateJobObject(task->job, 1);
+            WaitForSingleObject(task->process, 5000);
+            EndDialog(dialog, IDCANCEL);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Runs a command line with no window while a progress window shows step and the last line of
+ * log_file, and waits for it. Cancel ends it and everything it started. Returns its exit code,
+ * -1 if it did not start, -2 if the player cancelled. */
+static int run_with_progress(wchar_t *command_line, HANDLE log, const wchar_t *log_file,
+                             const wchar_t *step)
+{
+    static DWORD template_buffer[512]; /* the template must be DWORD-aligned */
+    const short width = 280, height = 74;
+    DLGTEMPLATE *dialog = (DLGTEMPLATE *)template_buffer;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    STARTUPINFOW startup;
+    PROCESS_INFORMATION process;
+    struct progress_task task;
+    DWORD code = (DWORD)-1;
+    INT_PTR result;
+    WORD *at;
+
+    /* The job ends the tool and its workers if the player cancels or this launcher is closed. */
+    task.job = CreateJobObjectW(NULL, NULL);
+    if (task.job == NULL)
+        return -1;
+    ZeroMemory(&limits, sizeof limits);
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(task.job, JobObjectExtendedLimitInformation, &limits, sizeof limits);
+
+    ZeroMemory(&startup, sizeof startup);
+    startup.cb = sizeof startup;
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = log;
+    startup.hStdError = log;
+    ZeroMemory(&process, sizeof process);
+    if (!CreateProcessW(NULL, command_line, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                        NULL, g_root, &startup, &process)) {
+        CloseHandle(task.job);
+        return -1;
+    }
+    AssignProcessToJobObject(task.job, process.hProcess);
+    ResumeThread(process.hThread);
+    CloseHandle(process.hThread);
+    task.process = process.hProcess;
+    task.log_file = log_file;
+    task.step = step;
+
+    ZeroMemory(template_buffer, sizeof template_buffer);
+    dialog->style = DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    dialog->cx = width;
+    dialog->cy = height;
+    at = (WORD *)(dialog + 1);
+    *at++ = 0; /* no menu */
+    *at++ = 0; /* the standard dialog class */
+    wcscpy((wchar_t *)at, APP_TITLE L" - PS2 extras");
+    at += wcslen((wchar_t *)at) + 1;
+    *at++ = 9; /* font size, then name */
+    wcscpy((wchar_t *)at, L"Segoe UI");
+    at += wcslen((wchar_t *)at) + 1;
+    at = add_dialog_item(at, SS_LEFT, 8, 8, width - 16, 18, ID_PROGRESS_STEP, 0x0082, L"");
+    at = add_dialog_item(at, SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, 8, 30, width - 16, 10,
+                         ID_PROGRESS_LINE, 0x0082, L"");
+    at = add_dialog_item(at, BS_PUSHBUTTON | WS_TABSTOP, width - 62, height - 22, 54, 15,
+                         IDCANCEL, 0x0080, L"Cancel");
+    dialog->cdit = 3;
+
+    result = DialogBoxIndirectParamW(GetModuleHandleW(NULL), dialog, NULL, progress_proc,
+                                     (LPARAM)&task);
+    if (result != IDCANCEL) {
+        /* Also when the window could not be shown: then just wait. */
+        WaitForSingleObject(task.process, INFINITE);
+        GetExitCodeProcess(task.process, &code);
+    }
+    CloseHandle(task.process);
+    CloseHandle(task.job);
+    return result == IDCANCEL ? -2 : (int)code;
+}
+
 /* Runs modding\ps2_extras.py with the bundled Python, once per chosen extra so that each one
- * that builds is switched on even if another fails. The output of all of them goes to
- * logs\ps2-extras.log; the mods are switched on in userdata\Config\Mods.ini (where the MODS
- * tab keeps its choices). Returns how many failed. */
+ * that builds is switched on even if another fails, behind a progress window. The output of
+ * all of them goes to logs\ps2-extras.log; the mods are switched on in userdata\Config\Mods.ini
+ * (where the MODS tab keeps its choices). Returns how many failed, or -1 if the player
+ * cancelled. */
 static int build_ps2_extras(const wchar_t *ps2_image, const BOOL chosen[PS2_EXTRA_COUNT])
 {
     wchar_t python[MAX_PATH], tool[MAX_PATH], files[MAX_PATH], mods[MAX_PATH], logs[MAX_PATH],
         log_file[MAX_PATH], user[MAX_PATH], config[MAX_PATH], mods_ini[MAX_PATH],
-        command_line[CMDLINE_MAX];
+        command_line[CMDLINE_MAX], step[512];
     SECURITY_ATTRIBUTES inheritable = {sizeof inheritable, NULL, TRUE};
     HANDLE log;
-    int failed = 0;
+    int failed = 0, count = 0, done = 0;
 
     root_path(python, MAX_PATH, L"toolchain\\python\\bin\\python.exe");
     root_path(tool, MAX_PATH, L"modding\\ps2_extras.py");
@@ -281,22 +435,40 @@ static int build_ps2_extras(const wchar_t *ps2_image, const BOOL chosen[PS2_EXTR
     CreateDirectoryW(user, NULL);
     CreateDirectoryW(config, NULL);
 
+    /* The progress window reads this log while the tool writes it. */
     log = CreateFileW(log_file, GENERIC_WRITE, FILE_SHARE_READ, &inheritable, CREATE_ALWAYS,
                       FILE_ATTRIBUTE_NORMAL, NULL);
+    if (log == INVALID_HANDLE_VALUE) {
+        show_error(L"Could not write logs\\ps2-extras.log.");
+        return (int)PS2_EXTRA_COUNT;
+    }
+    for (size_t i = 0; i < PS2_EXTRA_COUNT; ++i)
+        count += chosen[i] ? 1 : 0;
     for (size_t i = 0; i < PS2_EXTRA_COUNT; ++i) {
+        int code;
         if (!chosen[i])
             continue;
+        /* -u: unbuffered, so its progress reaches the log (and the window) as it happens. */
         _snwprintf(command_line, CMDLINE_MAX,
-                   L"\"%ls\" -I \"%ls\" --gc-files \"%ls\" --ps2 \"%ls\" --mods \"%ls\" %ls",
+                   L"\"%ls\" -u -I \"%ls\" --gc-files \"%ls\" --ps2 \"%ls\" --mods \"%ls\" %ls",
                    python, tool, files, ps2_image, mods, PS2_EXTRAS[i].option);
         command_line[CMDLINE_MAX - 1] = L'\0';
-        if (run(command_line, CREATE_NO_WINDOW, log == INVALID_HANDLE_VALUE ? NULL : log) == 0)
+        _snwprintf(step, 512,
+                   L"Building extra %d of %d: %ls\nThis takes a few minutes. Keep the game closed "
+                   L"until it is done.",
+                   ++done, count, PS2_EXTRAS[i].mod);
+        step[511] = L'\0';
+        code = run_with_progress(command_line, log, log_file, step);
+        if (code == -2) {
+            failed = -1;
+            break;
+        }
+        if (code == 0)
             WritePrivateProfileStringW(L"Mods", PS2_EXTRAS[i].mod, L"True", mods_ini);
         else
             ++failed;
     }
-    if (log != INVALID_HANDLE_VALUE)
-        CloseHandle(log);
+    CloseHandle(log);
     return failed;
 }
 
@@ -378,6 +550,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
 
     if (ps2_extras) {
         BOOL chosen[PS2_EXTRA_COUNT];
+        int failed;
+        /* Two builds at once would write the same mod folders and log. Held until exit. */
+        CreateMutexW(NULL, TRUE, L"Local\\DefJamFFNY-PS2Extras");
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            show_error(L"The PS2 extras are already being built; wait for the message saying "
+                       L"they are done.");
+            return 1;
+        }
         if (!game_is_built()) {
             show_error(L"Build the game first: start it once from the Def Jam: Fight for NY "
                        L"shortcut, then add the PS2 extras.");
@@ -385,7 +565,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR arguments, int
         }
         if (!choose_ps2_extras(chosen) || !pick_ps2_image(disc_image, MAX_PATH))
             return 1;
-        if (build_ps2_extras(disc_image, chosen) != 0) {
+        failed = build_ps2_extras(disc_image, chosen);
+        if (failed < 0) {
+            MessageBoxW(NULL, L"Stopped. The extras that were finished before are on.",
+                        APP_TITLE, MB_OK | MB_ICONINFORMATION);
+            return 1;
+        }
+        if (failed > 0) {
             show_error(L"Not every extra could be built (the ones that were are on).\n\n"
                        L"Details are in logs\\ps2-extras.log.");
             return 1;

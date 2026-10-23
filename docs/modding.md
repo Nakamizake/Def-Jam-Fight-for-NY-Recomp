@@ -54,7 +54,7 @@ each into a mod folder of its own:
 | Switch | Mod | What | Tool |
 | --- | --- | --- | --- |
 | `--textures` | PS2Textures | most textures at twice the resolution | `ps2_textures.py` |
-| `--music` | PS2Music | the soundtrack at the PS2's sample rate, and its 13 extra songs | `ps2_music.py` |
+| `--music` | PS2Music | the soundtrack at the PS2's sample rate | `ps2_music.py` |
 
 ```powershell
 python -I tools-src\ps2\ps2_extras.py --gc-files extracted\GNWE69\files `
@@ -78,29 +78,30 @@ height: every character texture and about half of each venue's. `ps2_textures.py
 GameCube texture with its PS2 counterpart and writes the larger one under the GameCube texture's
 name. It leaves a texture out when the PS2 one is not larger, and also when the two pictures do
 not match once the larger one is scaled down (a few textures were redrawn between the releases).
+The names match any palette (the game builds some palettes as it runs), so a replacement shows
+wherever the same texels are drawn: single-colour textures are left out too (every solid square
+of a size shares them; two white venue squares turned whole menus white), as are texels the
+GameCube disc draws with more than one palette.
 It takes a minute or two and writes about 5,800 textures: around 160 MB, or 250 MB with the
 installed game's Python, which lacks zlib and leaves the PNGs uncompressed. Like any texture mod
 it is drawn only on your PC, so it never matters to netplay. The textures are loaded the first
 time the game uses each one, not all at boot, which keeps the game's memory use about the same.
 
 **Music.** Both releases store the soundtrack as EA-XA ADPCM, the PS2 one at 36,000 Hz against
-the GameCube's 22,050, and the PS2 disc has 33 songs against 20. `ps2_music.py` rebuilds the
-five music archives (`audio/music0-4.viv`) with:
+the GameCube's 22,050. `ps2_music.py` rebuilds the five music archives (`audio/music0-4.viv`)
+with the PS2 recording of each of the 20 songs (`main.mus`) and its interactive-music script
+(`tune.mpf`), converted to the GameCube's byte order (`ea_audio.py`, `mpf.py`); the audio
+frames themselves are the same bytes on both consoles. The songs keep the GameCube's
+loading-screen and overlay sound banks (the same sounds, and the game holds them in buffers
+sized for the GameCube's own). It takes under a minute and writes about 400 MB. It is a
+game-file mod, so for netplay both players need it switched on (or both off).
 
-- the PS2 recording of each of the 20 songs (`main.mus`) and its interactive-music script
-  (`tune.mpf`), converted to the GameCube's byte order (`ea_audio.py`, `mpf.py`). The audio
-  frames themselves are the same bytes on both consoles;
-- the 13 PS2-only songs (`arewecuttin`, `getintoit`, `getitnow`, `hitem`, `holler`,
-  `mamasaid`, `minitrack2`, `nuffrespect`, `nwa`, `poppalarge`, `pump`, `ricache`,
-  `seizetheday`), whose loading-screen and overlay sound banks are resampled to the GameCube's
-  rate (24,000 to 16,000 Hz) and encoded again: the game keeps those banks in buffers sized for
-  the GameCube's own;
-- a `patches.txt` (see *Memory patches* below) that clears the names of 12 of those songs from
-  a list the GameCube executable skips in its song selection.
-
-The 20 shared songs keep the GameCube's loading-screen and overlay banks (the same sounds). It
-takes under a minute and writes about 700 MB. It is a game-file mod, so for netplay both
-players need it switched on (or both off).
+The PS2 disc also has 13 songs the GameCube release left out (`arewecuttin`, `getintoit`,
+`getitnow`, `hitem`, `holler`, `mamasaid`, `minitrack2`, `nuffrespect`, `nwa`, `poppalarge`,
+`pump`, `ricache`, `seizetheday`); `djv2.sod` still describes all of them. They are not added
+yet: the GameCube executable skips 12 of them by name (a list at `80297D54`), and with those
+names cleared the front end's song lists (code at `8002BC18` and `8002C6BC`) read a null
+pointer for each of them, which would crash a real console, and still leave them out.
 
 ## Game files
 

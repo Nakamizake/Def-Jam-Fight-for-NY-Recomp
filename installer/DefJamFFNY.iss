@@ -93,7 +93,7 @@ Type: files; Name: "{autodesktop}\{#ShortName}.lnk"; Tasks: not desktopicon
 [Run]
 ; Optional and off by default. They run first and are waited for, so with "Play now" also
 ; ticked the game starts once they are done instead of alongside them.
-Filename: "{app}\DefJam.exe"; Parameters: "--ps2-extras"; Description: "Add extras from your PlayStation 2 disc image now: HD textures, higher-quality music and its extra songs (optional, a few minutes; also in the game folder)"; Flags: postinstall unchecked skipifsilent; Check: GameIsBuilt
+Filename: "{app}\DefJam.exe"; Parameters: "--ps2-extras"; Description: "Add extras from your PlayStation 2 disc image now: HD textures and higher-quality music (optional, a few minutes; also in the game folder)"; Flags: postinstall unchecked skipifsilent; Check: GameIsBuilt
 Filename: "{app}\DefJam.exe"; Parameters: "--optimize"; Description: "Optimize the game for this PC now (optional, about 20 minutes; also in the game folder)"; Flags: postinstall unchecked skipifsilent; Check: GameIsBuilt
 Filename: "{app}\DefJam.exe"; Description: "Play now"; Flags: postinstall nowait skipifsilent; Check: GameIsBuilt
 

@@ -3,8 +3,7 @@
 Each extra becomes a mod of its own in the mods folder, switched on and off in Esc > MODS:
 
     --textures  PS2Textures  most textures at twice the resolution (ps2_textures.py)
-    --music     PS2Music     the soundtrack at the PS2's higher sample rate, plus the 13 songs the
-                             GameCube release left out (ps2_music.py)
+    --music     PS2Music     the soundtrack at the PS2's higher sample rate (ps2_music.py)
 
     python -I ps2_extras.py --gc-files extracted\\GNWE69\\files --ps2 DefJamPs2.iso \\
         --mods userdata\\Load\\Mods --textures --music
@@ -39,7 +38,7 @@ class Extra:
 
 EXTRAS = [
     Extra("textures", "PS2Textures", "most textures at twice the resolution", ps2_textures.build),
-    Extra("music", "PS2Music", "the soundtrack at the PS2's sample rate, plus its 13 extra songs", ps2_music.build),
+    Extra("music", "PS2Music", "the soundtrack at the PS2's sample rate", ps2_music.build),
 ]
 
 

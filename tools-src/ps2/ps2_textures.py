@@ -14,7 +14,11 @@ larger are left out (nothing to gain), as are pairs whose pictures do not agree 
 one is scaled down, so a mismatch can never put a wrong texture in the game.
 
 Names follow Dolphin: tex1_<w>x<h>_<XXH64 of the GameCube texels>_$_<format>.png, the `$`
-standing for any palette (the game builds some palettes at run time).
+standing for any palette (the game builds some palettes at run time). So a replacement goes
+wherever the same texels are drawn, whatever their colours, and two kinds of image are left out
+for it: single-colour ones (every solid image of a size shares their texels: a white venue
+square once turned menus white) and texels that the GameCube disc draws with more than one
+palette (colour variants of one picture, which would all take one variant's colours).
 """
 
 from __future__ import annotations
@@ -45,8 +49,11 @@ MAX_DIFFERENCE = 24.0  # mean per-channel difference of the sampled texels allow
 class Report:
     archive: str
     written: dict[str, bytes] = field(default_factory=dict)  # Dolphin name -> PNG
+    # Dolphin name -> the palettes (the colours used) of every GameCube image of that name.
+    palettes: dict[str, set[bytes]] = field(default_factory=dict)
     not_larger: int = 0
     unsupported: int = 0
+    solid: int = 0
     different: list[str] = field(default_factory=list)
 
 
@@ -90,18 +97,37 @@ def _cell_mean(colours) -> tuple[float, float, float] | None:
     return tuple(sum(c[i] for c in opaque) / len(opaque) for i in range(3))
 
 
+def gc_indices(gc: shapes.Image) -> set[int]:
+    """The palette indices a GameCube image's texels use."""
+    values = set(gc.pixels[:shapes.gc_size(gc)])
+    return values if gc.bits == 8 else {nibble for v in values for nibble in (v >> 4, v & 15)}
+
+
 def pair_archive(gc_path: str, ps2_source: str, ps2_path: str, name: str) -> Report:
     report = Report(name)
     gc_shapes = shape_files(viv.read_archive(pathlib.Path(gc_path)), ".gsh")
     ps2_shapes = shape_files(viv.parse_archive(Ps2Disc(ps2_source).read(ps2_path), ps2_path), ".ssh")
     for stem, gc_shape in gc_shapes.items():
-        if stem not in ps2_shapes:
-            continue
-        ps2_images = {image.tag: image for image in shapes.read_shape(ps2_shapes[stem])}
+        paired = stem in ps2_shapes
+        ps2_images = {image.tag: image for image in shapes.read_shape(ps2_shapes[stem])} if paired else {}
         for gc in shapes.read_shape(gc_shape):
+            if not shapes.gc_supported(gc):
+                report.unsupported += paired
+                continue
+            # Every GameCube image counts here, replaced or not: any of them can share its texels
+            # with one that is.
+            texels = gc.pixels[:shapes.gc_size(gc)]
+            dolphin_name = f"tex1_{gc.width}x{gc.height}_{xxh64(texels):016x}_$_{shapes.GX_FORMAT[gc.kind]}"
+            indices = gc_indices(gc)
+            report.palettes.setdefault(dolphin_name, set()).add(gc.palette[:(max(indices) + 1) * 2])
+            if not paired:
+                continue
             ps2 = ps2_images.get(gc.tag)
-            if ps2 is None or not shapes.gc_supported(gc) or not shapes.ps2_supported(ps2):
+            if ps2 is None or not shapes.ps2_supported(ps2):
                 report.unsupported += 1
+                continue
+            if len(indices) == 1:
+                report.solid += 1
                 continue
             if ps2.width <= gc.width or ps2.width % gc.width or ps2.height % gc.height \
                     or ps2.width // gc.width != ps2.height // gc.height:
@@ -111,8 +137,6 @@ def pair_archive(gc_path: str, ps2_source: str, ps2_path: str, name: str) -> Rep
             if not pictures_agree(gc, ps2, colours):
                 report.different.append(f"{stem}/{gc.tag}")
                 continue
-            texels = gc.pixels[:shapes.gc_size(gc)]
-            dolphin_name = f"tex1_{gc.width}x{gc.height}_{xxh64(texels):016x}_$_{shapes.GX_FORMAT[gc.kind]}"
             if dolphin_name not in report.written:
                 report.written[dolphin_name] = png.indexed_png(
                     ps2.width, ps2.height, ps2.bits, shapes.ps2_rows(ps2), colours)
@@ -152,9 +176,10 @@ def build(gc_files: str, ps2_source: str, out: str, jobs: int) -> None:
     if textures.exists():
         for old in textures.rglob("*.png"):
             old.unlink()
-    written: set[str] = set()
+    written: dict[str, pathlib.Path] = {}
+    palettes: dict[str, set[bytes]] = {}
     different: list[str] = []
-    totals = {"not larger": 0, "unsupported": 0}
+    totals = {"not larger": 0, "unsupported": 0, "solid": 0}
     size = 0
     with concurrent.futures.ProcessPoolExecutor(max_workers=jobs) as pool:
         for report in pool.map(pair_archive, *zip(*pairs)):
@@ -163,15 +188,25 @@ def build(gc_files: str, ps2_source: str, out: str, jobs: int) -> None:
             if new:
                 folder.mkdir(parents=True, exist_ok=True)
             for dolphin_name, data in new.items():
-                (folder / f"{dolphin_name}.png").write_bytes(data)
+                path = folder / f"{dolphin_name}.png"
+                path.write_bytes(data)
                 size += len(data)
-            written.update(new)
+                written[dolphin_name] = path
+            for dolphin_name, used in report.palettes.items():
+                palettes.setdefault(dolphin_name, set()).update(used)
             totals["not larger"] += report.not_larger
             totals["unsupported"] += report.unsupported
+            totals["solid"] += report.solid
             different += [f"{report.archive}:{item}" for item in report.different]
             print(f"  {report.archive}: {len(new)} textures")
+    # Only now is every image of a name known: drop the names drawn with several palettes.
+    recoloured = [name for name in written if len(palettes.get(name, ())) > 1]
+    for dolphin_name in recoloured:
+        size -= written[dolphin_name].stat().st_size
+        written.pop(dolphin_name).unlink()
     print(f"{len(written)} textures, {size / 2**20:.0f} MiB, in {textures} ({time.monotonic() - started:.0f} s)")
     print(f"left out: {totals['not larger']} not larger on PS2, {totals['unsupported']} other formats, "
+          f"{totals['solid']} single-colour, {len(recoloured)} drawn with several palettes, "
           f"{len(different)} pictures that differ")
     for item in different[:20]:
         print(f"  differs: {item}")
