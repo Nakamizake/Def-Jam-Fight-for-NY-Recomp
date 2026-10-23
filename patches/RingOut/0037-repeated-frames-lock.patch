@@ -1,0 +1,298 @@
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.cpp b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+index eea3c118..282b364d 100644
+--- a/ModernGekko/src/runtime/vi_locked_alarm.cpp
++++ b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+@@ -11,6 +11,7 @@
+ #include "Core/HW/VideoInterface.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/System.h"
++#include "VideoCommon/RepeatedFrames.h"
+ #include "VideoCommon/VideoEvents.h"
+ 
+ namespace moderngekko {
+@@ -25,8 +26,15 @@ constexpr std::uint32_t kAlarmSize = 40;
+ // loop is not running steps at all (loading): nothing to learn there.
+ constexpr std::uint32_t kWindowFields = 30;
+ constexpr std::uint32_t kUnevenFieldsToMove = 4;
++// Frames repeating the previous one right after a frame that did not, in the same window: at
++// 30 a second there are about 15; a smooth fight shows 0-2 (a frame whose matrices did not
++// change but its vertices did), a still scene none.
++constexpr std::uint64_t kAlternatingRepeatsToMove = 6;
+ constexpr std::uint32_t kMaxQueued = 3;
+ constexpr std::uint64_t kPhaseMoveUs = 1000;
++// Repeat bands are wider (several ms) and every clean stretch seen was 3 ms or more: bigger moves
++// get out sooner without stepping over one.
++constexpr std::uint64_t kRepeatPhaseMoveUs = 2000;
+ } // namespace
+ 
+ std::optional<ViLockedAlarm::Options> ViLockedAlarm::FromConfig() {
+@@ -57,10 +65,16 @@ std::optional<ViLockedAlarm::Options> ViLockedAlarm::FromConfig() {
+ }
+ 
+ ViLockedAlarm::ViLockedAlarm(Options options) : m_options(options) {
++  if (m_options.queue_offset != 0)
++    RepeatedFrames::SetEnabled(true);
+   m_field_hook = GetVideoEvents().vi_end_field_event.Register([this] { OnFieldEnd(); });
+ }
+ 
+-ViLockedAlarm::~ViLockedAlarm() = default;
++ViLockedAlarm::~ViLockedAlarm() {
++  m_field_hook = {};
++  if (m_options.queue_offset != 0)
++    RepeatedFrames::SetEnabled(false);
++}
+ 
+ void ViLockedAlarm::OnFieldEnd() {
+   // Runs on the CPU thread between guest instructions, at the end of every field.
+@@ -128,23 +142,32 @@ void ViLockedAlarm::FollowFrameLoop(const Memory::MemoryManager &memory, std::ui
+   // shows as a change in the count.
+   const std::uint32_t queued = memory.Read_U32(queue);
+   const std::optional<std::uint32_t> last = std::exchange(m_last_queued, queued);
++  const std::uint64_t repeats = RepeatedFrames::Get().alternating_repeats;
+   if (queued > kMaxQueued || !last || *last > kMaxQueued) {
+     m_window_fields = 0;
+     m_window_uneven = 0;
++    m_window_repeats_start = repeats;
+     return;
+   }
+   m_window_uneven += queued != *last;
+   if (++m_window_fields < kWindowFields)
+     return;
+-  if (m_window_uneven >= kUnevenFieldsToMove) {
++  const std::uint64_t window_repeats = repeats - m_window_repeats_start;
++  const bool repeating = window_repeats >= kAlternatingRepeatsToMove;
++  if (m_window_uneven >= kUnevenFieldsToMove || repeating) {
+     // Earlier, so the step is already waiting when the check comes; around the field if need be.
+-    const std::uint64_t move = kPhaseMoveUs * ticks_per_second / 1000000;
++    const std::uint64_t move =
++        (repeating ? kRepeatPhaseMoveUs : kPhaseMoveUs) * ticks_per_second / 1000000;
+     m_step_phase = (*m_step_phase + field - move) % field;
+-    std::fprintf(stderr, "[vi-locked-alarm] field %llu: uneven in %u of %u, phase now %llu us\n",
++    std::fprintf(stderr,
++                 "[vi-locked-alarm] field %llu: uneven in %u of %u, %llu repeated frames, "
++                 "phase now %llu us\n",
+                  static_cast<unsigned long long>(m_fields), m_window_uneven, m_window_fields,
++                 static_cast<unsigned long long>(window_repeats),
+                  static_cast<unsigned long long>(*m_step_phase * 1000000 / ticks_per_second));
+   }
+   m_window_fields = 0;
+   m_window_uneven = 0;
++  m_window_repeats_start = repeats;
+ }
+ } // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.hpp b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+index e1f7a65e..29301862 100644
+--- a/ModernGekko/src/runtime/vi_locked_alarm.hpp
++++ b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+@@ -39,6 +39,14 @@ namespace moderngekko {
+ // nothing by itself: it is in every field both where the frames run one step a frame late,
+ // which is smooth, and in the middle of a judder band.)
+ //
++// The queue cannot see the other way a phase goes wrong: in bands of phases (5-10 ms and
++// 14 ms to 0 at 2x in a 1v1 fight, in dual core; they shift between runs) every frame still
++// runs one step, yet every other frame draws exactly what the previous one drew, so the game
++// shows 30 frames a second. Nothing pulled the phase out of such a band, and a session whose
++// menus walked it in (memory card reads, loading) stayed at 30. So the lock also watches what
++// the frames are drawn from (VideoCommon/RepeatedFrames.h) and moves 2 ms earlier when frames
++// repeat in that drawn-repeated-drawn pattern.
++//
+ // Off unless Core.ViLockedAlarm names the alarm (MainSettings.h), normally in the game's ini.
+ class ViLockedAlarm {
+ public:
+@@ -90,5 +98,7 @@ private:
+   std::optional<std::uint32_t> m_last_queued;
+   std::uint32_t m_window_fields = 0;
+   std::uint32_t m_window_uneven = 0;
++  // RepeatedFrames' alternating repeats when the window started.
++  std::uint64_t m_window_repeats_start = 0;
+ };
+ } // namespace moderngekko
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
+index 3f0d09c7..531c194f 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/CMakeLists.txt
+@@ -160,6 +160,8 @@ add_library(videocommon
+   RecompPadLayout.h
+   RenderState.cpp
+   RenderState.h
++  RepeatedFrames.cpp
++  RepeatedFrames.h
+   Resources/CustomResourceManager.cpp
+   Resources/CustomResourceManager.h
+   Resources/InvalidTextures.cpp
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RepeatedFrames.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RepeatedFrames.cpp
+new file mode 100644
+index 00000000..1589f9bc
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RepeatedFrames.cpp
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "VideoCommon/RepeatedFrames.h"
++
++#include <atomic>
++#include <cstring>
++
++namespace RepeatedFrames
++{
++namespace
++{
++std::atomic<bool> s_enabled{false};
++
++// GPU thread only.
++u64 s_hash = 0;
++u64 s_previous_hash = 0;
++bool s_previous_repeated = true;
++
++std::atomic<u64> s_copies{0};
++std::atomic<u64> s_repeats{0};
++std::atomic<u64> s_alternating_repeats{0};
++
++constexpr u64 HASH_START = 0xCBF29CE484222325ull;
++constexpr u64 HASH_PRIME = 0x100000001B3ull;
++}  // namespace
++
++void SetEnabled(bool enabled)
++{
++  s_enabled.store(enabled, std::memory_order_relaxed);
++}
++
++bool IsEnabled()
++{
++  return s_enabled.load(std::memory_order_relaxed);
++}
++
++void OnXFLoad(const void* data, std::size_t size)
++{
++  if (!IsEnabled())
++    return;
++
++  const auto* bytes = static_cast<const u8*>(data);
++  u64 hash = s_hash == 0 ? HASH_START : s_hash;
++  std::size_t i = 0;
++  for (; i + sizeof(u64) <= size; i += sizeof(u64))
++  {
++    u64 word;
++    std::memcpy(&word, bytes + i, sizeof(word));
++    hash = (hash ^ word) * HASH_PRIME;
++    hash ^= hash >> 29;
++  }
++  for (; i < size; ++i)
++    hash = (hash ^ bytes[i]) * HASH_PRIME;
++  s_hash = hash;
++}
++
++void OnXFBCopy()
++{
++  if (!IsEnabled())
++    return;
++
++  const bool repeated = s_hash == s_previous_hash;
++  s_copies.fetch_add(1, std::memory_order_relaxed);
++  if (repeated)
++  {
++    s_repeats.fetch_add(1, std::memory_order_relaxed);
++    if (!s_previous_repeated)
++      s_alternating_repeats.fetch_add(1, std::memory_order_relaxed);
++  }
++  s_previous_repeated = repeated;
++  s_previous_hash = s_hash;
++  s_hash = 0;
++}
++
++Counts Get()
++{
++  return {s_copies.load(std::memory_order_relaxed), s_repeats.load(std::memory_order_relaxed),
++          s_alternating_repeats.load(std::memory_order_relaxed)};
++}
++}  // namespace RepeatedFrames
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RepeatedFrames.h b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RepeatedFrames.h
+new file mode 100644
+index 00000000..7aae8b86
+--- /dev/null
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/RepeatedFrames.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <cstddef>
++
++#include "Common/CommonTypes.h"
++
++// Counts XFB copies whose GPU input repeats the previous copy's, for frame pacing checks made
++// outside the video backend.
++//
++// A game can draw the same scene twice in a row and show half its frame rate while every field
++// still gets a fresh XFB copy, so counting copies or presents does not see it. What the copies
++// were drawn from does: the XF register loads in the command stream (matrices, viewport,
++// lights) change whenever anything on screen moves, and hashing them is cheap. A copy whose XF
++// loads hash the same as the previous copy's counts as a repeat.
++//
++// Off (and free) until something enables it. The hooks run on the GPU thread; Get() may be
++// called from any thread.
++namespace RepeatedFrames
++{
++struct Counts
++{
++  u64 copies = 0;
++  // Copies that repeated the previous copy.
++  u64 repeats = 0;
++  // Repeats that came right after a copy that did not repeat: the drawn, repeated, drawn,
++  // repeated... pattern of a scene shown at half rate. A still scene repeats every copy and adds
++  // nothing here.
++  u64 alternating_repeats = 0;
++};
++
++void SetEnabled(bool enabled);
++bool IsEnabled();
++
++// XF register data loaded from the command stream.
++void OnXFLoad(const void* data, std::size_t size);
++// An EFB copy to the XFB: closes the frame drawn since the previous one.
++void OnXFBCopy();
++
++Counts Get();
++}  // namespace RepeatedFrames
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/TextureCacheBase.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/TextureCacheBase.cpp
+index dc13d507..e2b5587c 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -48,6 +48,7 @@
+ #include "VideoCommon/OpcodeDecoding.h"
+ #include "VideoCommon/PixelShaderManager.h"
+ #include "VideoCommon/Present.h"
++#include "VideoCommon/RepeatedFrames.h"
+ #include "VideoCommon/Resources/CustomResourceManager.h"
+ #include "VideoCommon/ShaderCache.h"
+ #include "VideoCommon/Statistics.h"
+@@ -2194,6 +2195,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
+   // Disadvantage of all methods: Calling this function requires the GPU to perform a pipeline flush
+   // which stalls any further CPU processing.
+   const bool is_xfb_copy = !is_depth_copy && !isIntensity && dstFormat == EFBCopyFormat::XFB;
++  if (is_xfb_copy)
++    RepeatedFrames::OnXFBCopy();
+   bool copy_to_vram = g_backend_info.bSupportsCopyToVram && !g_ActiveConfig.bDisableCopyToVRAM;
+   bool copy_to_ram =
+       !(is_xfb_copy ? g_ActiveConfig.bSkipXFBCopyToRam : g_ActiveConfig.bSkipEFBCopyToRam) ||
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/XFStructs.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/XFStructs.cpp
+index 4ac11c89..0f777872 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/XFStructs.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoCommon/XFStructs.cpp
+@@ -17,6 +17,7 @@
+ #include "VideoCommon/Fifo.h"
+ #include "VideoCommon/GeometryShaderManager.h"
+ #include "VideoCommon/PixelShaderManager.h"
++#include "VideoCommon/RepeatedFrames.h"
+ #include "VideoCommon/VertexLoaderManager.h"
+ #include "VideoCommon/VertexManagerBase.h"
+ #include "VideoCommon/XFMemory.h"
+@@ -200,6 +201,8 @@ static void XFRegWritten(Core::System& system, XFStateManager& xf_state_manager,
+ 
+ void LoadXFReg(u16 base_address, u8 transfer_size, const u8* data)
+ {
++  RepeatedFrames::OnXFLoad(data, transfer_size * sizeof(u32));
++
+   if (base_address > XFMEM_REGISTERS_END)
+   {
+     WARN_LOG_FMT(VIDEO, "XF load base address past end of address space: {:x} {} bytes",

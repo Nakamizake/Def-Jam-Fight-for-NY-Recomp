@@ -1,0 +1,410 @@
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.cpp b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+index 282b364d..947ceee2 100644
+--- a/ModernGekko/src/runtime/vi_locked_alarm.cpp
++++ b/ModernGekko/src/runtime/vi_locked_alarm.cpp
+@@ -1,11 +1,13 @@
+ #include "vi_locked_alarm.hpp"
+ 
++#include <atomic>
+ #include <cstdio>
+ #include <cstring>
+ #include <utility>
+ 
+ #include "Common/Config/Config.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/CoreTiming.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/HW/SystemTimers.h"
+ #include "Core/HW/VideoInterface.h"
+@@ -20,6 +22,8 @@ namespace {
+ constexpr std::uint32_t kAlarmPeriodOffset = 24;
+ constexpr std::uint32_t kAlarmStartOffset = 32;
+ constexpr std::uint32_t kAlarmSize = 40;
++// The lock whose divider resets are queued in CoreTiming (there is one at most).
++std::atomic<const ViLockedAlarm *> s_active{nullptr};
+ // FollowFrameLoop: a window of half a second of fields. A judder stretch makes 10-20 of them
+ // uneven (steps 1, 2, 0 per frame); one long frame (a scene change) makes two. Each move is 1 ms,
+ // so crossing a judder band takes a few seconds. More queued than kMaxQueued means the frame
+@@ -32,9 +36,13 @@ constexpr std::uint32_t kUnevenFieldsToMove = 4;
+ constexpr std::uint64_t kAlternatingRepeatsToMove = 6;
+ constexpr std::uint32_t kMaxQueued = 3;
+ constexpr std::uint64_t kPhaseMoveUs = 1000;
+-// Repeat bands are wider (several ms) and every clean stretch seen was 3 ms or more: bigger moves
+-// get out sooner without stepping over one.
++// Repeat bands with the step late are wide (6-7 ms in the bar, more in a 1v1 fight) and end in
++// clean phases at least 3 ms wide: bigger moves get out sooner without stepping over them.
++// Repeats move as soon as there are enough of them, a fifth of a second into a 30 a second
++// stretch, without waiting for the window to end.
+ constexpr std::uint64_t kRepeatPhaseMoveUs = 2000;
++// Windows in a row without a move (5 s) that make a phase the one to go back to.
++constexpr std::uint32_t kCleanWindows = 10;
+ } // namespace
+ 
+ std::optional<ViLockedAlarm::Options> ViLockedAlarm::FromConfig() {
+@@ -44,7 +52,8 @@ std::optional<ViLockedAlarm::Options> ViLockedAlarm::FromConfig() {
+                   Config::Get(Config::MAIN_VI_LOCKED_ALARM_DIVIDER_POINTER),
+                   Config::Get(Config::MAIN_VI_LOCKED_ALARM_DIVIDER_OFFSET),
+                   Config::Get(Config::MAIN_VI_LOCKED_ALARM_DIVIDER_VALUE),
+-                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_QUEUE_OFFSET)};
++                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_QUEUE_OFFSET),
++                  Config::Get(Config::MAIN_VI_LOCKED_ALARM_FOLLOW_ADDRESS)};
+   if (options.address == 0)
+     return std::nullopt;
+   if (options.per_field == 0)
+@@ -61,17 +70,23 @@ std::optional<ViLockedAlarm::Options> ViLockedAlarm::FromConfig() {
+     std::fprintf(stderr, "[vi-locked-alarm] phase follows the step queue at +%u\n",
+                  options.queue_offset);
+   }
++  if (options.queue_offset != 0 && options.follow_address != 0) {
++    std::fprintf(stderr, "[vi-locked-alarm] only while %08X is not 0\n", options.follow_address);
++  }
+   return options;
+ }
+ 
+ ViLockedAlarm::ViLockedAlarm(Options options) : m_options(options) {
+   if (m_options.queue_offset != 0)
+     RepeatedFrames::SetEnabled(true);
++  s_active.store(this, std::memory_order_release);
+   m_field_hook = GetVideoEvents().vi_end_field_event.Register([this] { OnFieldEnd(); });
+ }
+ 
+ ViLockedAlarm::~ViLockedAlarm() {
+   m_field_hook = {};
++  // A divider reset still queued in CoreTiming finds no lock and does nothing.
++  s_active.store(nullptr, std::memory_order_release);
+   if (m_options.queue_offset != 0)
+     RepeatedFrames::SetEnabled(false);
+ }
+@@ -98,18 +113,40 @@ void ViLockedAlarm::OnFieldEnd() {
+   if (object != 0 && m_options.queue_offset != 0)
+     FollowFrameLoop(memory, object, field, ticks_per_second);
+ 
+-  // The firing that queues the step, and where the alarm's firings sit within the field.
++  // The alarm fires at the step's phase and every period from there around the field.
+   const std::uint64_t period = field / m_options.per_field;
+-  const std::uint64_t firing = m_options.divider_pointer != 0 ? *m_step_phase / period : 0;
+-  const std::uint64_t phase = *m_step_phase - firing * period;
+   const std::uint64_t now = system.GetPowerPC().ReadFullTimeBaseValue();
+   // The field rarely divides evenly (NTSC: 675675 ticks); restarting the alarm every field
+   // keeps the remainder from adding up. Any start in the past works, as long as it is
+   // congruent to the wanted phase: the SDK fires at the first start + k * period after now.
+   memory.Write_U64(period, alarm + kAlarmPeriodOffset);
+-  memory.Write_U64(now + phase - field, alarm + kAlarmStartOffset);
++  memory.Write_U64(now + *m_step_phase % period - field, alarm + kAlarmStartOffset);
+   if (object != 0)
+-    ResetDivider(memory, object, firing);
++    ScheduleDividerReset(system, field, period);
++}
++
++void ViLockedAlarm::ScheduleDividerReset(Core::System &system, std::uint64_t field,
++                                         std::uint64_t period) {
++  // The game acts on a firing from a thread the alarm wakes, some time after it (about 2 ms in
++  // Def Jam), so a reset at the field's end could land between a firing and its effect, and
++  // then the firing before the wanted one acted: the step came a period early, and the phase
++  // jumped instead of moving. Half a period before the wanted firing, the reset is clear of
++  // both as long as that delay stays under half a period.
++  CoreTiming::CoreTimingManager &core_timing = system.GetCoreTiming();
++  if (m_divider_event == nullptr)
++    m_divider_event = core_timing.RegisterEvent("ViLockedAlarmDivider", &ResetDividerEvent);
++  const std::uint64_t at = (*m_step_phase + field - period / 2) % field;
++  core_timing.ScheduleEvent(static_cast<s64>(at * SystemTimers::TIMER_RATIO), m_divider_event);
++}
++
++void ViLockedAlarm::ResetDividerEvent(Core::System &system, std::uint64_t, std::int64_t) {
++  // Runs on the CPU thread; the lock may be gone by then.
++  const ViLockedAlarm *lock = s_active.load(std::memory_order_acquire);
++  if (lock == nullptr)
++    return;
++  Memory::MemoryManager &memory = system.GetMemory();
++  if (const std::uint32_t object = lock->GameObject(memory); object != 0)
++    lock->ResetDivider(memory, object);
+ }
+ 
+ std::uint32_t ViLockedAlarm::GameObject(const Memory::MemoryManager &memory) const {
+@@ -120,14 +157,11 @@ std::uint32_t ViLockedAlarm::GameObject(const Memory::MemoryManager &memory) con
+   return memory.Read_U32(m_options.divider_pointer);
+ }
+ 
+-void ViLockedAlarm::ResetDivider(Memory::MemoryManager &memory, std::uint32_t object,
+-                                 std::uint64_t firing) const {
++void ViLockedAlarm::ResetDivider(Memory::MemoryManager &memory, std::uint32_t object) const {
+   const std::uint32_t address = object + m_options.divider_offset;
+   if (!memory.GetPointerForRange(address, sizeof(float)))
+     return;
+-  // Each firing before the one that should act adds another 1 / per_field.
+-  const float value =
+-      m_options.divider_value - static_cast<float>(firing) / static_cast<float>(m_options.per_field);
++  const float value = m_options.divider_value;
+   std::uint32_t bits;
+   std::memcpy(&bits, &value, sizeof(bits));
+   memory.Write_U32(bits, address);
+@@ -142,32 +176,95 @@ void ViLockedAlarm::FollowFrameLoop(const Memory::MemoryManager &memory, std::ui
+   // shows as a change in the count.
+   const std::uint32_t queued = memory.Read_U32(queue);
+   const std::optional<std::uint32_t> last = std::exchange(m_last_queued, queued);
+-  const std::uint64_t repeats = RepeatedFrames::Get().alternating_repeats;
+-  if (queued > kMaxQueued || !last || *last > kMaxQueued) {
+-    m_window_fields = 0;
+-    m_window_uneven = 0;
+-    m_window_repeats_start = repeats;
++  const bool following = Following(memory);
++  if (following != m_following) {
++    m_following = following;
++    std::fprintf(stderr, "[vi-locked-alarm] field %llu: %s at %llu us\n",
++                 static_cast<unsigned long long>(m_fields),
++                 following ? "following the frame loop" : "holding the phase",
++                 static_cast<unsigned long long>(*m_step_phase * 1000000 / ticks_per_second));
++  }
++  if (!following || queued > kMaxQueued || !last || *last > kMaxQueued) {
++    StartWindow();
+     return;
+   }
+   m_window_uneven += queued != *last;
+-  if (++m_window_fields < kWindowFields)
++  m_window_waiting += queued != 0;
++  ++m_window_fields;
++
++  const std::uint64_t window_repeats =
++      RepeatedFrames::Get().alternating_repeats - m_window_repeats_start;
++  if (window_repeats >= kAlternatingRepeatsToMove) {
++    // Back to where the frames last stayed clean. From there (or with none yet) the search
++    // starts earlier when the step mostly waited past the field's end (queued too late to run
++    // in its own field), later when it did not (queued so early the frame loop takes it before
++    // it is ready), and keeps that way until a window passes without repeats. Later moves are
++    // 1 ms only: the clean phases right after that edge can be just a few ms wide. A window that
++    // also judders (the step racing the check) says nothing about the way: 1 ms on, or earlier.
++    if (m_clean_phase && *m_clean_phase != *m_step_phase) {
++      MoveTo(*m_clean_phase, "repeated frames, back to the clean phase", window_repeats,
++             ticks_per_second);
++    } else {
++      m_clean_phase.reset();
++      const bool racing = 3 * m_window_uneven >= m_window_fields;
++      if (m_search_direction == 0 && !racing)
++        m_search_direction = 2 * m_window_waiting >= m_window_fields ? -1 : 1;
++      const bool earlier = m_search_direction <= 0;
++      const std::uint64_t move = (earlier && !racing ? kRepeatPhaseMoveUs : kPhaseMoveUs) *
++                                 ticks_per_second / 1000000;
++      MoveTo((*m_step_phase + (earlier ? field - move : move)) % field,
++             racing    ? "repeated frames and judder"
++             : earlier ? "repeated frames, step late"
++                       : "repeated frames, step early",
++             window_repeats, ticks_per_second);
++    }
++    m_clean_windows = 0;
++    StartWindow();
++    return;
++  }
++  if (m_window_fields < kWindowFields)
+     return;
+-  const std::uint64_t window_repeats = repeats - m_window_repeats_start;
+-  const bool repeating = window_repeats >= kAlternatingRepeatsToMove;
+-  if (m_window_uneven >= kUnevenFieldsToMove || repeating) {
+-    // Earlier, so the step is already waiting when the check comes; around the field if need be.
+-    const std::uint64_t move =
+-        (repeating ? kRepeatPhaseMoveUs : kPhaseMoveUs) * ticks_per_second / 1000000;
+-    m_step_phase = (*m_step_phase + field - move) % field;
+-    std::fprintf(stderr,
+-                 "[vi-locked-alarm] field %llu: uneven in %u of %u, %llu repeated frames, "
+-                 "phase now %llu us\n",
+-                 static_cast<unsigned long long>(m_fields), m_window_uneven, m_window_fields,
+-                 static_cast<unsigned long long>(window_repeats),
++  m_search_direction = 0;
++  if (m_window_uneven >= kUnevenFieldsToMove) {
++    // Earlier, so the step is already waiting when the check comes. A clean phase that judders
++    // now is not one to come back to.
++    if (m_clean_phase == m_step_phase)
++      m_clean_phase.reset();
++    const std::uint64_t move = kPhaseMoveUs * ticks_per_second / 1000000;
++    MoveTo((*m_step_phase + field - move) % field, "uneven", window_repeats, ticks_per_second);
++    m_clean_windows = 0;
++  } else if (++m_clean_windows == kCleanWindows && m_clean_phase != m_step_phase) {
++    m_clean_phase = m_step_phase;
++    std::fprintf(stderr, "[vi-locked-alarm] field %llu: clean at %llu us\n",
++                 static_cast<unsigned long long>(m_fields),
+                  static_cast<unsigned long long>(*m_step_phase * 1000000 / ticks_per_second));
+   }
++  StartWindow();
++}
++
++bool ViLockedAlarm::Following(const Memory::MemoryManager &memory) const {
++  const std::uint32_t address = m_options.follow_address;
++  if (address == 0)
++    return true;
++  return memory.GetPointerForRange(address, sizeof(std::uint32_t)) &&
++         memory.Read_U32(address) != 0;
++}
++
++void ViLockedAlarm::StartWindow() {
+   m_window_fields = 0;
+   m_window_uneven = 0;
+-  m_window_repeats_start = repeats;
++  m_window_waiting = 0;
++  m_window_repeats_start = RepeatedFrames::Get().alternating_repeats;
++}
++
++void ViLockedAlarm::MoveTo(std::uint64_t phase, const char *reason, std::uint64_t window_repeats,
++                           std::uint64_t ticks_per_second) {
++  m_step_phase = phase;
++  std::fprintf(stderr,
++               "[vi-locked-alarm] field %llu: %s (uneven in %u of %u, %llu repeated frames), "
++               "phase now %llu us\n",
++               static_cast<unsigned long long>(m_fields), reason, m_window_uneven,
++               m_window_fields, static_cast<unsigned long long>(window_repeats),
++               static_cast<unsigned long long>(phase * 1000000 / ticks_per_second));
+ }
+ } // namespace moderngekko
+diff --git a/ModernGekko/src/runtime/vi_locked_alarm.hpp b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+index 29301862..d62749d0 100644
+--- a/ModernGekko/src/runtime/vi_locked_alarm.hpp
++++ b/ModernGekko/src/runtime/vi_locked_alarm.hpp
+@@ -5,6 +5,12 @@
+ 
+ #include "Common/HookableEvent.h"
+ 
++namespace Core {
++class System;
++}
++namespace CoreTiming {
++struct EventType;
++}
+ namespace Memory {
+ class MemoryManager;
+ }
+@@ -44,8 +50,21 @@ namespace moderngekko {
+ // runs one step, yet every other frame draws exactly what the previous one drew, so the game
+ // shows 30 frames a second. Nothing pulled the phase out of such a band, and a session whose
+ // menus walked it in (memory card reads, loading) stayed at 30. So the lock also watches what
+-// the frames are drawn from (VideoCommon/RepeatedFrames.h) and moves 2 ms earlier when frames
+-// repeat in that drawn-repeated-drawn pattern.
++// the frames are drawn from (VideoCommon/RepeatedFrames.h) and moves when frames repeat in that
++// drawn-repeated-drawn pattern. Which way to move, the queue does tell: through most of a band
++// the step is queued too late to run in its own field and still waits at the field's end, so
++// the lock moves 2 ms earlier; at the other edge (the step queued so early that the frame loop
++// takes it before the frame is ready) nothing waits, and the lock moves 1 ms later. Moving
++// earlier only crossed the whole band the long way round from there, and in a heavy scene (a
++// story fight in the crowded bar) the clean phases shrink to a few ms right after that edge.
++//
++// Menus and movies that run at 30 frames a second on purpose repeat in that same pattern
++// whatever the phase, so following everywhere walked the phase around for nothing between
++// scenes, and every fight started wherever the menus had left it. Given a guest value that is
++// set only in the game's own scenes (Def Jam has a pointer that is not 0 only in a match), the
++// lock follows the loop only there and keeps the phase the last scene settled on everywhere
++// else. It also keeps the phase that stayed clean longest: when frames repeat again away from
++// it, the lock goes straight back there instead of walking through the band.
+ //
+ // Off unless Core.ViLockedAlarm names the alarm (MainSettings.h), normally in the game's ini.
+ class ViLockedAlarm {
+@@ -53,14 +72,14 @@ public:
+   struct Options {
+     std::uint32_t address;   // the OSAlarm struct in guest RAM
+     std::uint32_t per_field; // firings per field
+-    // When the step is queued, after the field ends. With the divider, the firing that queues
+-    // it is the first one at or after this point; without it, the first firing is here.
++    // When the alarm fires to queue the step, after the field ends (the step itself follows
++    // when the game gets to it). Without the divider, every firing is here and a period on.
+     std::uint32_t phase_us;
+     // Optional: a float the game divides the alarm by (a counter it adds a fraction to on
+     // every firing and acts on when it reaches 1), found at *divider_pointer + divider_offset
+-    // and set to divider_value at every field end, so the game acts on the same firing of
+-    // each field instead of on either of them depending on where the counter happened to be.
+-    // divider_value is the value that makes the first firing of a field act; the game is
++    // and set to divider_value half a period before the step's firing in every field, so the
++    // game acts on that firing instead of on any of them depending on where the counter
++    // happened to be. divider_value is the value that makes the next firing act; the game is
+     // expected to add 1 / per_field per firing (one step per field).
+     std::uint32_t divider_pointer;
+     std::uint32_t divider_offset;
+@@ -68,6 +87,9 @@ public:
+     // Optional, in the same object: the u32 count of steps queued and not run yet (0 = keep
+     // phase_us fixed). Needs the divider.
+     std::uint32_t queue_offset;
++    // Optional, with the queue: follow only while the guest u32 at follow_address is not 0
++    // (follow_address 0 = always).
++    std::uint32_t follow_address;
+   };
+ 
+   // Reads the Core.ViLockedAlarm* settings; returns the options when the lock is on.
+@@ -83,22 +105,40 @@ private:
+   void OnFieldEnd();
+   // The game object holding the divider and the queue, or 0 while it does not exist.
+   std::uint32_t GameObject(const Memory::MemoryManager &memory) const;
+-  void ResetDivider(Memory::MemoryManager &memory, std::uint32_t object,
+-                    std::uint64_t firing) const;
++  // Queues ResetDividerEvent for half a period before the step's firing.
++  void ScheduleDividerReset(Core::System &system, std::uint64_t field, std::uint64_t period);
++  static void ResetDividerEvent(Core::System &system, std::uint64_t userdata,
++                                std::int64_t cycles_late);
++  void ResetDivider(Memory::MemoryManager &memory, std::uint32_t object) const;
+   void FollowFrameLoop(const Memory::MemoryManager &memory, std::uint32_t object,
+                        std::uint64_t field, std::uint64_t ticks_per_second);
++  bool Following(const Memory::MemoryManager &memory) const;
++  void StartWindow();
++  // Moves the step to `phase` (timebase ticks after a field's end) and logs why.
++  void MoveTo(std::uint64_t phase, const char *reason, std::uint64_t window_repeats,
++              std::uint64_t ticks_per_second);
+ 
+   Options m_options;
+   Common::EventHook m_field_hook;
++  CoreTiming::EventType *m_divider_event = nullptr;
+   // Timebase ticks after a field's end at which the step is queued; set at the first field.
+   std::optional<std::uint64_t> m_step_phase;
+   // Fields so far (for the log); the queue count at the last field's end; FollowFrameLoop's
+-  // window: fields seen, and fields whose frame ran no step or two (the count changed).
++  // window: fields seen, fields whose frame ran no step or two (the count changed), and fields
++  // that ended with a step still queued.
+   std::uint64_t m_fields = 0;
+   std::optional<std::uint32_t> m_last_queued;
+   std::uint32_t m_window_fields = 0;
+   std::uint32_t m_window_uneven = 0;
++  std::uint32_t m_window_waiting = 0;
+   // RepeatedFrames' alternating repeats when the window started.
+   std::uint64_t m_window_repeats_start = 0;
++  // Whether the last field was followed (for the log), the windows in a row that ended without a
++  // move, and the phase that reached kCleanWindows of them (the one to return to).
++  bool m_following = false;
++  std::uint32_t m_clean_windows = 0;
++  std::optional<std::uint64_t> m_clean_phase;
++  // The way repeats are moving the phase (-1 earlier, 1 later, 0 not moving).
++  int m_search_direction = 0;
+ };
+ } // namespace moderngekko
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+index e60f0eae..b884e1b4 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.cpp
+@@ -68,8 +68,9 @@ const Info<bool> MAIN_SMOOTH_LATE_PRESENTATION{{System::Main, "Core", "SmoothLat
+ const Info<u32> MAIN_VI_LOCKED_ALARM{{System::Main, "Core", "ViLockedAlarm"}, 0};
+ const Info<u32> MAIN_VI_LOCKED_ALARM_PER_FIELD{{System::Main, "Core", "ViLockedAlarmPerField"}, 1};
+ const Info<u32> MAIN_VI_LOCKED_ALARM_PHASE_US{{System::Main, "Core", "ViLockedAlarmPhaseUs"}, 0};
+-// Optional float the game counts the alarm with, reset every field so it acts on the same
+-// firing each time: the address of a pointer to it (0 = none), its offset there, and the value.
++// Optional float the game counts the alarm with, reset every field half a period before the
++// wanted firing so it acts on that one each time: the address of a pointer to it (0 = none),
++// its offset there, and the value that makes the next firing act.
+ const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_POINTER{
+     {System::Main, "Core", "ViLockedAlarmDividerPointer"}, 0};
+ const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_OFFSET{
+@@ -80,6 +81,11 @@ const Info<float> MAIN_VI_LOCKED_ALARM_DIVIDER_VALUE{
+ // run yet (0 = fixed phase). With it the phase follows the game's frame loop, see ViLockedAlarm.
+ const Info<u32> MAIN_VI_LOCKED_ALARM_QUEUE_OFFSET{
+     {System::Main, "Core", "ViLockedAlarmQueueOffset"}, 0};
++// Optional, with the queue: a guest u32 that is not 0 only while the phase should follow the
++// frame loop (0 = always follow), so screens that draw at 30 a second on purpose (menus, movies)
++// leave the phase where the game's own scenes found it.
++const Info<u32> MAIN_VI_LOCKED_ALARM_FOLLOW_ADDRESS{
++    {System::Main, "Core", "ViLockedAlarmFollowAddress"}, 0};
+ #if defined(ANDROID)
+ // Currently enabled by default on Android because the performance boost is really needed.
+ constexpr bool DEFAULT_CPU_THREAD = true;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+index 0bccb67e..a01d40a6 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/Core/Config/MainSettings.h
+@@ -76,6 +76,7 @@ extern const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_POINTER;
+ extern const Info<u32> MAIN_VI_LOCKED_ALARM_DIVIDER_OFFSET;
+ extern const Info<float> MAIN_VI_LOCKED_ALARM_DIVIDER_VALUE;
+ extern const Info<u32> MAIN_VI_LOCKED_ALARM_QUEUE_OFFSET;
++extern const Info<u32> MAIN_VI_LOCKED_ALARM_FOLLOW_ADDRESS;
+ extern const Info<bool> MAIN_CPU_THREAD;
+ extern const Info<bool> MAIN_LOAD_GAME_INTO_MEMORY;
+ extern const Info<bool> MAIN_SYNC_ON_SKIP_IDLE;
