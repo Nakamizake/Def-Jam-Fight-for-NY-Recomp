@@ -8,7 +8,8 @@ is built from the game's own files, so the game build (build-game.ps1) runs this
 
 Fixes:
 
-- the Sketch Artist's voice page, which the GameCube release skips (voice_select.py).
+- what the menus switch off on the GameCube: the Sketch Artist's voice page, the detailed
+  venue map, the trailer in Extras and the menus' spotlight (gc_cuts.py).
 
 The folder is rebuilt from scratch each time; the game's files are only read.
 """
@@ -23,7 +24,7 @@ import sys
 
 # `python -I` leaves the script's own directory off sys.path; add it back for the sibling modules.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import voice_select  # noqa: E402
+import gc_cuts  # noqa: E402
 
 FIXES = "fixes"
 
@@ -41,13 +42,13 @@ def main() -> None:
 def build(game: str) -> None:
     root = pathlib.Path(game)
     files = root / "files"
-    if not (files / voice_select.ARCHIVE).is_file():
-        raise ValueError(f"{root} is not an extracted game (no files\\{voice_select.ARCHIVE})")
+    if not (files / gc_cuts.ARCHIVE).is_file():
+        raise ValueError(f"{root} is not an extracted game (no files\\{gc_cuts.ARCHIVE})")
     out = root / FIXES
     # Built aside and swapped in, so a failure leaves the previous fixes in place.
     staging = root / (FIXES + ".new")
     shutil.rmtree(staging, ignore_errors=True)
-    voice_select.build(str(files), str(staging))
+    gc_cuts.build(str(files), str(staging))
     shutil.rmtree(out, ignore_errors=True)
     staging.rename(out)
     print(f"port fixes ready in {out}")

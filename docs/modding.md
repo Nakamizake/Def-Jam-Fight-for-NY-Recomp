@@ -136,7 +136,7 @@ string inside the executable itself. One patch per line, in hex, `#` starting a 
 
 ```
 # <address> <new bytes> <bytes expected there>
-80297D54 007265776563757474696E 617265776563757474696E  # arewecuttin
+8029E384 0000021800000216000002190000021A0000021400000215 000002180000021800000218000002180000021800000218  # voice banks
 ```
 
 A patch applies only if the bytes at the address are the expected ones, so it never lands in
@@ -181,16 +181,30 @@ missing or older than the tools), with `tools-src/modding/port_fixes.py`:
 python -I tools-src\modding\port_fixes.py --game extracted\GNWE69
 ```
 
-**Voice page.** On the other consoles, the story mode's Sketch Artist ends with one more page
-after *Positive ID?*: what your fighter sounds like, out of six voices (Rough, Street, Clean
-Cut, Cocky, Smooth, Gruff), each with a preview on X. The GameCube release still has that page,
-with its art and its preview lines, but the screen's script skips it on the GameCube only and
-always gives the first voice. The script is `Sketch.apt`, the compiled ActionScript of
-`screens/story/Sketch.big` in `screens/screens.viv`; `voice_select.py` makes its two tests of
-`_root.g_console == "gc"` around the voice page compare with a string the console name never
-equals (one byte each) and rebuilds the archive. The voice is chosen when the fighter is
-created, so it shows in a new story. `voice_select.py --out <mod folder>` also builds it as an
-ordinary mod.
+**What the menus switch off on the GameCube.** The menus are Flash screens whose compiled
+ActionScript (the `.apt` script of each screen's bundle in `screens/screens.viv`) is shared by
+every console the game shipped on, and branches on `_root.g_console` where they differ. On the
+GameCube, a few of those branches leave out things that are still on its disc:
+
+- **Voice page.** The story mode's Sketch Artist ends with one more page after *Positive ID?*:
+  what your fighter sounds like, out of six voices (Rough, Street, Clean Cut, Cocky, Smooth,
+  Gruff), each with a preview on X. The GameCube skips it and always gives the first voice, and
+  its executable gives all six voices the first one's speech in fights; a memory patch
+  (`patches.txt` in the fixes) puts back the PlayStation 2's table, one set of speech per voice.
+  The voice is chosen when the fighter is created, so it shows in a new story.
+- **Venue map.** *Choose Venue* draws the city from `battle/map.swf`, about four times as
+  detailed as the `map_ngc.swf` the GameCube loads instead.
+- **Trailer.** *Extras* gets a third poster that plays the game's trailer
+  (`movies/attract.mad`), from the posters the PlayStation 2 release uses.
+- **Spotlight.** Most menus lay a soft light over the screen that darkens its edges; the
+  GameCube hides it.
+
+`gc_cuts.py` makes those tests of `_root.g_console == "gc"` compare with a string the console
+name never equals (one byte each), rebuilds the archive and writes the voice patch. Every other
+console test in the scripts was checked too: the rest fit the layout to the TV, show the
+GameCube's own button prompts, copyright line and memory card messages, or only concern the
+other consoles.
+`gc_cuts.py --out <mod folder>` also builds the fix as an ordinary mod.
 
 ## Netplay
 
