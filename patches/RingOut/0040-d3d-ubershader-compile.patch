@@ -1,0 +1,80 @@
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D/D3DGfx.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D/D3DGfx.cpp
+index dc7ee379..b4454f46 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D/D3DGfx.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D/D3DGfx.cpp
+@@ -74,7 +74,8 @@ std::unique_ptr<AbstractShader>
+ Gfx::CreateShaderFromSource(ShaderStage stage, std::string_view source,
+                             VideoCommon::ShaderIncluder* shader_includer, std::string_view name)
+ {
+-  auto bytecode = DXShader::CompileShader(D3D::feature_level, stage, source, shader_includer);
++  auto bytecode = DXShader::CompileShader(D3D::feature_level, stage, source, shader_includer,
++                                          DXShader::ShouldOptimize(name));
+   if (!bytecode)
+     return nullptr;
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D12/DX12Shader.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D12/DX12Shader.cpp
+index e4375335..2e46ad6c 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D12/DX12Shader.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3D12/DX12Shader.cpp
+@@ -32,7 +32,8 @@ std::unique_ptr<DXShader> DXShader::CreateFromSource(ShaderStage stage, std::str
+                                                      VideoCommon::ShaderIncluder* shader_includer,
+                                                      std::string_view name)
+ {
+-  auto bytecode = CompileShader(g_dx_context->GetFeatureLevel(), stage, source, shader_includer);
++  auto bytecode = CompileShader(g_dx_context->GetFeatureLevel(), stage, source, shader_includer,
++                                ShouldOptimize(name));
+   if (!bytecode)
+     return nullptr;
+ 
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.cpp b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.cpp
+index bf4af33b..72feb523 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.cpp
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.cpp
+@@ -239,9 +239,15 @@ static const char* GetCompileTarget(D3D_FEATURE_LEVEL feature_level, ShaderStage
+   }
+ }
+ 
++bool Shader::ShouldOptimize(std::string_view name)
++{
++  // ShaderCache names ubershaders "Vertex UberShader for ..." and "Pixel UberShader for ...".
++  return name.find("UberShader") == std::string_view::npos;
++}
++
+ std::optional<Shader::BinaryData>
+ Shader::CompileShader(D3D_FEATURE_LEVEL feature_level, ShaderStage stage, std::string_view source,
+-                      VideoCommon::ShaderIncluder* shader_includer)
++                      VideoCommon::ShaderIncluder* shader_includer, bool optimize)
+ {
+   const auto hlsl = GetHLSL(feature_level, stage, source, shader_includer);
+   if (!hlsl)
+@@ -250,7 +256,8 @@ Shader::CompileShader(D3D_FEATURE_LEVEL feature_level, ShaderStage stage, std::s
+   static constexpr D3D_SHADER_MACRO macros[] = {{"API_D3D", "1"}, {nullptr, nullptr}};
+   const UINT flags = g_ActiveConfig.bEnableValidationLayer ?
+                          (D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION) :
+-                         (D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_SKIP_VALIDATION);
++                     optimize ? (D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_SKIP_VALIDATION) :
++                                (D3DCOMPILE_SKIP_OPTIMIZATION | D3DCOMPILE_SKIP_VALIDATION);
+   const char* target = GetCompileTarget(feature_level, stage);
+ 
+   Microsoft::WRL::ComPtr<ID3DBlob> code;
+diff --git a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.h b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.h
+index 0018534f..390885d5 100644
+--- a/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.h
++++ b/ModernGekko/vendor/dolphin/Source/Core/VideoBackends/D3DCommon/Shader.h
+@@ -21,7 +21,15 @@ public:
+ 
+   static std::optional<BinaryData> CompileShader(D3D_FEATURE_LEVEL feature_level, ShaderStage stage,
+                                                  std::string_view source,
+-                                                 VideoCommon::ShaderIncluder* shader_includer);
++                                                 VideoCommon::ShaderIncluder* shader_includer,
++                                                 bool optimize = true);
++
++  // Whether a shader is worth the HLSL compiler's optimiser. Not for ubershaders: FXC spends
++  // about 45 s of one core on each pixel ubershader at any optimisation level (a few hundred of
++  // them at boot, so half an hour on a 6-core CPU), against 9 s without. The GPU driver
++  // optimises the bytecode again, and an ubershader only draws until the specialised shader for
++  // the same state is ready. Ubershaders are the shaders the shader cache names after their UID.
++  static bool ShouldOptimize(std::string_view name);
+ 
+   static BinaryData CreateByteCode(const void* data, size_t length);
+ 

@@ -80,6 +80,11 @@ explains the selected setting.
 A few settings (renderer, audio output, compile shaders at boot) apply at the next launch; the
 menu says so.
 
+Vulkan (the default) and OpenGL start in seconds. Direct3D 11 and 12 compile their shaders with
+Windows' HLSL compiler, which is slower: the first launch on either takes a few minutes before
+the game shows up (about 2 on D3D11 and 5 on D3D12 on a 6-core CPU); later launches reuse the
+shader cache and are quicker.
+
 ## Controls
 
 Any SDL gamepad works, and the keyboard plays alongside it. Each console release of the game is
