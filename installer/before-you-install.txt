@@ -26,9 +26,9 @@ What happens
 4. Optional: "Optimize for this PC" in the game folder (or "Def Jam - Optimize for this PC"
    in the Start menu) makes the game run faster (about 20 minutes). A game window opens
    and plays fights on its own while it measures; your saves and settings are not touched.
-5. Optional: "Build PS2 HD textures" in the game folder (or the Start menu) copies the
-   sharper textures of the PlayStation 2 version from your own PS2 disc image (.iso) into
-   a mod, in a minute or two.
+5. Optional: "Add PS2 extras" in the game folder (or the Start menu) takes the sharper
+   textures, the higher-quality music and the 12 extra songs of the PlayStation 2 version
+   from your own PS2 disc image (.iso), each into a mod, in a few minutes.
 
 Updating
 --------

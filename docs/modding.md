@@ -54,7 +54,7 @@ each into a mod folder of its own:
 | Switch | Mod | What | Tool |
 | --- | --- | --- | --- |
 | `--textures` | PS2Textures | most textures at twice the resolution | `ps2_textures.py` |
-| `--music` | PS2Music | the soundtrack at the PS2's sample rate | `ps2_music.py` |
+| `--music` | PS2Music | the soundtrack at the PS2's sample rate, and its 12 extra songs | `ps2_music.py` |
 
 ```powershell
 python -I tools-src\ps2\ps2_extras.py --gc-files extracted\GNWE69\files `
@@ -93,15 +93,31 @@ with the PS2 recording of each of the 20 songs (`main.mus`) and its interactive-
 (`tune.mpf`), converted to the GameCube's byte order (`ea_audio.py`, `mpf.py`); the audio
 frames themselves are the same bytes on both consoles. The songs keep the GameCube's
 loading-screen and overlay sound banks (the same sounds, and the game holds them in buffers
-sized for the GameCube's own). It takes under a minute and writes about 400 MB. It is a
-game-file mod, so for netplay both players need it switched on (or both off).
+sized for the GameCube's own).
 
-The PS2 disc also has 13 songs the GameCube release left out (`arewecuttin`, `getintoit`,
-`getitnow`, `hitem`, `holler`, `mamasaid`, `minitrack2`, `nuffrespect`, `nwa`, `poppalarge`,
-`pump`, `ricache`, `seizetheday`); `djv2.sod` still describes all of them. They are not added
-yet: the GameCube executable skips 12 of them by name (a list at `80297D54`), and with those
-names cleared the front end's song lists (code at `8002BC18` and `8002C6BC`) read a null
-pointer for each of them, which would crash a real console, and still leave them out.
+It also adds the 12 songs the GameCube release left out (`arewecuttin`, `getintoit`,
+`getitnow`, `hitem`, `mamasaid`, `minitrack2`, `nuffrespect`, `nwa`, `poppalarge`, `pump`,
+`ricache`, `seizetheday`), whose loading-screen and overlay banks are resampled to the
+GameCube's rate (24,000 to 16,000 Hz) and encoded again, as the game keeps those banks in
+buffers sized for the GameCube's own. The song database (`djv2.sod`, the same on both discs)
+still describes them; the GameCube executable skips them by name, from two copies of one list
+(at `80297D54` for the Beatbox's list, at `802990EC` for checks elsewhere in the game), and a
+`patches.txt` (see *Memory patches* below) empties both. Emptying only the first left the front
+end's music set-up (`8002BC18`, `8002C6BC`) reading a null pointer for each of them. A 13th PS2
+song, `holler`, has no Beatbox entry in the database on either console, so it is left out.
+
+The same `patches.txt` fits an Options save from before the mod to the longer list
+(`playlist_fix.py`). The game keeps the Beatbox playlist as an array of song ids, sorted (a song
+is found by binary search, `8028E62C`), and a flags byte for each: display position and state
+(locked, checked, unchecked). The save holds both arrays but not their length, so a 20-song save
+comes back with 12 empty entries while the game counts 32, and the Beatbox repeats songs and
+loses the new ones. The patch hooks the playlist's `GetState` (`8028DFE4`): when ids are missing
+it lays the arrays out again in id order, each song keeping its flags, and unlocks the missing
+ones at the next display positions, so they join the end of the player's list, checked. Its
+code sits in the two emptied lists.
+
+It takes under a minute and writes about 670 MB. It is a game-file mod, so for netplay both
+players need it switched on (or both off).
 
 ## Game files
 
@@ -144,6 +160,13 @@ the wrong place in another version of the game; addresses must be in main memory
 (`80000000`-`817FFFFF`), and the new and expected bytes the same length. The log
 (`logs\runtime.log` in an installed game) says how many patches each mod applied, and why a
 line was rejected. Like game files, patches apply from the next start and count for netplay.
+
+Patching code needs care. The game runs as native code recompiled ahead of time; a 4 KB block
+of it whose bytes no longer match falls back to Dolphin's JIT, but only where the game enters it
+through the dispatcher: through a function pointer such as a C++ virtual call, not a direct
+call (`bl`) from other recompiled code, which runs the original. Hook a function the game only
+reaches through a pointer (as `playlist_fix.py` does), and check the log for the
+`SMC: chunk ... hash mismatch` line that shows the block left the native code.
 
 ### .viv archives
 

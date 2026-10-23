@@ -47,8 +47,10 @@ disc image of Def Jam: Fight for NY for PlayStation 2 (`.iso`):
 
 - **HD textures** (mod **PS2Textures**, about 250 MB, a minute or two): most of the game's
   textures at twice the resolution.
-- **Music** (mod **PS2Music**, about 400 MB, under a minute): the soundtrack at the PS2's
-  higher sample rate. Netplay needs it on for both players or for neither.
+- **Music** (mod **PS2Music**, about 670 MB, under a minute): the soundtrack at the PS2's
+  higher sample rate, plus the 12 songs the GameCube release left out, listed in the Beatbox
+  like the others. With Options saved before, the Beatbox keeps your order and check marks and
+  adds the 12 songs at the end, checked. Netplay needs it on for both players or for neither.
 
 Each one is built into a mod of its own and switched on; Esc > MODS switches it off again
 (music from the next start). The disc image is only read; the log is `logs\ps2-extras.log`.

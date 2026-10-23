@@ -152,7 +152,8 @@ static const struct ps2_extra {
      L"HD textures: most of the game's textures at twice the resolution (about 250 MB, a "
      L"minute or two)"},
     {L"--music", L"PS2Music",
-     L"Music: the soundtrack in the PS2's higher quality (about 400 MB, under a minute)"},
+     L"Music: the soundtrack in the PS2's higher quality, plus the 12 songs the GameCube "
+     L"release left out (about 670 MB, under a minute)"},
 };
 #define PS2_EXTRA_COUNT (sizeof PS2_EXTRAS / sizeof PS2_EXTRAS[0])
 #define ID_FIRST_EXTRA 100
